@@ -1,0 +1,4 @@
+# Keep local project agent files visible to ripgrep, even though Git ignores them.
+!/.agents/
+!/.agents/**
+!/AGENTS.md
