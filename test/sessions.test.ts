@@ -48,7 +48,7 @@ const makeOpenCodeLayer = (callCount: Ref.Ref<number>) =>
     wait: () => Effect.void,
     activeSessions: () => Effect.succeed([]),
     compact: () => Effect.void,
-    listSessions: () => Effect.succeed([]),
+        listSessions: () => Effect.succeed({ data: [], cursor: {} }),
     listProjects: () => Effect.succeed([]),
     listProjectDirectories: () => Effect.succeed([]),
     listPendingPermissions: () => Effect.succeed([]),

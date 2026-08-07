@@ -6,7 +6,7 @@ import { answerRepliedQuestion } from "./question.js"
 import { runWithFiles } from "./run.js"
 import { showModels } from "./model.js"
 import { showProjects, showSessions } from "./picker.js"
-import { compactSession, resetSession, resumeRun, setProjectDirectory, showStatus, stopRun } from "./run.js"
+import { compactSession, resetSession, resumeRun, setProjectDirectory, setSessionById, showStatus, stopRun } from "./run.js"
 
 export const handleMessage = (message: Message) =>
   Effect.gen(function* () {
@@ -65,6 +65,15 @@ export const handleMessage = (message: Message) =>
     }
     if (text === "/sessions") {
       yield* showSessions(chatId, threadId)
+      return
+    }
+    if (text === "/session" || (text !== undefined && text.startsWith("/session "))) {
+      const sessionID = text === "/session" ? "" : text.slice("/session ".length).trim()
+      if (sessionID.length === 0) {
+        yield* sendText(chatId, "Usage: /session <id>", threadId)
+        return
+      }
+      yield* setSessionById(chatId, sessionID, threadId)
       return
     }
     if (text === "/whoami") {

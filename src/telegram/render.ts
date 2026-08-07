@@ -149,6 +149,26 @@ export const parseModelVariantCallback = (
   return Option.some({ token, index })
 }
 
+/** Parse callback data of the form `modelc:<token>`. */
+export const parseModelCancelCallback = (data: string): Option.Option<number> => {
+  const parts = data.split(":")
+  if (parts.length !== 2 || parts[0] !== "modelc") return Option.none()
+  const token = Number(parts[1])
+  if (!Number.isInteger(token) || token <= 0) return Option.none()
+  return Option.some(token)
+}
+
+export const parseSessionPageCallback = (
+  data: string,
+): Option.Option<{ readonly token: number; readonly direction: "next" | "previous" }> => {
+  const parts = data.split(":")
+  if (parts.length !== 3 || parts[0] !== "sesp") return Option.none()
+  const token = Number(parts[1])
+  if (!Number.isInteger(token) || token <= 0) return Option.none()
+  if (parts[2] !== "next" && parts[2] !== "previous") return Option.none()
+  return Option.some({ token, direction: parts[2] })
+}
+
 /** Short label for a model picker button. */
 export const renderModelLabel = (modelID: string, providerID: string): string =>
   `${modelID} (${providerID})`
@@ -176,7 +196,7 @@ export const modelPageKeyboard = (
     rows.push(
       models.slice(i, i + 2).map((model, index) => ({
         text: renderModelLabel(model.id, model.providerID),
-        callback_data: `model:${token}:${i + index}`,
+        callback_data: `model:${token}:${page * MODEL_PAGE_SIZE + i + index}`,
       })),
     )
   }
@@ -191,6 +211,7 @@ export const modelPageKeyboard = (
   if (navigation.length > 0) {
     rows.push(navigation)
   }
+  rows.push([{ text: "Cancel", callback_data: `modelc:${token}` }])
   return { inline_keyboard: rows }
 }
 

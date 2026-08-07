@@ -292,6 +292,18 @@ describe("modelPageKeyboard", () => {
     expect(buttons.some((b) => b.callback_data === "model:1:9")).toBe(true)
   })
 
+  test("uses absolute model indexes on later pages", () => {
+    const keyboard = modelPageKeyboard(1, models, 1, 25)
+    const buttons = keyboard.inline_keyboard.flat()
+    expect(buttons.some((b) => b.callback_data === "model:1:10")).toBe(true)
+    expect(buttons.some((b) => b.callback_data === "model:1:19")).toBe(true)
+  })
+
+  test("adds Cancel to every model page", () => {
+    const keyboard = modelPageKeyboard(1, models, 0, 25)
+    expect(keyboard.inline_keyboard.flat()).toContainEqual({ text: "Cancel", callback_data: "modelc:1" })
+  })
+
   test("adds Next on the first page", () => {
     const keyboard = modelPageKeyboard(1, models, 0, 25)
     const flat = keyboard.inline_keyboard.flat()
