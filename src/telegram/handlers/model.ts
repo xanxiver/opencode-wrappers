@@ -1,0 +1,255 @@
+import { Effect, Option } from "effect"
+import type { Model } from "@opencode-ai/client/effect"
+import { logBoundary } from "../../core/logging.js"
+import { OpenCode } from "../../core/opencode.js"
+import { Sessions } from "../../core/sessions.js"
+import { Store } from "../../core/store.js"
+import { ModelRegistry } from "../models.js"
+import {
+  MODEL_PAGE_SIZE,
+  modelPageKeyboard,
+  parseModelCallback,
+  parseModelPageCallback,
+  parseModelVariantCallback,
+  renderModelPageHeader,
+} from "../render.js"
+import type { CallbackQuery } from "../api.js"
+import { answer, apiEdit, callbackFailure, chunk, clientId, sendMarkup, sendText } from "./shared.js"
+
+/** Remember the chosen model for the chat's directory. */
+const rememberModel = (chatId: number, model: { readonly id: string; readonly providerID: string; readonly variant?: string }) =>
+  Effect.gen(function* () {
+    const sessions = yield* Sessions
+    const store = yield* Store
+    const directory = yield* sessions.directoryFor(clientId(chatId))
+    yield* store.setModel(directory, model).pipe(
+      Effect.catchCause((cause) =>
+        logBoundary("telegram/handlers", "sessions", "remember model failed")(cause),
+      ),
+    )
+  })
+
+export const handleModelCallback = (query: CallbackQuery, data: string) =>
+  Option.match(parseModelCallback(data), {
+    onNone: () => answer(query.id, "Invalid data."),
+    onSome: (parsed) =>
+      Effect.gen(function* () {
+        const registry = yield* ModelRegistry
+        const opencode = yield* OpenCode
+        const message = query.message
+        if (message === undefined) {
+          yield* answer(query.id, "Invalid callback.")
+          return
+        }
+        const entry = yield* registry.take(parsed.token, message.chat.id, message.message_id)
+        yield* Option.match(entry, {
+          onNone: () => answer(query.id, "Expired."),
+          onSome: (value) => {
+            switch (value.kind) {
+              case "variant":
+                return answer(query.id, "Invalid entry.")
+              case "page": {
+                const model = Option.fromNullishOr(value.models[parsed.index])
+                return Option.match(model, {
+                  onNone: () => answer(query.id, "Invalid model."),
+                  onSome: (selected) =>
+                    Option.match(
+                      Option.fromNullishOr(selected.variants.length === 0 ? undefined : selected.variants),
+                      {
+                        onNone: () =>
+                          opencode.switchModel({
+                            sessionID: value.sessionID,
+                            model: { id: selected.id, providerID: selected.providerID },
+                          }).pipe(
+                            Effect.andThen(rememberModel(value.chatId, selected)),
+                            Effect.andThen(apiEdit(value.chatId, value.messageId, `Model switched to ${selected.id}`)),
+                            Effect.andThen(answer(query.id, "Switched.")),
+                          ),
+                        onSome: (variants) =>
+                          Effect.gen(function* () {
+                            const variantToken = yield* registry.registerVariant({
+                              sessionID: value.sessionID,
+                              providerID: selected.providerID,
+                              modelID: selected.id,
+                              variants,
+                              chatId: value.chatId,
+                              messageId: value.messageId,
+                            })
+                            const rows = chunk(
+                              variants.map((variant, index) => ({
+                                text: variant,
+                                callback_data: `modelv:${variantToken}:${index}`,
+                              })),
+                              2,
+                            )
+                            yield* apiEdit(
+                              value.chatId,
+                              value.messageId,
+                              `Select a variant for ${selected.id}:`,
+                              { inline_keyboard: rows },
+                            )
+                            yield* answer(query.id, "Choose a variant.")
+                          }),
+                      }
+                    ),
+                })
+              }
+            }
+          },
+        })
+      }).pipe(
+        Effect.catchCause(callbackFailure(query, "model callback failed", "Failed.")),
+      ),
+  })
+
+/** Page navigation of the model picker. */
+export const handleModelPageCallback = (query: CallbackQuery, data: string) =>
+  Option.match(parseModelPageCallback(data), {
+    onNone: () => answer(query.id, "Invalid data."),
+    onSome: (parsed) =>
+      Effect.gen(function* () {
+        const registry = yield* ModelRegistry
+        const message = query.message
+        if (message === undefined) {
+          yield* answer(query.id, "Invalid callback.")
+          return
+        }
+        const entry = yield* registry.take(parsed.token, message.chat.id, message.message_id)
+        yield* Option.match(entry, {
+          onNone: () => answer(query.id, "Expired."),
+          onSome: (value) => {
+            switch (value.kind) {
+              case "variant":
+                return answer(query.id, "Invalid entry.")
+              case "page": {
+                if (parsed.page < 0 || parsed.page * MODEL_PAGE_SIZE >= value.total) {
+                  return answer(query.id, "Invalid page.")
+                }
+                return Effect.gen(function* () {
+                  const nextToken = yield* registry.registerPage({
+                    sessionID: value.sessionID,
+                    models: value.models,
+                    page: parsed.page,
+                    total: value.total,
+                    chatId: value.chatId,
+                  })
+                  const from = parsed.page * MODEL_PAGE_SIZE
+                  const pageModels = value.models.slice(from, from + MODEL_PAGE_SIZE)
+                  yield* registry.attachMessageId(nextToken, value.messageId)
+                  yield* apiEdit(
+                    value.chatId,
+                    value.messageId,
+                    renderModelPageHeader(parsed.page, value.total),
+                    modelPageKeyboard(nextToken, pageModels, parsed.page, value.total),
+                  )
+                  yield* answer(query.id, "Page changed.")
+                }).pipe(Effect.catchCause(callbackFailure(query, "model page callback failed", "Failed.")))
+              }
+            }
+          },
+        })
+      }).pipe(
+        Effect.catchCause(callbackFailure(query, "model page callback failed", "Failed.")),
+      ),
+  })
+
+export const handleModelVariantCallback = (query: CallbackQuery, data: string) =>
+  Option.match(parseModelVariantCallback(data), {
+    onNone: () => answer(query.id, "Invalid data."),
+    onSome: (parsed) =>
+      Effect.gen(function* () {
+        const registry = yield* ModelRegistry
+        const opencode = yield* OpenCode
+        const message = query.message
+        if (message === undefined) {
+          yield* answer(query.id, "Invalid callback.")
+          return
+        }
+        const entry = yield* registry.take(parsed.token, message.chat.id, message.message_id)
+        yield* Option.match(entry, {
+          onNone: () => answer(query.id, "Expired."),
+          onSome: (value) => {
+            switch (value.kind) {
+              case "page":
+                return answer(query.id, "Invalid entry.")
+              case "variant":
+                return Option.match(Option.fromNullishOr(value.variants[parsed.index]), {
+                  onNone: () => answer(query.id, "Invalid variant."),
+                  onSome: (variant) =>
+                    opencode.switchModel({
+                      sessionID: value.sessionID,
+                      model: {
+                        id: value.modelID,
+                        providerID: value.providerID,
+                        variant,
+                      },
+                    }).pipe(
+                      Effect.andThen(
+                        rememberModel(value.chatId, {
+                          id: value.modelID,
+                          providerID: value.providerID,
+                          variant,
+                        }),
+                      ),
+                      Effect.andThen(
+                        apiEdit(value.chatId, value.messageId, `Model switched to ${value.modelID} (${variant})`),
+                      ),
+                      Effect.andThen(answer(query.id, "Switched.")),
+                    ),
+                })
+            }
+          },
+        })
+      }).pipe(
+        Effect.catchCause(callbackFailure(query, "model variant callback failed", "Failed.")),
+      ),
+  })
+
+/** `/model` — list models page by page; picking one selects it for the session. */
+export const showModels = (chatId: number, threadId?: number) =>
+  Effect.gen(function* () {
+    const sessions = yield* Sessions
+    const opencode = yield* OpenCode
+    const store = yield* Store
+    const registry = yield* ModelRegistry
+    const sessionID = yield* sessions.getOrCreate(clientId(chatId))
+    const directory = yield* sessions.directoryFor(clientId(chatId))
+    const remembered = yield* store.getModel(directory)
+    const currentLine = Option.match(remembered, {
+      onNone: () => "",
+      onSome: (model) => `Current model: ${model.id}${model.variant === undefined ? "" : ` [${model.variant}]`}\n`,
+    })
+    const models = yield* opencode.listModels(directory).pipe(
+      Effect.catchCause((cause) =>
+        logBoundary("telegram/handlers", "opencode-client", "list models failed")(cause).pipe(
+          Effect.andThen(Effect.succeed<readonly Model.Info[]>([])),
+        ),
+      ),
+    )
+    if (models.length === 0) {
+      yield* sendText(chatId, "No models available.", threadId)
+      return
+    }
+    const pageModels = models.map((model) => ({
+      id: model.id,
+      providerID: model.providerID,
+      variants: model.variants.map((variant) => variant.id),
+    }))
+    const token = yield* registry.registerPage({
+      sessionID,
+      models: pageModels,
+      page: 0,
+      total: pageModels.length,
+      chatId,
+    })
+    const message = yield* sendMarkup(
+      chatId,
+      currentLine + renderModelPageHeader(0, pageModels.length),
+      modelPageKeyboard(token, pageModels, 0, pageModels.length),
+      threadId,
+    )
+    yield* Option.match(message, {
+      onNone: () => Effect.void,
+      onSome: (sent) => registry.attachMessageId(token, sent.message_id),
+    })
+  })

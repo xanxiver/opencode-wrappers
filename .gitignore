@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+.repos/
+
+# Environment
+.env
+.env.local
+/.envrc
+
+# Local planning notes
+/TODO.md
+
+# Runtime state
+data/
+
+# scripts
+scripts/
+
+# Local OpenCode configuration and tools
+.opencode/
+
+# Local agent skills and project instructions
+/.agents/
+/AGENTS.md
+
+# Logs
+*.log
+
+# Editor/OS
+.DS_Store
+*.swp
+
+.codegraph/
