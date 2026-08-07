@@ -16,7 +16,16 @@ export interface PendingSession {
   readonly messageId: number
 }
 
-export type PickerEntry = PendingDirectory | PendingSession
+export interface PendingSessionPage {
+  readonly kind: "session-page"
+  readonly directory: string
+  readonly chatId: number
+  readonly previous?: string
+  readonly next?: string
+  readonly messageId: number
+}
+
+export type PickerEntry = PendingDirectory | PendingSession | PendingSessionPage
 
 export interface PickersShape {
   readonly registerDirectory: (input: { readonly directory: string; readonly chatId: number }) =>
@@ -27,8 +36,17 @@ export interface PickersShape {
     readonly title: Option.Option<string>
     readonly chatId: number
   }) => Effect.Effect<number, never>
+  readonly registerSessionPage: (input: {
+    readonly directory: string
+    readonly chatId: number
+    readonly previous?: string
+    readonly next?: string
+  }) => Effect.Effect<number, never>
   readonly attachMessageId: (token: number, messageId: number) => Effect.Effect<void, never>
   readonly take: (token: number, chatId: number, messageId: number) =>
+    Effect.Effect<Option.Option<PickerEntry>, never>
+  /** Remove the picker entries attached to a message after cancellation. */
+  readonly cancel: (token: number, chatId: number, messageId: number) =>
     Effect.Effect<Option.Option<PickerEntry>, never>
 }
 
@@ -64,6 +82,13 @@ export const Live: Layer.Layer<Pickers> = Layer.effect(
           const entries = new Map(state.entries).set(token, entry)
           return [token, { next: token + 1, entries }]
         }),
+      registerSessionPage: (input) =>
+        Ref.modify(ref, (state) => {
+          const token = state.next
+          const entry: PickerEntry = { kind: "session-page", ...input, messageId: 0 }
+          const entries = new Map(state.entries).set(token, entry)
+          return [token, { next: token + 1, entries }]
+        }),
       attachMessageId: (token, messageId) =>
         Ref.update(ref, (state) => {
           const entry = state.entries.get(token)
@@ -80,6 +105,18 @@ export const Live: Layer.Layer<Pickers> = Layer.effect(
           }
           const entries = new Map(state.entries)
           entries.delete(token)
+          return [Option.some(entry), { ...state, entries }]
+        }),
+      cancel: (token, chatId, messageId) =>
+        Ref.modify(ref, (state) => {
+          const entry = state.entries.get(token)
+          if (entry === undefined || entry.chatId !== chatId || entry.messageId !== messageId) {
+            return [Option.none(), state]
+          }
+          const entries = new Map(state.entries)
+          for (const [key, value] of entries) {
+            if (value.chatId === chatId && value.messageId === messageId) entries.delete(key)
+          }
           return [Option.some(entry), { ...state, entries }]
         }),
     }

@@ -1,5 +1,5 @@
 import { Buffer } from "node:buffer"
-import { Context, Data, Effect, FileSystem, Layer, Option, Schema, Stream } from "effect"
+import { Brand, Context, Data, Effect, FileSystem, Layer, Option, Schema, Stream } from "effect"
 import { HttpClient, HttpClientRequest } from "effect/unstable/http"
 import {
   AbsolutePath,
@@ -36,7 +36,11 @@ export interface OpenCodeShape {
   readonly wait: (sessionID: string) => Effect.Effect<void, OpenCodeError>
   readonly activeSessions: () => Effect.Effect<readonly string[], OpenCodeError>
   readonly compact: (sessionID: string) => Effect.Effect<void, OpenCodeError>
-  readonly listSessions: (directory: string) => Effect.Effect<readonly Session.Info[], OpenCodeError>
+  readonly listSessions: (input: { readonly directory: string; readonly cursor?: string; readonly limit?: number }) =>
+    Effect.Effect<{
+      readonly data: readonly Session.Info[]
+      readonly cursor: { readonly previous?: string | null; readonly next?: string | null }
+    }, OpenCodeError>
   readonly listProjects: () => Effect.Effect<readonly Project.Info[], OpenCodeError>
   readonly listProjectDirectories: (projectID: string) =>
     Effect.Effect<readonly { readonly directory: string; readonly strategy?: string }[], OpenCodeError>
@@ -144,6 +148,7 @@ const resolveEndpoint = (): Effect.Effect<ResolvedEndpoint, OpenCodeError, FileS
 
 /** Decode a plain string into a branded id required by the client contract. */
 type SessionID = Schema.Schema.Type<typeof Session.ID>
+type SessionCursor = string & Brand.Brand<"SessionsCursor">
 type PermissionID = Schema.Schema.Type<typeof Permission.ID>
 type QuestionID = Schema.Schema.Type<typeof Question.ID>
 type ModelID = Schema.Schema.Type<typeof Model.ID>
@@ -152,6 +157,8 @@ type VariantID = Schema.Schema.Type<typeof Model.VariantID>
 type ProjectID = Schema.Schema.Type<typeof Project.ID>
 
 const toSessionID = (value: string): SessionID => Schema.decodeUnknownSync(Session.ID)(value)
+const toSessionCursor = (value: string): SessionCursor =>
+  Schema.decodeUnknownSync(Schema.String.pipe(Schema.brand("SessionsCursor")))(value)
 const toPermissionID = (value: string): PermissionID => Schema.decodeUnknownSync(Permission.ID)(value)
 const toQuestionID = (value: string): QuestionID => Schema.decodeUnknownSync(Question.ID)(value)
 const toModelID = (value: string): ModelID => Schema.decodeUnknownSync(Model.ID)(value)
@@ -205,10 +212,14 @@ export const Live: Layer.Layer<
           Effect.map(() => undefined),
           wrap("session.compact"),
         ),
-      listSessions: (directory) =>
-        client.session.list({ directory: AbsolutePath.make(directory) }).pipe(
+      listSessions: (input) =>
+        client.session.list({
+          directory: AbsolutePath.make(input.directory),
+          cursor: input.cursor === undefined ? undefined : toSessionCursor(input.cursor),
+          limit: input.limit,
+        }).pipe(
           wrap("session.list"),
-          Effect.map((output) => output.data),
+          Effect.map((output) => ({ data: output.data, cursor: output.cursor })),
         ),
       listProjects: () => client.project.list().pipe(wrap("project.list")),
       listProjectDirectories: (projectID) =>

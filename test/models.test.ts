@@ -122,4 +122,24 @@ describe("ModelRegistry", () => {
     expect(Option.isNone(result.stale)).toBe(true)
     expect(Option.isSome(result.current)).toBe(true)
   })
+
+  test("cancel removes all entries for the picker message", async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const registry = yield* ModelRegistry
+        const page = yield* registry.registerPage({
+          sessionID: "s", models, page: 0, total: 2, chatId: 1,
+        })
+        const variant = yield* registry.registerVariant({
+          sessionID: "s", providerID: "p", modelID: "m", variants: ["v"], chatId: 1, messageId: 10,
+        })
+        yield* registry.attachMessageId(page, 10)
+        const cancelled = yield* registry.cancel(page, 1, 10)
+        const remaining = yield* registry.take(variant, 1, 10)
+        return { cancelled, remaining }
+      }).pipe(Effect.provide(Live)),
+    )
+    expect(Option.isSome(result.cancelled)).toBe(true)
+    expect(Option.isNone(result.remaining)).toBe(true)
+  })
 })

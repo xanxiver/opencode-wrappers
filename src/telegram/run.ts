@@ -118,9 +118,6 @@ export const questionKeyboard = (
   return { inline_keyboard: chunk(buttons, 2) }
 }
 
-/** Auto-compact sessions above this input token count. */
-export const COMPACT_THRESHOLD_INPUT_TOKENS = 200_000
-
 const handleEvent = (
   event: SessionEvent,
   chatId: number,
@@ -128,7 +125,6 @@ const handleEvent = (
   state: Ref.Ref<RunState>,
   terminal: Ref.Ref<Option.Option<RunOutcome>>,
   terminalHandled: Deferred.Deferred<void>,
-  compacting: Ref.Ref<boolean>,
   registry: PermissionRegistryShape,
   questionRegistry: QuestionRegistryShape,
 ): Effect.Effect<void, never, TelegramApi | HttpClient.HttpClient | OpenCode> => {
@@ -227,27 +223,17 @@ const handleEvent = (
       return Ref.update(state, (current) => ({ ...current, activity: Option.none(), dirty: true }))
     }
     case "session.usage.updated": {
-      return Effect.gen(function* () {
-        yield* Ref.update(state, (current) => ({
-          ...current,
-          usage: Option.some({
-            cost: event.data.cost,
-            tokens: {
-              input: event.data.tokens.input,
-              output: event.data.tokens.output,
-              reasoning: event.data.tokens.reasoning,
-            },
-          }),
-        }))
-        const already = yield* Ref.get(compacting)
-        if (!already && event.data.tokens.input > COMPACT_THRESHOLD_INPUT_TOKENS) {
-          yield* Ref.set(compacting, true)
-          const opencode = yield* OpenCode
-          yield* opencode.compact(event.data.sessionID).pipe(
-            Effect.catchCause(logOpenCodeFailure("compact failed")),
-          )
-        }
-      })
+      return Ref.update(state, (current) => ({
+        ...current,
+        usage: Option.some({
+          cost: event.data.cost,
+          tokens: {
+            input: event.data.tokens.input,
+            output: event.data.tokens.output,
+            reasoning: event.data.tokens.reasoning,
+          },
+        }),
+      }))
     }
     case "permission.asked": {
       return Effect.gen(function* () {
@@ -385,7 +371,6 @@ export const runPrompt = (input: RunInput) =>
       const terminal = yield* Ref.make<Option.Option<RunOutcome>>(Option.none())
       const terminalHandled = yield* Deferred.make<void>()
       const eventReady = yield* Deferred.make<void>()
-      const compacting = yield* Ref.make(false)
       const waitUntilIdle = (failureMessage: string): Effect.Effect<boolean> =>
         Effect.gen(function* () {
           while (true) {
@@ -448,7 +433,6 @@ export const runPrompt = (input: RunInput) =>
             state,
             terminal,
             terminalHandled,
-            compacting,
             registry,
             questionRegistry,
           )

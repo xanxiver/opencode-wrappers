@@ -10,9 +10,19 @@ import type { Pickers } from "../pickers.js"
 import type { QuestionRegistry } from "../questions.js"
 import { answer } from "./shared.js"
 import { handlePermissionCallback } from "./permission.js"
-import { handleModelCallback, handleModelPageCallback, handleModelVariantCallback } from "./model.js"
+import {
+  handleModelCallback,
+  handleModelCancelCallback,
+  handleModelPageCallback,
+  handleModelVariantCallback,
+} from "./model.js"
 import { handleQuestionCallback } from "./question.js"
-import { handleDirectoryCallback, handleSessionCallback } from "./picker.js"
+import {
+  handleDirectoryCallback,
+  handleSessionCallback,
+  handleSessionCancelCallback,
+  handleSessionPageCallback,
+} from "./picker.js"
 
 /** Services used by the callback handlers. Keep the dispatcher boundary typed. */
 type CallbackEnv =
@@ -40,12 +50,18 @@ export const handleCallback = (query: CallbackQuery): Effect.Effect<void, never,
           return handleModelPageCallback(query, data)
         case "modelv":
           return handleModelVariantCallback(query, data)
+        case "modelc":
+          return handleModelCancelCallback(query, data)
         case "q":
           return handleQuestionCallback(query, data)
         case "dir":
           return handleDirectoryCallback(query, data)
         case "ses":
           return handleSessionCallback(query, data)
+        case "sesp":
+          return handleSessionPageCallback(query, data)
+        case "sesc":
+          return handleSessionCancelCallback(query, data)
         default:
           return answer(query.id, "Unknown action.")
       }

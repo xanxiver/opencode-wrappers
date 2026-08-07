@@ -85,4 +85,23 @@ describe("Pickers", () => {
     expect(Option.isNone(result.stale)).toBe(true)
     expect(Option.isSome(result.current)).toBe(true)
   })
+
+  test("cancel removes all entries for the picker message", async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const pickers = yield* Pickers
+        const session = yield* pickers.registerSession({
+          sessionID: "ses_1", directory: "/a", title: Option.none(), chatId: 1,
+        })
+        const page = yield* pickers.registerSessionPage({ directory: "/a", chatId: 1 })
+        yield* pickers.attachMessageId(session, 10)
+        yield* pickers.attachMessageId(page, 10)
+        const cancelled = yield* pickers.cancel(page, 1, 10)
+        const remaining = yield* pickers.take(session, 1, 10)
+        return { cancelled, remaining }
+      }).pipe(Effect.provide(Live)),
+    )
+    expect(Option.isSome(result.cancelled)).toBe(true)
+    expect(Option.isNone(result.remaining)).toBe(true)
+  })
 })

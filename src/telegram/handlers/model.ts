@@ -8,6 +8,7 @@ import { ModelRegistry } from "../models.js"
 import {
   MODEL_PAGE_SIZE,
   modelPageKeyboard,
+  parseModelCancelCallback,
   parseModelCallback,
   parseModelPageCallback,
   parseModelVariantCallback,
@@ -81,7 +82,8 @@ export const handleModelCallback = (query: CallbackQuery, data: string) =>
                                 callback_data: `modelv:${variantToken}:${index}`,
                               })),
                               2,
-                            )
+                            ).map((row) => [...row])
+                            rows.push([{ text: "Cancel", callback_data: `modelc:${variantToken}` }])
                             yield* apiEdit(
                               value.chatId,
                               value.messageId,
@@ -205,6 +207,29 @@ export const handleModelVariantCallback = (query: CallbackQuery, data: string) =
       ),
   })
 
+/** Cancel the model picker without changing the active model. */
+export const handleModelCancelCallback = (query: CallbackQuery, data: string) =>
+  Option.match(parseModelCancelCallback(data), {
+    onNone: () => answer(query.id, "Invalid data."),
+    onSome: (token) =>
+      Effect.gen(function* () {
+        const registry = yield* ModelRegistry
+        const message = query.message
+        if (message === undefined) {
+          yield* answer(query.id, "Invalid callback.")
+          return
+        }
+        const entry = yield* registry.cancel(token, message.chat.id, message.message_id)
+        yield* Option.match(entry, {
+          onNone: () => answer(query.id, "Expired."),
+          onSome: (value) =>
+            apiEdit(value.chatId, value.messageId, "Model selection cancelled.").pipe(
+              Effect.andThen(answer(query.id, "Cancelled.")),
+            ),
+        })
+      }).pipe(Effect.catchCause(callbackFailure(query, "model cancel callback failed", "Failed."))),
+  })
+
 /** `/model` — list models page by page; picking one selects it for the session. */
 export const showModels = (chatId: number, threadId?: number) =>
   Effect.gen(function* () {
@@ -245,7 +270,7 @@ export const showModels = (chatId: number, threadId?: number) =>
     const message = yield* sendMarkup(
       chatId,
       currentLine + renderModelPageHeader(0, pageModels.length),
-      modelPageKeyboard(token, pageModels, 0, pageModels.length),
+      modelPageKeyboard(token, pageModels.slice(0, MODEL_PAGE_SIZE), 0, pageModels.length),
       threadId,
     )
     yield* Option.match(message, {

@@ -206,14 +206,17 @@ export const showStatus = (chatId: number, threadId?: number) =>
       onSome: (model) =>
         `Model: ${model.id} (${model.providerID})${model.variant === undefined ? "" : ` [${model.variant}]`}`,
     })
-    const contextLine = yield* Option.match(sessionID, {
-      onNone: () => Effect.succeed("Context: none"),
+    const sessionStatus = yield* Option.match(sessionID, {
+      onNone: () => Effect.succeed({ session: Option.none(), contextLine: "Context: none" }),
       onSome: (id) =>
         opencode.getSession(id).pipe(
-          Effect.map((session) => `Context: ${session.tokens.input.toLocaleString()} input tokens`),
+          Effect.map((session) => ({
+            session: Option.some(session),
+            contextLine: `Context: ${session.tokens.input.toLocaleString()} input tokens`,
+          })),
           Effect.catchCause((cause) =>
             logBoundary("telegram/handlers", "opencode-client", "session status failed")(cause).pipe(
-              Effect.andThen(Effect.succeed("Context: unavailable")),
+              Effect.andThen(Effect.succeed({ session: Option.none(), contextLine: "Context: unavailable" })),
             ),
           ),
         ),
@@ -232,11 +235,33 @@ export const showStatus = (chatId: number, threadId?: number) =>
     })
     const sessionLine = Option.match(sessionID, {
       onNone: () => "Session: none",
-      onSome: (id) => `Session: ${id}`,
+      onSome: (id) =>
+        Option.match(sessionStatus.session, {
+          onNone: () => `Session: ${id}`,
+          onSome: (session) => session.title === undefined ? `Session: ${id}` : `Session: ${session.title} (${id})`,
+        }),
     })
     yield* sendText(
       chatId,
-      `Directory: ${directory}\n${sessionLine}\n${modelLine}\n${contextLine}\n${runLine}`,
+      `Directory: ${directory}\n${sessionLine}\n${modelLine}\n${sessionStatus.contextLine}\n${runLine}`,
       threadId,
     )
   })
+
+/** `/session <id>` — validate and set the active session for this directory. */
+export const setSessionById = (chatId: number, sessionID: string, threadId?: number) =>
+  Effect.gen(function* () {
+    const sessions = yield* Sessions
+    const opencode = yield* OpenCode
+    const store = yield* Store
+    const directory = yield* sessions.directoryFor(clientId(chatId))
+    yield* opencode.getSession(sessionID)
+    yield* store.setSessionIDForDirectory(directory, sessionID)
+    yield* sendText(chatId, `Active session set to ${sessionID}.`, threadId)
+  }).pipe(
+    Effect.catchCause((cause) =>
+      logBoundary("telegram/handlers", "session", "set session by id failed")(cause).pipe(
+        Effect.andThen(sendText(chatId, `Session not found: ${sessionID}.`, threadId)),
+      ),
+    ),
+  )

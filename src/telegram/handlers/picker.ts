@@ -6,6 +6,7 @@ import { Store } from "../../core/store.js"
 import { Pickers } from "../pickers.js"
 import type { CallbackQuery } from "../api.js"
 import { answer, apiEdit, callbackFailure, chunk, clientId, sendMarkup, sendText } from "./shared.js"
+import { parseSessionPageCallback } from "../render.js"
 import { setProjectDirectory } from "./run.js"
 
 /** `/projects` — list project directories, let the user pick one for this chat. */
@@ -34,13 +35,13 @@ export const showProjects = (chatId: number, threadId?: number) =>
     const tokens = yield* Effect.forEach(visible, (directory) =>
       pickers.registerDirectory({ directory, chatId })
     )
-    const rows = chunk(
+    const rows = [...chunk(
       visible.map((directory, index) => ({
         text: directory,
         callback_data: `dir:${tokens[index]}`,
       })),
       1,
-    )
+    )]
     const message = yield* sendMarkup(
       chatId,
       directories.length > visible.length
@@ -65,18 +66,27 @@ export const showSessions = (chatId: number, threadId?: number) =>
     const pickers = yield* Pickers
     const directory = yield* sessions.directoryFor(clientId(chatId))
     const current = yield* store.getSessionIDForDirectory(directory)
-    const list = yield* opencode.listSessions(directory).pipe(
+    const list = yield* opencode.listSessions({ directory, limit: 20 }).pipe(
       Effect.catchCause((cause) =>
         logBoundary("telegram/handlers", "opencode-client", "list sessions failed")(cause).pipe(
-          Effect.andThen(Effect.succeed<readonly { id: string; title?: string }[]>([])),
+          Effect.andThen(Effect.succeed({
+            data: [] as readonly { id: string; title?: string }[],
+            previous: undefined,
+            next: undefined,
+          })),
         ),
       ),
+      Effect.map((page) => ({
+        data: page.data,
+        previous: "cursor" in page ? page.cursor.previous : page.previous,
+        next: "cursor" in page ? page.cursor.next : page.next,
+      })),
     )
-    if (list.length === 0) {
+    if (list.data.length === 0) {
       yield* sendText(chatId, "No sessions in this directory.", threadId)
       return
     }
-    const visible = list.slice(0, 20)
+    const visible = list.data
     const tokens = yield* Effect.forEach(visible, (session) =>
       pickers.registerSession({
         sessionID: session.id,
@@ -85,13 +95,25 @@ export const showSessions = (chatId: number, threadId?: number) =>
         chatId,
       }),
     )
-    const rows = chunk(
+    const rows = [...chunk(
       visible.map((session, index) => ({
         text: session.title ?? session.id,
         callback_data: `ses:${tokens[index]}`,
       })),
       1,
-    )
+    )]
+    const pageToken = yield* pickers.registerSessionPage({
+      directory,
+      chatId,
+      previous: list.previous ?? undefined,
+      next: list.next ?? undefined,
+    })
+    const navigation = [
+      ...(list.previous == null ? [] : [{ text: "Previous", callback_data: `sesp:${pageToken}:previous` }]),
+      ...(list.next == null ? [] : [{ text: "Next", callback_data: `sesp:${pageToken}:next` }]),
+    ]
+    if (navigation.length > 0) rows.push(navigation)
+    rows.push([{ text: "Cancel", callback_data: `sesc:${pageToken}` }])
     const currentLine = Option.match(current, {
       onNone: () => "No active session.",
       onSome: (id) => `Current: ${id}`,
@@ -105,8 +127,92 @@ export const showSessions = (chatId: number, threadId?: number) =>
     yield* Option.match(message, {
       onNone: () => Effect.void,
       onSome: (sent) =>
-        Effect.forEach(tokens, (token) => pickers.attachMessageId(token, sent.message_id), { discard: true }),
+        Effect.gen(function* () {
+          yield* Effect.forEach(tokens, (token) => pickers.attachMessageId(token, sent.message_id), { discard: true })
+          yield* pickers.attachMessageId(pageToken, sent.message_id)
+        }),
     })
+  })
+
+/** Navigate the cursor-based session picker. */
+export const handleSessionPageCallback = (query: CallbackQuery, data: string) =>
+  Option.match(parseSessionPageCallback(data), {
+    onNone: () => answer(query.id, "Invalid data."),
+    onSome: (parsed) =>
+      Effect.gen(function* () {
+        const pickers = yield* Pickers
+        const opencode = yield* OpenCode
+        const message = query.message
+        if (message === undefined) {
+          yield* answer(query.id, "Invalid callback.")
+          return
+        }
+        const entry = yield* pickers.take(parsed.token, message.chat.id, message.message_id)
+        yield* Option.match(entry, {
+          onNone: () => answer(query.id, "Expired."),
+          onSome: (value) => {
+            if (!("kind" in value) || value.kind !== "session-page") return answer(query.id, "Invalid entry.")
+            const cursor = parsed.direction === "next" ? value.next : value.previous
+            if (cursor === undefined) return answer(query.id, "No more sessions.")
+            return Effect.gen(function* () {
+              const page = yield* opencode.listSessions({ directory: value.directory, cursor, limit: 20 })
+              if (page.data.length === 0) {
+                yield* answer(query.id, "No sessions on that page.")
+                return
+              }
+              const sessionTokens = yield* Effect.forEach(page.data, (session) => pickers.registerSession({
+                sessionID: session.id,
+                directory: value.directory,
+                title: Option.fromNullishOr(session.title),
+                chatId: value.chatId,
+              }))
+              const pageToken = yield* pickers.registerSessionPage({
+                directory: value.directory,
+                chatId: value.chatId,
+                previous: page.cursor.previous ?? undefined,
+                next: page.cursor.next ?? undefined,
+              })
+            const rows = [...chunk(page.data.map((session, index) => ({
+                text: session.title ?? session.id,
+                callback_data: `ses:${sessionTokens[index]}`,
+            })), 1)]
+              const navigation = [
+                ...(page.cursor.previous == null ? [] : [{ text: "Previous", callback_data: `sesp:${pageToken}:previous` }]),
+                ...(page.cursor.next == null ? [] : [{ text: "Next", callback_data: `sesp:${pageToken}:next` }]),
+              ]
+              if (navigation.length > 0) rows.push(navigation)
+              rows.push([{ text: "Cancel", callback_data: `sesc:${pageToken}` }])
+              yield* pickers.attachMessageId(pageToken, message.message_id)
+              yield* Effect.forEach(sessionTokens, (token) => pickers.attachMessageId(token, message.message_id), { discard: true })
+              yield* apiEdit(value.chatId, message.message_id, `Sessions in ${value.directory}:`, { inline_keyboard: rows })
+              yield* answer(query.id, "Page changed.")
+            }).pipe(Effect.catchCause(callbackFailure(query, "session page callback failed", "Failed.")))
+          },
+        })
+      }).pipe(Effect.catchCause(callbackFailure(query, "session page callback failed", "Failed."))),
+  })
+
+/** Cancel the session picker without changing the active session. */
+export const handleSessionCancelCallback = (query: CallbackQuery, data: string) =>
+  Option.match(parseTokenCallback(data, "sesc"), {
+    onNone: () => answer(query.id, "Invalid data."),
+    onSome: (token) =>
+      Effect.gen(function* () {
+        const pickers = yield* Pickers
+        const message = query.message
+        if (message === undefined) {
+          yield* answer(query.id, "Invalid callback.")
+          return
+        }
+        const entry = yield* pickers.cancel(token, message.chat.id, message.message_id)
+        yield* Option.match(entry, {
+          onNone: () => answer(query.id, "Expired."),
+          onSome: (value) =>
+            apiEdit(value.chatId, value.messageId, "Session selection cancelled.").pipe(
+              Effect.andThen(answer(query.id, "Cancelled.")),
+            ),
+        })
+      }).pipe(Effect.catchCause(callbackFailure(query, "session cancel callback failed", "Failed."))),
   })
 
 export const handleDirectoryCallback = (query: CallbackQuery, data: string) =>
