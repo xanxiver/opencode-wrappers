@@ -14,11 +14,14 @@ import {
   handleModelCallback,
   handleModelCancelCallback,
   handleModelPageCallback,
+  handleModelProviderCallback,
   handleModelVariantCallback,
 } from "./model.js"
 import { handleQuestionCallback } from "./question.js"
 import {
   handleDirectoryCallback,
+  handleDirectoryCancelCallback,
+  handleDirectoryPageCallback,
   handleSessionCallback,
   handleSessionCancelCallback,
   handleSessionPageCallback,
@@ -48,6 +51,8 @@ export const handleCallback = (query: CallbackQuery): Effect.Effect<void, never,
           return handleModelCallback(query, data)
         case "modelp":
           return handleModelPageCallback(query, data)
+        case "modelpr":
+          return handleModelProviderCallback(query, data)
         case "modelv":
           return handleModelVariantCallback(query, data)
         case "modelc":
@@ -56,6 +61,10 @@ export const handleCallback = (query: CallbackQuery): Effect.Effect<void, never,
           return handleQuestionCallback(query, data)
         case "dir":
           return handleDirectoryCallback(query, data)
+        case "dirp":
+          return handleDirectoryPageCallback(query, data)
+        case "dirc":
+          return handleDirectoryCancelCallback(query, data)
         case "ses":
           return handleSessionCallback(query, data)
         case "sesp":

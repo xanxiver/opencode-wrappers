@@ -39,6 +39,7 @@ const StateSchema = Schema.Struct({
 
 /** Legacy format: clientId -> sessionID (one session per chat). */
 const LegacySchema = Schema.Record(Schema.String, Schema.String)
+type JsonValue = ReturnType<typeof JSON.parse>
 
 const emptyState = (): State => ({ sessions: {}, directories: {}, models: {} })
 
@@ -51,7 +52,7 @@ const migrateLegacy = (legacy: Record<string, string>): State => {
   return { sessions: { ...legacy }, directories, models: {} }
 }
 
-const parseState = (json: unknown): Option.Option<{ readonly state: State; readonly migrated: boolean }> =>
+const parseState = (json: JsonValue): Option.Option<{ readonly state: State; readonly migrated: boolean }> =>
   Option.match(Schema.decodeUnknownOption(StateSchema)(json), {
     onNone: () =>
       Option.match(Schema.decodeUnknownOption(LegacySchema)(json), {
@@ -61,7 +62,7 @@ const parseState = (json: unknown): Option.Option<{ readonly state: State; reado
     onSome: (state) => Option.some({ state: { ...state, models: state.models ?? {} }, migrated: false }),
   })
 
-export interface StoreShape {
+export interface StoreService {
   readonly getSessionIDForDirectory: (directory: string) => Effect.Effect<Option.Option<string>, never>
   readonly setSessionIDForDirectory: (directory: string, sessionID: string) => Effect.Effect<void, StoreError>
   readonly removeSessionIDForDirectory: (directory: string) => Effect.Effect<void, StoreError>
@@ -71,9 +72,11 @@ export interface StoreShape {
   readonly setModel: (directory: string, model: StoredModel) => Effect.Effect<void, StoreError>
   /** Every client id the store knows about. */
   readonly listClients: () => Effect.Effect<readonly string[], never>
+  /** Every directory retained by a client or session mapping. */
+  readonly listDirectories: () => Effect.Effect<readonly string[], never>
 }
 
-export class Store extends Context.Service<Store, StoreShape>()("opencode2-uis/Store") {}
+export class Store extends Context.Service<Store, StoreService>()("opencode2-uis/Store") {}
 
 export const Live: Layer.Layer<Store, StoreError, FileSystem.FileSystem | AppConfig> = Layer.effect(
   Store,
@@ -95,10 +98,13 @@ export const Live: Layer.Layer<Store, StoreError, FileSystem.FileSystem | AppCon
         Effect.mapError((cause) => new StoreError({ message: "failed to write state file", cause })),
       )
     const loaded = yield* fs.readFileString(config.stateFile).pipe(
-      Effect.map((text): unknown => JSON.parse(text)),
+      Effect.flatMap((text) => Effect.try({
+        try: (): JsonValue => JSON.parse(text),
+        catch: (cause) => new StoreError({ message: "state file contains invalid JSON", cause }),
+      })),
       Effect.flatMap((json) => Effect.succeed(parseState(json))),
       Effect.catchIf(
-        (error: PlatformError) => error.reason._tag === "NotFound",
+        (error: PlatformError | StoreError) => error._tag === "PlatformError" && error.reason._tag === "NotFound",
         () =>
           Effect.annotateLogs({ component: "core/store", boundary: "state-file" })(
             Effect.logDebug("state file not found; starting empty"),
@@ -158,6 +164,9 @@ export const Live: Layer.Layer<Store, StoreError, FileSystem.FileSystem | AppCon
           models: { ...state.models, [directory]: model },
         })),
       listClients: () => Ref.get(ref).pipe(Effect.map((state) => Object.keys(state.directories))),
+      listDirectories: () => Ref.get(ref).pipe(Effect.map((state) => [
+        ...new Set([...Object.keys(state.sessions), ...Object.values(state.directories)]),
+      ])),
     }
   }),
 )

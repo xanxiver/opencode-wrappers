@@ -14,11 +14,11 @@ export const parseAllowedUsers = (raw: string | undefined): ReadonlySet<number> 
   return ids
 }
 
-export interface AccessShape {
+export interface AccessPolicy {
   readonly isAllowed: (userId: number) => boolean
 }
 
-export class Access extends Context.Service<Access, AccessShape>()("opencode2-uis/Access") {}
+export class Access extends Context.Service<Access, AccessPolicy>()("opencode2-uis/Access") {}
 
 export const Live: Layer.Layer<Access, never, AppConfig> = Layer.effect(
   Access,

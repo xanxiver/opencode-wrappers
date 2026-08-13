@@ -7,6 +7,15 @@ export interface PendingDirectory {
   readonly messageId: number
 }
 
+/** A page in the project-directory picker. */
+export interface PendingDirectoryPage {
+  readonly kind: "directory-page"
+  readonly directories: readonly string[]
+  readonly page: number
+  readonly chatId: number
+  readonly messageId: number
+}
+
 /** A session chosen from the session list. */
 export interface PendingSession {
   readonly sessionID: string
@@ -25,11 +34,16 @@ export interface PendingSessionPage {
   readonly messageId: number
 }
 
-export type PickerEntry = PendingDirectory | PendingSession | PendingSessionPage
+export type PickerEntry = PendingDirectory | PendingDirectoryPage | PendingSession | PendingSessionPage
 
-export interface PickersShape {
+export interface PickerService {
   readonly registerDirectory: (input: { readonly directory: string; readonly chatId: number }) =>
     Effect.Effect<number, never>
+  readonly registerDirectoryPage: (input: {
+    readonly directories: readonly string[]
+    readonly page: number
+    readonly chatId: number
+  }) => Effect.Effect<number, never>
   readonly registerSession: (input: {
     readonly sessionID: string
     readonly directory: string
@@ -50,7 +64,7 @@ export interface PickersShape {
     Effect.Effect<Option.Option<PickerEntry>, never>
 }
 
-export class Pickers extends Context.Service<Pickers, PickersShape>()("opencode2-uis/Pickers") {}
+export class Pickers extends Context.Service<Pickers, PickerService>()("opencode2-uis/Pickers") {}
 
 interface RegistryState {
   readonly next: number
@@ -66,6 +80,13 @@ export const Live: Layer.Layer<Pickers> = Layer.effect(
         Ref.modify(ref, (state) => {
           const token = state.next
           const entry: PickerEntry = { ...input, messageId: 0 }
+          const entries = new Map(state.entries).set(token, entry)
+          return [token, { next: token + 1, entries }]
+        }),
+      registerDirectoryPage: (input) =>
+        Ref.modify(ref, (state) => {
+          const token = state.next
+          const entry: PickerEntry = { kind: "directory-page", ...input, messageId: 0 }
           const entries = new Map(state.entries).set(token, entry)
           return [token, { next: token + 1, entries }]
         }),

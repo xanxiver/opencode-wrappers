@@ -1,7 +1,7 @@
-import { Cause, Context, Data, Effect, Layer, Option, Ref, Schedule, Schema } from "effect"
+import { Cause, Clock, Context, Data, Effect, Layer, Option, Ref, Schedule, Schema } from "effect"
 import { HttpBody, HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
 import { Stream } from "effect"
-import { AppConfigTag } from "../config.js"
+import { AppConfigTag, ConfigError } from "../config.js"
 import { logBoundary } from "../core/logging.js"
 import type { AppConfig } from "../config.js"
 
@@ -16,6 +16,19 @@ export class ApiError extends Data.TaggedError("ApiError")<{
 
 /** Status codes that are safe to retry with backoff. */
 export const isTransientStatus = (status: number): boolean => status === 429 || status >= 500
+
+/** A Telegram 4xx response proves that the requested message was not accepted. */
+export const isDefinitiveSendRejection = (error: Pick<ApiError, "code" | "transient">): boolean =>
+  error.code !== undefined && error.code >= 400 && error.code < 500 && !error.transient
+
+/** Record a durable rejected-send fence only when Telegram proves rejection. */
+export const recordDefinitiveSendFailure = <A, E, R, R2>(
+  send: Effect.Effect<A, ApiError, R>,
+  reject: Effect.Effect<boolean, E, R2>,
+): Effect.Effect<A, ApiError | E, R | R2> => send.pipe(Effect.catchTag("ApiError", (error) =>
+  isDefinitiveSendRejection(error)
+    ? reject.pipe(Effect.andThen(Effect.fail(error)))
+    : Effect.fail(error)))
 
 /** Minimum interval between message edits for the same chat (ms). */
 export const EDIT_MIN_INTERVAL_MS = 1000
@@ -36,6 +49,18 @@ export interface KeyboardButton {
 
 export interface KeyboardMarkup {
   readonly inline_keyboard: ReadonlyArray<ReadonlyArray<KeyboardButton>>
+}
+
+export interface TelegramMediaInput {
+  readonly chatId: number
+  readonly bytes: Uint8Array
+  readonly name: string
+  readonly mime: string
+  readonly caption?: string
+  readonly messageThreadId?: number
+  readonly replyToMessageId?: number
+  /** Disable transport retries when a repeated upload could duplicate delivery. */
+  readonly retryTransient?: boolean
 }
 
 const ChatSchema = Schema.Struct({ id: Schema.Number })
@@ -60,11 +85,12 @@ const MessageContentSchema = Schema.Struct({
   from: Schema.optional(Schema.Struct({ id: Schema.Number })),
   message_thread_id: Schema.optional(Schema.Number),
   text: Schema.optional(Schema.String),
+  caption: Schema.optional(Schema.String),
   document: Schema.optional(DocumentSchema),
   photo: Schema.optional(Schema.Array(PhotoSizeSchema)),
 })
 
-const MessageSchema = Schema.Struct({
+export const MessageSchema = Schema.Struct({
   ...MessageContentSchema.fields,
   reply_to_message: Schema.optional(MessageContentSchema),
 })
@@ -102,8 +128,9 @@ const envelope = Schema.Struct({
   description: Schema.optional(Schema.String),
   error_code: Schema.optional(Schema.Number),
 })
+type JsonValue = ReturnType<typeof JSON.parse>
 
-export interface TelegramApiShape {
+export interface TelegramApiClient {
   readonly getUpdates: (offset: number, timeoutSeconds: number) =>
     Effect.Effect<readonly Update[], ApiError, HttpClient.HttpClient>
   readonly sendMessage: (input: {
@@ -112,7 +139,12 @@ export interface TelegramApiShape {
     readonly replyMarkup?: KeyboardMarkup
     /** Forum topic thread id; replies into that thread when provided. */
     readonly messageThreadId?: number
+    /** Reply to another Telegram message when provided. */
+    readonly replyToMessageId?: number
   }) => Effect.Effect<Message, ApiError, HttpClient.HttpClient>
+  readonly sendPhoto: (input: TelegramMediaInput) => Effect.Effect<Message, ApiError, HttpClient.HttpClient>
+  readonly sendVideo: (input: TelegramMediaInput) => Effect.Effect<Message, ApiError, HttpClient.HttpClient>
+  readonly sendDocument: (input: TelegramMediaInput) => Effect.Effect<Message, ApiError, HttpClient.HttpClient>
   readonly editMessageText: (input: {
     readonly chatId: number
     readonly messageId: number
@@ -127,56 +159,92 @@ export interface TelegramApiShape {
   readonly downloadFile: (filePath: string) => Effect.Effect<Uint8Array<ArrayBufferLike>, ApiError, HttpClient.HttpClient>
 }
 
-export class TelegramApi extends Context.Service<TelegramApi, TelegramApiShape>()(
+export class TelegramApi extends Context.Service<TelegramApi, TelegramApiClient>()(
   "opencode2-uis/TelegramApi",
 ) {}
 
 const logApiBoundary = (operation: string) => (cause: Cause.Cause<unknown>): Effect.Effect<void> =>
   logBoundary("telegram/api", "telegram-bot-api", `telegram ${operation} failed`)(cause)
 
+export const decodeTelegramResponse = <A>(
+  operation: string,
+  schema: Schema.ConstraintCodec<A>,
+  text: string,
+): Effect.Effect<A, ApiError> => Effect.gen(function* () {
+  const body = yield* Effect.try({
+    try: (): JsonValue => JSON.parse(text),
+    catch: (cause) => new ApiError({ operation, cause, transient: false }),
+  }).pipe(
+    Effect.flatMap((json) => Schema.decodeUnknownEffect(envelope)(json)),
+    Effect.mapError((cause) => cause instanceof ApiError
+      ? cause
+      : new ApiError({ operation, cause, transient: false })),
+  )
+  if (!body.ok) {
+    return yield* new ApiError({
+      operation,
+      code: body.error_code,
+      description: body.description,
+      transient: body.error_code !== undefined && isTransientStatus(body.error_code),
+    })
+  }
+  return yield* Option.match(Option.fromNullishOr(body.result), {
+    onNone: () => Effect.fail(new ApiError({ operation, description: "response has no result", transient: false })),
+    onSome: (result) => Schema.decodeUnknownEffect(schema)(result).pipe(
+      Effect.mapError((cause) => new ApiError({ operation, cause, transient: false })),
+    ),
+  })
+})
+
+/** Preserve Telegram's structured error details even when HTTP is non-2xx. */
+export const decodeTelegramErrorResponse = (
+  operation: string,
+  status: number,
+  text: string,
+): ApiError => {
+  const parsed = Effect.runSync(Effect.try({
+    try: (): JsonValue => JSON.parse(text),
+    catch: () => undefined,
+  }))
+  const decoded = Schema.decodeUnknownOption(envelope)(parsed)
+  const code = Option.isSome(decoded) ? (decoded.value.error_code ?? status) : status
+  const details: { readonly description?: string } = Option.isSome(decoded) && decoded.value.description !== undefined
+    ? { description: decoded.value.description }
+    : {}
+  return new ApiError({
+    operation,
+    code,
+    ...details,
+    transient: isTransientStatus(code),
+  })
+}
+
 /**
  * Execute a request with backoff retry for transient failures.
  * Network errors and transient statuses retry; decode and business errors do not.
  */
-const call = <A>(operation: string, schema: Schema.ConstraintCodec<A>) =>
+const call = <A>(
+  operation: string,
+  schema: Schema.ConstraintCodec<A>,
+  options?: { readonly retryTransient?: boolean },
+) =>
   (request: HttpClientRequest.HttpClientRequest): Effect.Effect<A, ApiError, HttpClient.HttpClient> =>
     Effect.gen(function* () {
-      const response = yield* HttpClient.execute(request).pipe(
+      const requestEffect = HttpClient.execute(request).pipe(
         Effect.mapError((cause) => new ApiError({ operation, cause, transient: true })),
-        Effect.flatMap((result) => {
-          const status = result.status
-          return status >= 200 && status < 300
-            ? Effect.succeed(result)
-            : Effect.fail(new ApiError({ operation, code: status, transient: isTransientStatus(status) }))
-        }),
-        Effect.retry({ schedule: retrySchedule, while: (error) => error.transient }),
+        Effect.flatMap((response) => HttpClientResponse.stream(Effect.succeed(response)).pipe(
+          Stream.runCollect,
+          Effect.map(concatBytes),
+          Effect.map((bytes) => new TextDecoder().decode(bytes)),
+          Effect.mapError((cause) => new ApiError({ operation, cause, transient: true })),
+          Effect.flatMap((text) => response.status >= 200 && response.status < 300
+            ? decodeTelegramResponse(operation, schema, text)
+            : Effect.fail(decodeTelegramErrorResponse(operation, response.status, text))),
+        )),
       )
-      const body = yield* HttpClientResponse.stream(Effect.succeed(response)).pipe(
-        Stream.runCollect,
-        Effect.map(concatBytes),
-        Effect.map((bytes) => new TextDecoder().decode(bytes)),
-        Effect.map((text): unknown => JSON.parse(text)),
-        Effect.flatMap((json) => Schema.decodeUnknownEffect(envelope)(json)),
-        Effect.mapError((cause) => new ApiError({ operation, cause, transient: false })),
-      )
-      if (!body.ok) {
-        return yield* Effect.fail(
-          new ApiError({
-            operation,
-            code: body.error_code,
-            description: body.description,
-            transient: body.error_code !== undefined && isTransientStatus(body.error_code),
-          }),
-        )
-      }
-      return yield* Option.match(Option.fromNullishOr(body.result), {
-        onNone: () =>
-          Effect.fail(new ApiError({ operation, description: "response has no result", transient: false })),
-        onSome: (result) =>
-          Schema.decodeUnknownEffect(schema)(result).pipe(
-            Effect.mapError((cause) => new ApiError({ operation, cause, transient: false })),
-          ),
-      })
+      return yield* options?.retryTransient === false
+        ? requestEffect
+        : requestEffect.pipe(Effect.retry({ schedule: retrySchedule, while: (error) => error.transient }))
     }).pipe(
       Effect.catchCause((cause) =>
         Option.match(Cause.findErrorOption(cause), {
@@ -189,8 +257,30 @@ const call = <A>(operation: string, schema: Schema.ConstraintCodec<A>) =>
       ),
     )
 
-const jsonBody = (operation: string, value: unknown) =>
+const jsonBody = <A>(operation: string, value: A) =>
   HttpBody.json(value).pipe(Effect.mapError((cause) => new ApiError({ operation, cause, transient: false })))
+
+const mediaRequest = (
+  base: string,
+  operation: "sendPhoto" | "sendVideo" | "sendDocument",
+  field: "photo" | "video" | "document",
+  input: TelegramMediaInput,
+) => {
+  const bytes = new Uint8Array(input.bytes.byteLength)
+  bytes.set(input.bytes)
+  const file = new File([bytes.buffer], input.name, { type: input.mime })
+  return HttpClientRequest.post(`${base}/${operation}`).pipe(
+    HttpClientRequest.bodyFormDataRecord({
+      chat_id: input.chatId,
+      [field]: file,
+      caption: input.caption,
+      message_thread_id: input.messageThreadId,
+      reply_parameters: input.replyToMessageId === undefined
+        ? undefined
+        : JSON.stringify({ message_id: input.replyToMessageId }),
+    }),
+  )
+}
 
 const concatBytes = (chunks: readonly Uint8Array<ArrayBufferLike>[]): Uint8Array => {
   const parts = Array.from(chunks)
@@ -204,24 +294,35 @@ const concatBytes = (chunks: readonly Uint8Array<ArrayBufferLike>[]): Uint8Array
   return out
 }
 
-export const Live: Layer.Layer<TelegramApi, never, AppConfig> = Layer.effect(
+export const Live: Layer.Layer<TelegramApi, ConfigError, AppConfig> = Layer.effect(
   TelegramApi,
   Effect.gen(function* () {
     const config = yield* AppConfigTag
-    const base = `https://api.telegram.org/bot${config.telegramBotToken}`
-    const fileBase = `https://api.telegram.org/file/bot${config.telegramBotToken}`
+    const token = config.telegramBotToken
+    if (token === undefined) return yield* new ConfigError({ message: "TELEGRAM_BOT_TOKEN is required by the Telegram API" })
+    const base = `https://api.telegram.org/bot${token}`
+    const fileBase = `https://api.telegram.org/file/bot${token}`
     // Throttle edits per chat: at most one edit per second.
     const lastEdits = yield* Ref.make<ReadonlyMap<number, number>>(new Map())
-    const waitForEditSlot = (chatId: number): Effect.Effect<void, never> =>
-      Ref.modify(lastEdits, (map) => {
-        const now = Date.now()
+    const waitForEditSlot = (chatId: number): Effect.Effect<void, never> => Clock.currentTimeMillis.pipe(
+      Effect.flatMap((now) => Ref.modify(lastEdits, (map) => {
         const last = map.get(chatId) ?? 0
         const delay = editDelay(last, now)
         const next = new Map(map).set(chatId, now + delay)
         return [delay, next]
-      }).pipe(
-        Effect.flatMap((delay) => (delay > 0 ? Effect.sleep(delay) : Effect.void)),
-      )
+      })),
+      Effect.flatMap((delay) => (delay > 0 ? Effect.sleep(delay) : Effect.void)),
+    )
+    const sendMedia = (
+      operation: "sendPhoto" | "sendVideo" | "sendDocument",
+      field: "photo" | "video" | "document",
+      input: TelegramMediaInput,
+    ): Effect.Effect<Message, ApiError, HttpClient.HttpClient> =>
+      Effect.gen(function* () {
+        return yield* call(operation, MessageSchema, { retryTransient: input.retryTransient })(
+          mediaRequest(base, operation, field, input),
+        )
+      })
     return {
       getUpdates: (offset, timeoutSeconds) =>
         call("getUpdates", Schema.Array(UpdateSchema))(
@@ -236,11 +337,17 @@ export const Live: Layer.Layer<TelegramApi, never, AppConfig> = Layer.effect(
             text: input.text,
             reply_markup: input.replyMarkup,
             message_thread_id: input.messageThreadId,
+            reply_parameters: input.replyToMessageId === undefined
+              ? undefined
+              : { message_id: input.replyToMessageId },
           })
-          return yield* call("sendMessage", MessageSchema)(
+          return yield* call("sendMessage", MessageSchema, { retryTransient: false })(
             HttpClientRequest.post(`${base}/sendMessage`).pipe(HttpClientRequest.setBody(body)),
           )
         }),
+      sendPhoto: (input) => sendMedia("sendPhoto", "photo", input),
+      sendVideo: (input) => sendMedia("sendVideo", "video", input),
+      sendDocument: (input) => sendMedia("sendDocument", "document", input),
       editMessageText: (input) =>
         waitForEditSlot(input.chatId).pipe(
           Effect.andThen(

@@ -21,6 +21,14 @@ export const parsePromptCommand = (text: string | undefined): Option.Option<stri
   return Option.none()
 }
 
+/** Include the replied message as context for a prompt reply. */
+export const promptWithReply = (prompt: string, repliedText: string | undefined): string => {
+  const context = repliedText?.trim() ?? ""
+  if (context.length === 0) return prompt
+  if (prompt.length === 0) return `Message to respond to:\n\n${context}`
+  return `Message to respond to:\n\n${context}\n\nTask:\n${prompt}`
+}
+
 /** How much of the reasoning stream to show in the live message. */
 export const REASONING_DISPLAY_LIMIT = 800
 
@@ -136,6 +144,18 @@ export const parseModelPageCallback = (
   return Option.some({ token, page })
 }
 
+/** Parse callback data of the form `modelpr:<token>:<providerIndex>`. */
+export const parseModelProviderCallback = (
+  data: string,
+): Option.Option<{ readonly token: number; readonly index: number }> => {
+  const parts = data.split(":")
+  if (parts.length !== 3 || parts[0] !== "modelpr") return Option.none()
+  const token = Number(parts[1])
+  const index = Number(parts[2])
+  if (!Number.isInteger(token) || token <= 0 || !Number.isInteger(index) || index < 0) return Option.none()
+  return Option.some({ token, index })
+}
+
 /** Parse callback data of the form `modelv:<token>:<variantIndex>`. */
 export const parseModelVariantCallback = (
   data: string,
@@ -169,12 +189,43 @@ export const parseSessionPageCallback = (
   return Option.some({ token, direction: parts[2] })
 }
 
+/** Parse callback data of the form `dirp:<token>:<page>`. */
+export const parseDirectoryPageCallback = (
+  data: string,
+): Option.Option<{ readonly token: number; readonly page: number }> => {
+  const parts = data.split(":")
+  if (parts.length !== 3 || parts[0] !== "dirp") return Option.none()
+  const token = Number(parts[1])
+  const page = Number(parts[2])
+  if (!Number.isInteger(token) || token <= 0 || !Number.isInteger(page) || page < 0) return Option.none()
+  return Option.some({ token, page })
+}
+
 /** Short label for a model picker button. */
 export const renderModelLabel = (modelID: string, providerID: string): string =>
   `${modelID} (${providerID})`
 
 /** Models shown per page in the picker. */
 export const MODEL_PAGE_SIZE = 10
+
+export const modelProviderKeyboard = (
+  token: number,
+  providers: readonly { readonly id: string }[],
+) => ({
+  inline_keyboard: [
+    ...chunkButtons(providers.map((provider, index) => ({
+      text: provider.id,
+      callback_data: `modelpr:${token}:${index}`,
+    })), 2),
+    [{ text: "Cancel", callback_data: `modelc:${token}` }],
+  ],
+})
+
+const chunkButtons = <A>(items: readonly A[], size: number): A[][] => {
+  const result: A[][] = []
+  for (let index = 0; index < items.length; index += size) result.push(items.slice(index, index + size))
+  return result
+}
 
 export interface ModelPageButton {
   readonly text: string
@@ -190,7 +241,7 @@ export const modelPageKeyboard = (
   models: readonly { readonly id: string; readonly providerID: string }[],
   page: number,
   total: number,
-): { readonly inline_keyboard: ReadonlyArray<ReadonlyArray<ModelPageButton>> } => {
+) => {
   const rows: ModelPageButton[][] = []
   for (let i = 0; i < models.length; i += 2) {
     rows.push(

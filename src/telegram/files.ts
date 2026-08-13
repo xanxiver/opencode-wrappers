@@ -12,14 +12,25 @@ export const ALLOWED_EXTENSIONS = [
   "csv",
   "xlsx",
   "docx",
+  "dacpac",
   "md",
   "mdx",
 ] as const
+
+export const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
+export const MAX_ATTACHMENT_COUNT = 10
+export const MAX_ATTACHMENT_TOTAL_BYTES = 50 * 1024 * 1024
 
 export type DetectedKind = "pdf" | "png" | "jpg" | "gif" | "webp" | "zip" | "text"
 
 export class FileValidationError extends Data.TaggedError("FileValidationError")<{
   readonly message: string
+}> {}
+
+export class AttachmentDownloadError extends Data.TaggedError("AttachmentDownloadError")<{
+  readonly message: string
+  readonly transient: boolean
+  readonly cause: unknown
 }> {}
 
 /** Extract the lowercase extension from a file name. Dotfiles have no extension. */
@@ -77,6 +88,7 @@ export const kindForExtension = (extension: string): Option.Option<DetectedKind>
       return Option.some("webp")
     case "xlsx":
     case "docx":
+    case "dacpac":
       return Option.some("zip")
     case "csv":
     case "md":
@@ -106,6 +118,8 @@ export const mimeForExtension = (extension: string): Option.Option<string> => {
       return Option.some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     case "docx":
       return Option.some("application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+    case "dacpac":
+      return Option.some("application/octet-stream")
     case "md":
     case "mdx":
       return Option.some("text/markdown")
@@ -191,6 +205,7 @@ interface FileRef {
   readonly name: Option.Option<string>
   readonly mimeType: Option.Option<string>
   readonly isPhoto: boolean
+  readonly size: Option.Option<number>
 }
 
 /** Collect file references from a message and its replied-to message. */
@@ -202,6 +217,7 @@ export const collectRefs = (message: Message): readonly FileRef[] => {
       name: Option.fromNullishOr(document.file_name),
       mimeType: Option.fromNullishOr(document.mime_type),
       isPhoto: false,
+      size: Option.fromNullishOr(document.file_size),
     })
   }
   const pushPhoto = (photo: NonNullable<Message["photo"]>) => {
@@ -211,6 +227,7 @@ export const collectRefs = (message: Message): readonly FileRef[] => {
         name: Option.none(),
         mimeType: Option.none(),
         isPhoto: true,
+        size: Option.fromNullishOr(photo[photo.length - 1].file_size),
       })
     }
   }
@@ -259,17 +276,30 @@ const downloadAndValidate = (ref: FileRef) =>
     const info = yield* api.getFile(ref.fileId).pipe(
       Effect.mapError(
         (cause) =>
-          new FileValidationError({
+          new AttachmentDownloadError({
             message: `failed to get file info: ${cause.description ?? cause.operation}`,
+            transient: cause.transient,
+            cause,
           }),
       ),
     )
+    const declaredSize = Option.getOrUndefined(ref.size) ?? info.file_size
+    if (declaredSize !== undefined && declaredSize > MAX_ATTACHMENT_BYTES) {
+      return yield* Effect.fail(new FileValidationError({ message: "file exceeds 10 MB" }))
+    }
     if (info.file_path === undefined) {
       return yield* Effect.fail(new FileValidationError({ message: "telegram did not return a file path" }))
     }
     const bytes = yield* api.downloadFile(info.file_path).pipe(
-      Effect.mapError(() => new FileValidationError({ message: "failed to download file" })),
+      Effect.mapError((cause) => new AttachmentDownloadError({
+        message: `failed to download file: ${cause.description ?? cause.operation}`,
+        transient: cause.transient,
+        cause,
+      })),
     )
+    if (bytes.length > MAX_ATTACHMENT_BYTES) {
+      return yield* Effect.fail(new FileValidationError({ message: "file exceeds 10 MB" }))
+    }
     const validated = ref.isPhoto
       ? validatePhoto(bytes)
       : Result.match(nameForRef(ref), {
@@ -288,5 +318,16 @@ const downloadAndValidate = (ref: FileRef) =>
  */
 export const collectAttachments = (message: Message) => {
   const refs = dedupe(collectRefs(message))
-  return Effect.forEach(refs, (ref) => downloadAndValidate(ref), { concurrency: 4 })
+  if (refs.length > MAX_ATTACHMENT_COUNT) {
+    return Effect.fail(new FileValidationError({ message: `too many files. Maximum: ${MAX_ATTACHMENT_COUNT}` }))
+  }
+  const declaredTotal = refs.reduce((total, ref) => total + Option.getOrElse(ref.size, () => 0), 0)
+  if (declaredTotal > MAX_ATTACHMENT_TOTAL_BYTES) {
+    return Effect.fail(new FileValidationError({ message: "files exceed 50 MB in total" }))
+  }
+  return Effect.forEach(refs, (ref) => downloadAndValidate(ref)).pipe(
+    Effect.flatMap((attachments) => attachments.reduce((total, attachment) => total + attachment.bytes.length, 0) > MAX_ATTACHMENT_TOTAL_BYTES
+      ? Effect.fail(new FileValidationError({ message: "files exceed 50 MB in total" }))
+      : Effect.succeed(attachments)),
+  )
 }

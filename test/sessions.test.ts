@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { Effect, Layer, Option, Ref, Schema, Stream } from "effect"
+import { Effect, Layer, Ref, Schema, Stream } from "effect"
 import { BunFileSystem } from "@effect/platform-bun"
 import { OpenCode } from "../src/core/opencode.js"
 import { Live as SessionsLive, Sessions } from "../src/core/sessions.js"
@@ -29,7 +29,9 @@ const makeStoreLayer = () => {
       telegramBotToken: "test-token",
       projectDirectory: "/default-dir",
       stateFile,
+      webDatabaseFile: `${stateFile}.sqlite`,
       telegramRunTimeout: "10 minutes",
+      webPort: 3001,
     }),
   )
   const storeLayer = Layer.provide(StoreLive, Layer.merge(configLayer, BunFileSystem.layer))
@@ -44,18 +46,24 @@ const makeOpenCodeLayer = (callCount: Ref.Ref<number>) =>
       ),
     getSession: () => Effect.succeed(fakeInfo("ses_test")),
     prompt: () => Effect.never,
+    listPending: () => Effect.succeed([]),
+    cancelPending: () => Effect.void,
     interrupt: () => Effect.never,
     wait: () => Effect.void,
     activeSessions: () => Effect.succeed([]),
     compact: () => Effect.void,
-        listSessions: () => Effect.succeed({ data: [], cursor: {} }),
+    revert: () => Effect.void,
+     listSessions: () => Effect.succeed({ data: [], cursor: {} }),
+      listMessages: () => Effect.succeed({ data: [], cursor: {} }),
     listProjects: () => Effect.succeed([]),
     listProjectDirectories: () => Effect.succeed([]),
     listPendingPermissions: () => Effect.succeed([]),
     listPendingQuestions: () => Effect.succeed([]),
     replyPermission: () => Effect.never,
-    listModels: () => Effect.never,
-    switchModel: () => Effect.never,
+     listModels: () => Effect.never,
+     listAgents: () => Effect.succeed([]),
+     switchAgent: () => Effect.never,
+     switchModel: () => Effect.never,
     replyQuestion: () => Effect.never,
     events: () => Stream.never,
   })

@@ -1,6 +1,6 @@
 import { Context, Data, Effect, Layer, Option, Semaphore } from "effect"
 import { OpenCode } from "./opencode.js"
-import { Store, StoreError } from "./store.js"
+import { Store } from "./store.js"
 import { AppConfigTag, type AppConfig } from "../config.js"
 
 export class SessionsError extends Data.TaggedError("SessionsError")<{
@@ -8,14 +8,14 @@ export class SessionsError extends Data.TaggedError("SessionsError")<{
   readonly cause: unknown
 }> {}
 
-export interface SessionsShape {
+export interface SessionsService {
   readonly getOrCreate: (clientId: string) => Effect.Effect<string, SessionsError>
   readonly reset: (clientId: string) => Effect.Effect<void, SessionsError>
   readonly directoryFor: (clientId: string) => Effect.Effect<string, SessionsError>
   readonly setDirectory: (clientId: string, directory: string) => Effect.Effect<void, SessionsError>
 }
 
-export class Sessions extends Context.Service<Sessions, SessionsShape>()("opencode2-uis/Sessions") {}
+export class Sessions extends Context.Service<Sessions, SessionsService>()("opencode2-uis/Sessions") {}
 
 const mapError = (message: string) =>
   (cause: unknown): SessionsError => new SessionsError({ message, cause })
