@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { Effect, Layer, Option, Ref, Schema, Stream } from "effect"
+import { Effect, Layer, Ref, Schema, Stream } from "effect"
 import { BunFileSystem } from "@effect/platform-bun"
 import { OpenCode } from "../src/core/opencode.js"
 import { Live as SessionsLive, Sessions } from "../src/core/sessions.js"
@@ -29,7 +29,9 @@ const makeStoreLayer = () => {
       telegramBotToken: "test-token",
       projectDirectory: "/default-dir",
       stateFile,
+      webDatabaseFile: `${stateFile}.sqlite`,
       telegramRunTimeout: "10 minutes",
+      webPort: 3001,
     }),
   )
   const storeLayer = Layer.provide(StoreLive, Layer.merge(configLayer, BunFileSystem.layer))
@@ -44,18 +46,24 @@ const makeOpenCodeLayer = (callCount: Ref.Ref<number>) =>
       ),
     getSession: () => Effect.succeed(fakeInfo("ses_test")),
     prompt: () => Effect.never,
+    listPending: () => Effect.succeed([]),
+    cancelPending: () => Effect.void,
     interrupt: () => Effect.never,
     wait: () => Effect.void,
     activeSessions: () => Effect.succeed([]),
     compact: () => Effect.void,
-        listSessions: () => Effect.succeed({ data: [], cursor: {} }),
+    revert: () => Effect.void,
+     listSessions: () => Effect.succeed({ data: [], cursor: {} }),
+      listMessages: () => Effect.succeed({ data: [], cursor: {} }),
     listProjects: () => Effect.succeed([]),
     listProjectDirectories: () => Effect.succeed([]),
     listPendingPermissions: () => Effect.succeed([]),
     listPendingQuestions: () => Effect.succeed([]),
     replyPermission: () => Effect.never,
-    listModels: () => Effect.never,
-    switchModel: () => Effect.never,
+     listModels: () => Effect.never,
+     listAgents: () => Effect.succeed([]),
+     switchAgent: () => Effect.never,
+     switchModel: () => Effect.never,
     replyQuestion: () => Effect.never,
     events: () => Stream.never,
   })
@@ -93,7 +101,7 @@ describe("Sessions", () => {
     }
   })
 
-  test("chats in the same directory share the session", async () => {
+  test("conversations in the same directory have separate sessions", async () => {
     const { storeLayer, configLayer, cleanup } = makeStoreLayer()
     const callCount = await Effect.runPromise(Ref.make(0))
     const layer = sessionsLayer(callCount, storeLayer, configLayer)
@@ -107,6 +115,23 @@ describe("Sessions", () => {
           return { first, second, count }
         }).pipe(Effect.provide(layer)),
       )
+      expect(result.count).toBe(2)
+    } finally {
+      cleanup()
+    }
+  })
+
+  test("the same forum topic reuses its session", async () => {
+    const { storeLayer, configLayer, cleanup } = makeStoreLayer()
+    const callCount = await Effect.runPromise(Ref.make(0))
+    const layer = sessionsLayer(callCount, storeLayer, configLayer)
+    try {
+      const result = await Effect.runPromise(Effect.gen(function* () {
+        const sessions = yield* Sessions
+        const first = yield* sessions.getOrCreate("tg:1:thread:42")
+        const second = yield* sessions.getOrCreate("tg:1:thread:42")
+        return { first, second, count: yield* Ref.get(callCount) }
+      }).pipe(Effect.provide(layer)))
       expect(result.first).toBe(result.second)
       expect(result.count).toBe(1)
     } finally {
@@ -130,6 +155,49 @@ describe("Sessions", () => {
       )
       expect(result.id).toBe("ses__project_x")
       expect(result.directory).toBe("/project-x")
+    } finally {
+      cleanup()
+    }
+  })
+
+  test("changing directories creates a session in the new directory", async () => {
+    const { storeLayer, configLayer, cleanup } = makeStoreLayer()
+    const callCount = await Effect.runPromise(Ref.make(0))
+    const layer = sessionsLayer(callCount, storeLayer, configLayer)
+    try {
+      const result = await Effect.runPromise(
+        Effect.gen(function* () {
+          const sessions = yield* Sessions
+          const first = yield* sessions.getOrCreate("tg:1")
+          yield* sessions.setDirectory("tg:1", "/project-x")
+          const second = yield* sessions.getOrCreate("tg:1")
+          return { first, second, count: yield* Ref.get(callCount) }
+        }).pipe(Effect.provide(layer)),
+      )
+      expect(result.first).toBe("ses__default_dir")
+      expect(result.second).toBe("ses__project_x")
+      expect(result.count).toBe(2)
+    } finally {
+      cleanup()
+    }
+  })
+
+  test("selecting the current directory keeps its active session", async () => {
+    const { storeLayer, configLayer, cleanup } = makeStoreLayer()
+    const callCount = await Effect.runPromise(Ref.make(0))
+    const layer = sessionsLayer(callCount, storeLayer, configLayer)
+    try {
+      const result = await Effect.runPromise(
+        Effect.gen(function* () {
+          const sessions = yield* Sessions
+          const first = yield* sessions.getOrCreate("tg:1")
+          yield* sessions.setDirectory("tg:1", "/default-dir")
+          const second = yield* sessions.getOrCreate("tg:1")
+          return { first, second, count: yield* Ref.get(callCount) }
+        }).pipe(Effect.provide(layer)),
+      )
+      expect(result.second).toBe(result.first)
+      expect(result.count).toBe(1)
     } finally {
       cleanup()
     }

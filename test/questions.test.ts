@@ -1,9 +1,24 @@
 import { describe, expect, test } from "bun:test"
 import { Effect, Layer, Option } from "effect"
+import { TestClock } from "effect/testing"
 import { Live, QuestionRegistry, QUESTION_TTL_MS, hasExpired, isComplete } from "../src/telegram/questions.js"
+import { InteractionStore, InteractionStoreMemory, type InteractionStoreError } from "../src/telegram/interaction-store.js"
 
-const run = <A>(effect: Effect.Effect<A, never, never>) =>
-  Effect.runPromise(effect.pipe(Effect.provide(Live)))
+const run = <A>(effect: Effect.Effect<A, InteractionStoreError, QuestionRegistry | InteractionStore>) =>
+  Effect.runPromise(effect.pipe(Effect.provide(Live), Effect.provide(InteractionStoreMemory)))
+
+const persistentStore = () => {
+  const values = new Map<string, unknown>()
+  return Layer.succeed(InteractionStore, {
+    get: (key) => Effect.succeed(Option.fromNullishOr(values.get(key))),
+    set: (key, value) => Effect.sync(() => { values.set(key, value) }),
+    modify: (key, change) => Effect.sync(() => {
+      const [result, value] = change(Option.fromNullishOr(values.get(key)))
+      values.set(key, value)
+      return result
+    }),
+  })
+}
 
 const base = {
   sessionID: "ses_1",
@@ -16,6 +31,54 @@ const base = {
 }
 
 describe("QuestionRegistry", () => {
+  test("restores partial answers and message ids after a registry restart", async () => {
+    const store = persistentStore()
+    const token = await Effect.runPromise(Effect.gen(function* () {
+      const registry = yield* QuestionRegistry
+      const token = yield* registry.register(base)
+      yield* registry.attachMessageId(token, 0, 77)
+      yield* registry.answer(token, 0, ["a"])
+      return token
+    }).pipe(Effect.provide(Live), Effect.provide(store)))
+    const restored = await Effect.runPromise(Effect.gen(function* () {
+      const registry = yield* QuestionRegistry
+      return yield* registry.get(token)
+    }).pipe(Effect.provide(Live), Effect.provide(store)))
+    expect(Option.isSome(restored)).toBe(true)
+    if (Option.isSome(restored)) {
+      expect(restored.value.messageIds).toEqual([77, 0])
+      expect(restored.value.answers).toEqual([["a"], undefined])
+    }
+  })
+
+  test("derives a chat route for legacy persisted questions", async () => {
+    const store = InteractionStoreMemory
+    const result = await Effect.runPromise(Effect.gen(function* () {
+      const persistence = yield* InteractionStore
+      yield* persistence.set("questions", {
+        next: 2,
+        entries: [{
+          token: 1,
+          sessionID: "ses_legacy",
+          requestID: "req_legacy",
+          chatId: 17,
+          questions: ["Continue?"],
+          options: [[]],
+          customs: [true],
+          multiples: [false],
+          selections: [[]],
+          answers: [{ answered: false, value: [] }],
+          messageIds: [0],
+          timeCreated: Date.now(),
+        }],
+      })
+      const registry = yield* QuestionRegistry
+      return yield* registry.getSessionRoute("ses_legacy")
+    }).pipe(Effect.provide(Live), Effect.provide(store)))
+
+    expect(result).toEqual(Option.some({ chatId: 17 }))
+  })
+
   test("register creates an unanswered request", async () => {
     const result = await run(
       Effect.gen(function* () {
@@ -33,6 +96,324 @@ describe("QuestionRegistry", () => {
       expect(result.entry.value.messageIds).toEqual([0, 0])
       expect(isComplete(result.entry.value)).toBe(false)
     }
+  })
+
+  test("registerIfAbsent prevents duplicate requests atomically", async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const registry = yield* QuestionRegistry
+        const first = yield* registry.registerIfAbsent(base)
+        const second = yield* registry.registerIfAbsent(base)
+        return { first, second }
+      }).pipe(Effect.provide(Live)),
+    )
+    expect(Option.isSome(result.first)).toBe(true)
+    expect(Option.isNone(result.second)).toBe(true)
+  })
+
+  test("resumes only missing Telegram question messages after restart", async () => {
+    const store = persistentStore()
+    await Effect.runPromise(Effect.gen(function* () {
+      const registry = yield* QuestionRegistry
+      const token = yield* registry.registerOrResume(base)
+      if (Option.isSome(token)) yield* registry.attachMessageId(token.value, 0, 77)
+    }).pipe(Effect.provide(Live), Effect.provide(store)))
+    const result = await Effect.runPromise(Effect.gen(function* () {
+      const registry = yield* QuestionRegistry
+      const token = yield* registry.registerOrResume(base)
+      const entry = Option.isSome(token) ? yield* registry.get(token.value) : Option.none()
+      return { token, entry }
+    }).pipe(Effect.provide(Live), Effect.provide(store)))
+    expect(result.token).toEqual(Option.some(1))
+    expect(Option.isSome(result.entry) && result.entry.value.messageIds).toEqual([77, 0])
+  })
+
+  test("route transfer re-surfaces only unanswered delivered questions", async () => {
+    const result = await run(Effect.gen(function* () {
+      const registry = yield* QuestionRegistry
+      const token = yield* registry.register(base)
+      yield* registry.attachMessageId(token, 0, 77)
+      yield* registry.attachMessageId(token, 1, 78)
+      yield* registry.answer(token, 0, ["a"])
+      yield* registry.rerouteSession("ses_1", { chatId: 7, threadId: 9 })
+      return yield* registry.get(token)
+    }))
+
+    expect(Option.isSome(result) && result.value.messageIds).toEqual([77, 0])
+  })
+
+  test("route transfer retries a definitively rejected unanswered question at the new destination", async () => {
+    const result = await run(Effect.gen(function* () {
+      const registry = yield* QuestionRegistry
+      const token = yield* registry.register(base)
+      const generation = yield* registry.claimDeliveryWithGeneration(token, 0, 7)
+      if (Option.isSome(generation)) yield* registry.rejectDeliveryWithGeneration(token, 0, 7, generation.value)
+      yield* registry.rerouteSession("ses_1", { chatId: 7, threadId: 9 })
+      return yield* registry.registerOrResume({ ...base, chatId: 7 })
+    }))
+
+    expect(result).toEqual(Option.some(1))
+  })
+
+  test("repeating a route transfer to the same topic does not reset delivered questions", async () => {
+    const result = await run(Effect.gen(function* () {
+      const registry = yield* QuestionRegistry
+      const token = yield* registry.register(base)
+      yield* registry.setSessionRoute("ses_1", { chatId: 7, threadId: 9 })
+      yield* registry.attachMessageId(token, 0, 77)
+      yield* registry.rerouteSession("ses_1", { chatId: 7, threadId: 9 })
+      return yield* registry.get(token)
+    }))
+
+    expect(Option.isSome(result) && result.value.messageIds[0]).toBe(77)
+  })
+
+  test("question routing still catches up after permission routing moved independently", async () => {
+    const result = await run(Effect.gen(function* () {
+      const registry = yield* QuestionRegistry
+      const token = yield* registry.register(base)
+      yield* registry.setSessionRoute("ses_1", { chatId: 7, threadId: 4 })
+      yield* registry.attachMessageId(token, 0, 77)
+      // A previous partial transfer changed only the permission registry.
+      yield* registry.rerouteSession("ses_1", { chatId: 7, threadId: 9 })
+      return yield* registry.get(token)
+    }))
+
+    expect(Option.isSome(result) && result.value.messageIds[0]).toBe(0)
+  })
+
+  test("persists and reads question routes independently", async () => {
+    const route = await run(Effect.gen(function* () {
+      const registry = yield* QuestionRegistry
+      yield* registry.setSessionRoute("ses_1", { chatId: 9, threadId: 4 })
+      return yield* registry.getSessionRoute("ses_1")
+    }))
+
+    expect(route).toEqual(Option.some({ chatId: 9, threadId: 4 }))
+  })
+
+  test("route transfer fences an in-flight question and rejects its late sender", async () => {
+    const result = await run(Effect.gen(function* () {
+      const registry = yield* QuestionRegistry
+      const token = yield* registry.register(base)
+      const generation = yield* registry.claimDeliveryWithGeneration(token, 0, 7)
+      yield* registry.rerouteSession("ses_1", { chatId: 7, threadId: 9 })
+      if (Option.isSome(generation)) yield* registry.attachMessageId(token, 0, 99, generation.value)
+      return {
+        reviews: yield* registry.listUncertainDeliveries(7),
+        entry: yield* registry.get(token),
+      }
+    }))
+
+    expect(result.reviews[0]?.questionIndex).toBe(0)
+    expect(Option.isSome(result.entry) && result.entry.value.messageIds[0]).toBe(-1)
+  })
+
+  test("route transfer clears selections that replacement multi-select prompts do not display", async () => {
+    const result = await run(Effect.gen(function* () {
+      const registry = yield* QuestionRegistry
+      const token = yield* registry.register(base)
+      yield* registry.attachMessageId(token, 0, 77)
+      yield* registry.toggleSelection(token, 0, "a")
+      yield* registry.rerouteSession("ses_1", { chatId: 7, threadId: 9 })
+      return yield* registry.get(token)
+    }))
+
+    expect(Option.isSome(result) && result.value.messageIds[0]).toBe(0)
+    expect(Option.isSome(result) && result.value.selections[0]).toEqual([])
+  })
+
+  test("failed reply restoration keeps questions delivered at the replacement route", async () => {
+    const result = await run(Effect.gen(function* () {
+      const registry = yield* QuestionRegistry
+      const token = yield* registry.register(base)
+      yield* registry.attachMessageId(token, 0, 77)
+      yield* registry.attachMessageId(token, 1, 78)
+      yield* registry.answer(token, 0, ["a"])
+      yield* registry.answer(token, 1, ["x"])
+      const claim = yield* registry.claimComplete(token)
+      yield* registry.rerouteSession("ses_1", { chatId: 9, threadId: 9 })
+      const firstDelivery = yield* registry.claimDeliveryWithGeneration(token, 0, 9)
+      if (Option.isSome(firstDelivery)) yield* registry.attachMessageId(token, 0, 97, firstDelivery.value)
+      const secondDelivery = yield* registry.claimDeliveryWithGeneration(token, 1, 9)
+      if (Option.isSome(secondDelivery)) yield* registry.attachMessageId(token, 1, 98, secondDelivery.value)
+      if (Option.isSome(claim)) yield* registry.restoreClaim(claim.value)
+      return yield* registry.getForMessage(token, 0, 9, 97)
+    }))
+
+    expect(Option.isSome(result)).toBe(true)
+    expect(Option.isSome(result) && result.value.chatId).toBe(9)
+    expect(Option.isSome(result) && result.value.messageIds).toEqual([97, 98])
+  })
+
+  test("does not resend a question whose Telegram delivery outcome is uncertain", async () => {
+    const result = await run(Effect.gen(function* () {
+      const registry = yield* QuestionRegistry
+      const token = yield* registry.registerOrResume(base)
+      if (Option.isSome(token)) yield* registry.attachMessageId(token.value, 0, -1)
+      const resumed = yield* registry.registerOrResume(base)
+      const entry = Option.isSome(resumed) ? yield* registry.get(resumed.value) : Option.none()
+      const reviews = yield* registry.listUncertainDeliveries(7)
+      const wrongChat = Option.isSome(token) && (yield* registry.retryUncertainDelivery(token.value, 0, 8))
+      const retry = Option.isSome(token) && (yield* registry.retryUncertainDelivery(token.value, 0, 7))
+      const afterReview = yield* registry.registerOrResume(base)
+      return { resumed, entry, reviews, wrongChat, retry, afterReview }
+    }))
+    expect(Option.isSome(result.resumed)).toBe(true)
+    expect(Option.isSome(result.entry) && result.entry.value.messageIds).toEqual([-1, 0])
+    expect(result.reviews).toHaveLength(1)
+    expect(result.wrongChat).toBe(false)
+    expect(result.retry).toBe(true)
+    expect(result.afterReview).toEqual(Option.some(1))
+  })
+
+  test("scopes delivery reviews and retries to a session", async () => {
+    const result = await run(Effect.gen(function* () {
+      const registry = yield* QuestionRegistry
+      const first = yield* registry.registerOrResume({ ...base, sessionID: "ses_topic_1", requestID: "req_1" })
+      const second = yield* registry.registerOrResume({ ...base, sessionID: "ses_topic_2", requestID: "req_2" })
+      if (Option.isSome(first)) yield* registry.attachMessageId(first.value, 0, -1)
+      if (Option.isSome(second)) yield* registry.attachMessageId(second.value, 0, -1)
+      const reviews = yield* registry.listUncertainDeliveries(7, "ses_topic_1")
+      const crossTopicRetry = Option.isSome(second) &&
+        (yield* registry.retryUncertainDelivery(second.value, 0, 7, "ses_topic_1"))
+      return { reviews, crossTopicRetry }
+    }))
+
+    expect(result.reviews.map(({ entry }) => entry.sessionID)).toEqual(["ses_topic_1"])
+    expect(result.crossTopicRetry).toBe(false)
+  })
+
+  test("claims a complete request before dispatch and restores it after rejection", async () => {
+    const result = await run(Effect.gen(function* () {
+      const registry = yield* QuestionRegistry
+      const token = yield* registry.register(base)
+      yield* registry.answer(token, 0, ["a"])
+      yield* registry.answer(token, 1, ["x"])
+      const claimed = yield* registry.claimComplete(token)
+      const absentDuringDispatch = yield* registry.get(token)
+      if (Option.isSome(claimed)) yield* registry.restoreClaim(claimed.value)
+      const restored = yield* registry.get(token)
+      return { claimed, absentDuringDispatch, restored }
+    }))
+    expect(Option.isSome(result.claimed)).toBe(true)
+    expect(Option.isNone(result.absentDuringDispatch)).toBe(true)
+    expect(Option.isSome(result.restored)).toBe(true)
+  })
+
+  test("keeps a reply claim fenced across restart", async () => {
+    const store = persistentStore()
+    const token = await Effect.runPromise(Effect.gen(function* () {
+      const registry = yield* QuestionRegistry
+      const token = yield* registry.register(base)
+      yield* registry.answer(token, 0, ["a"])
+      yield* registry.answer(token, 1, ["x"])
+      yield* registry.claimComplete(token)
+      return token
+    }).pipe(Effect.provide(Live), Effect.provide(store)))
+    const replay = await Effect.runPromise(Effect.gen(function* () {
+      const registry = yield* QuestionRegistry
+      return yield* registry.claimComplete(token)
+    }).pipe(Effect.provide(Live), Effect.provide(store)))
+    expect(Option.isNone(replay)).toBe(true)
+  })
+
+  test("allows only one process to claim each unsent Telegram question", async () => {
+    const store = persistentStore()
+    const result = await Effect.runPromise(Effect.gen(function* () {
+      const first = yield* Effect.gen(function* () { return yield* QuestionRegistry }).pipe(Effect.provide(Live))
+      const second = yield* Effect.gen(function* () { return yield* QuestionRegistry }).pipe(Effect.provide(Live))
+      const token = yield* first.registerOrResume(base)
+      if (Option.isNone(token)) return []
+      return yield* Effect.all([
+        first.claimDelivery(token.value, 0, 7),
+        second.claimDelivery(token.value, 0, 7),
+      ], { concurrency: "unbounded" })
+    }).pipe(Effect.provide(store)))
+    expect(result.filter(Boolean)).toHaveLength(1)
+  })
+
+  test("keeps a definitive Telegram rejection fenced until operator retry", async () => {
+    const result = await run(Effect.gen(function* () {
+      const registry = yield* QuestionRegistry
+      const token = yield* registry.registerOrResume(base)
+      if (Option.isNone(token)) return undefined
+      const claimed = yield* registry.claimDelivery(token.value, 0, 7)
+      const rejected = yield* registry.rejectDelivery(token.value, 0, 7)
+      const automaticRetry = yield* registry.claimDelivery(token.value, 0, 7)
+      const reviews = yield* registry.listUncertainDeliveries(7)
+      const operatorRetry = yield* registry.retryUncertainDelivery(token.value, 0, 7)
+      return { claimed, rejected, automaticRetry, reviews, operatorRetry }
+    }))
+    expect(result?.claimed).toBe(true)
+    expect(result?.rejected).toBe(true)
+    expect(result?.automaticRetry).toBe(false)
+    expect(result?.reviews[0]?.failure).toBe("rejected")
+    expect(result?.operatorRetry).toBe(true)
+  })
+
+  test("moves an abandoned in-flight question to review instead of allowing immediate retry", async () => {
+    const result = await Effect.runPromise(Effect.gen(function* () {
+      const registry = yield* QuestionRegistry
+      const token = yield* registry.registerOrResume(base)
+      if (Option.isNone(token)) return undefined
+      const claimed = yield* registry.claimDelivery(token.value, 0, 7)
+      const beforeExpiry = yield* registry.listUncertainDeliveries(7)
+      yield* TestClock.adjust("121 seconds")
+      const afterExpiry = yield* registry.listUncertainDeliveries(7)
+      return { claimed, beforeExpiry, afterExpiry }
+    }).pipe(Effect.provide(Live), Effect.provide(InteractionStoreMemory), Effect.provide(TestClock.layer())))
+    expect(result?.claimed).toBe(true)
+    expect(result?.beforeExpiry).toHaveLength(0)
+    expect(result?.afterExpiry[0]?.failure).toBe("uncertain")
+  })
+
+  test("fences a stale process after another registry takes over an expired claim", async () => {
+    const store = persistentStore()
+    const result = await Effect.runPromise(Effect.gen(function* () {
+      const first = yield* Effect.gen(function* () { return yield* QuestionRegistry }).pipe(Effect.provide(Live))
+      const second = yield* Effect.gen(function* () { return yield* QuestionRegistry }).pipe(Effect.provide(Live))
+      const token = yield* first.register(base)
+      yield* first.answer(token, 0, ["a"])
+      yield* first.answer(token, 1, ["x"])
+      const oldClaim = yield* first.claimComplete(token)
+      yield* TestClock.adjust("121 seconds")
+      const newClaim = yield* second.claimComplete(token)
+      if (Option.isNone(oldClaim) || Option.isNone(newClaim)) return undefined
+      return {
+        differentGeneration: oldClaim.value.generation !== newClaim.value.generation,
+        oldRenewed: yield* first.renewClaim(token, oldClaim.value.generation),
+        oldRestored: yield* first.restoreClaim(oldClaim.value),
+        oldCompleted: yield* first.completeClaim(token, oldClaim.value.generation),
+        newRenewed: yield* second.renewClaim(token, newClaim.value.generation),
+      }
+    }).pipe(Effect.provide(store), Effect.provide(TestClock.layer())))
+    expect(result).toEqual({
+      differentGeneration: true,
+      oldRenewed: false,
+      oldRestored: false,
+      oldCompleted: false,
+      newRenewed: true,
+    })
+  })
+
+  test("renews an in-process reply claim for a long external request", async () => {
+    const result = await Effect.runPromise(Effect.gen(function* () {
+      const registry = yield* QuestionRegistry
+      const token = yield* registry.register(base)
+      yield* registry.answer(token, 0, ["a"])
+      yield* registry.answer(token, 1, ["x"])
+      const first = yield* registry.claimComplete(token)
+      yield* TestClock.adjust("90 seconds")
+      const renewed = Option.isSome(first) && (yield* registry.renewClaim(token, first.value.generation))
+      yield* TestClock.adjust("90 seconds")
+      yield* registry.registerOrResume(base)
+      const second = yield* registry.claimComplete(token)
+      return { first, renewed, second }
+    }).pipe(Effect.provide(Live), Effect.provide(InteractionStoreMemory), Effect.provide(TestClock.layer())))
+    expect(Option.isSome(result.first)).toBe(true)
+    expect(result.renewed).toBe(true)
+    expect(Option.isNone(result.second)).toBe(true)
   })
 
   test("attachMessageId records the question message ids", async () => {
