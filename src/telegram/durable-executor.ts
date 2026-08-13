@@ -17,14 +17,16 @@ import { OpenCode, type OpenCodeError } from "../core/opencode.js"
 import { Sessions, type SessionsError } from "../core/sessions.js"
 import { Store, type StoreError } from "../core/store.js"
 import { AttachmentDownloadError, collectAttachments, FileValidationError } from "./files.js"
-import { clientId, sendText } from "./handlers/shared.js"
-import { recoveredResponseFromHistory, runPrompt, type RunFinalization } from "./run.js"
+import { sendText } from "./handlers/shared.js"
+import { conversationId } from "./conversation.js"
+import { limitMedia, recoveredResponseFromHistory, runPrompt, type RunFinalization } from "./run.js"
 import { MessageSchema, TelegramApi, type ApiError, type Message } from "./api.js"
 import { PermissionRegistry } from "./permissions.js"
 import { QuestionRegistry } from "./questions.js"
 import { reconcilePendingSession } from "./resurface.js"
 import type { InteractionStoreError } from "./interaction-store.js"
 import { renderFinal, truncate } from "./render.js"
+import { renderTelegramMermaid } from "./mermaid.js"
 
 const TelegramJobPayload = Schema.Struct({
   chatId: Schema.Number,
@@ -67,6 +69,7 @@ const PersistedFinalization = Schema.Struct({
     name: Schema.String,
     mime: Schema.String,
     base64: Schema.String,
+    delivery: Schema.optional(Schema.Literal("document")),
   })),
 })
 type PersistedFinalization = Schema.Schema.Type<typeof PersistedFinalization>
@@ -78,6 +81,7 @@ const encodeFinalization = (result: RunFinalization): string => JSON.stringify({
     name: media.name,
     mime: media.mime,
     base64: Buffer.from(media.bytes).toString("base64"),
+    delivery: media.delivery,
   })),
 } satisfies PersistedFinalization)
 
@@ -237,7 +241,7 @@ export const TelegramDurableExecutorLive: Layer.Layer<
             retryTransient: false,
           }
           let upload = api.sendDocument(mediaInput)
-          if (media.mime.startsWith("image/")) upload = api.sendPhoto(mediaInput)
+          if (media.delivery !== "document" && media.mime.startsWith("image/")) upload = api.sendPhoto(mediaInput)
           else if (media.mime.startsWith("video/")) upload = api.sendVideo(mediaInput)
           yield* jobs.beginMediaDelivery(lease.job.id, lease.generation, index)
           yield* upload
@@ -291,8 +295,11 @@ export const TelegramDurableExecutorLive: Layer.Layer<
             if (lease.job.inputID !== undefined) {
               const response = yield* recoveredResponseFromHistory(payload.sessionID, lease.job.inputID)
               if (Option.isSome(response)) {
-                const finalText = truncate(renderFinal(response.value.text, "done"))
-                yield* jobs.markFinalizing(lease.job.id, lease.generation, encodeFinalization({ text: finalText, media: response.value.media }))
+                const rendered = yield* renderTelegramMermaid(renderFinal(response.value.text, "done"))
+                yield* jobs.markFinalizing(lease.job.id, lease.generation, encodeFinalization({
+                  text: truncate(rendered.text),
+                  media: limitMedia([...rendered.media, ...response.value.media]),
+                }))
                 const current = yield* jobs.get(lease.job.id)
                 if (Option.isSome(current)) {
                   yield* deliverPersistedFinal({ ...lease, job: current.value, recoveredFrom: "finalizing" }, payload)
@@ -457,8 +464,9 @@ export const TelegramDurableExecutorLive: Layer.Layer<
           }),
         )
         if (Option.isNone(attachments)) return
-        const sessionID = yield* sessions.getOrCreate(clientId(chatId))
-        const directory = yield* sessions.directoryFor(clientId(chatId))
+         const conversation = conversationId({ chatId, threadId: message.message_thread_id })
+         const sessionID = yield* sessions.getOrCreate(conversation)
+         const directory = yield* sessions.directoryFor(conversation)
         const model = yield* store.getModel(directory).pipe(Effect.map(Option.getOrUndefined))
         const payload: TelegramJobPayload = {
           chatId,
@@ -471,7 +479,7 @@ export const TelegramDurableExecutorLive: Layer.Layer<
         if (message.message_thread_id !== undefined) Object.assign(payload, { threadId: message.message_thread_id })
         if (model !== undefined) Object.assign(payload, { model })
         const submitted = yield* jobs.submit({
-          sourceKey: `telegram:${chatId}:${message.message_id}`,
+           sourceKey: `telegram:${conversation}:${message.message_id}`,
           channel: "telegram",
           owner: ownerFor(sessionID),
           payload: JSON.stringify(payload),
@@ -487,9 +495,10 @@ export const TelegramDurableExecutorLive: Layer.Layer<
         }
       }).pipe(Effect.provide(context)),
       reconnect: (chatId: number, message: Message, force: boolean) => Effect.gen(function* () {
-        const threadId = message.message_thread_id
-        const directory = yield* sessions.directoryFor(clientId(chatId))
-        const sessionID = yield* store.getSessionIDForDirectory(directory)
+         const threadId = message.message_thread_id
+          const conversation = conversationId({ chatId, threadId })
+          const directory = yield* sessions.directoryFor(conversation)
+          const sessionID = yield* store.getSessionIDForConversation(conversation)
         if (Option.isNone(sessionID)) {
           yield* sendText(chatId, "No session yet.", threadId)
           return
@@ -525,7 +534,7 @@ export const TelegramDurableExecutorLive: Layer.Layer<
             reconnect: true,
           }
           yield* jobs.submit({
-            sourceKey: `telegram:${chatId}:${message.message_id}`,
+           sourceKey: `telegram:${conversation}:${message.message_id}`,
             channel: "telegram",
             owner,
             payload: JSON.stringify(payload),
@@ -588,10 +597,14 @@ export const TelegramDurableExecutorLive: Layer.Layer<
       }).pipe(Effect.provide(context)),
       listReviews: (chatId, threadId) => Effect.gen(function* () {
         yield* jobs.purgeExpiredReviews
-        const permissionReviews = yield* permissionRegistry.listUncertainDeliveries(chatId)
-        const questionReviews = yield* questionRegistry.listUncertainDeliveries(chatId)
-        const directory = yield* sessions.directoryFor(clientId(chatId))
-        const sessionID = yield* store.getSessionIDForDirectory(directory)
+         const conversation = conversationId({ chatId, threadId })
+         const sessionID = yield* store.getSessionIDForConversation(conversation)
+        const permissionReviews = Option.isNone(sessionID)
+          ? []
+          : yield* permissionRegistry.listUncertainDeliveries(chatId, sessionID.value)
+        const questionReviews = Option.isNone(sessionID)
+          ? []
+          : yield* questionRegistry.listUncertainDeliveries(chatId, sessionID.value)
         const reviews = Option.isNone(sessionID)
           ? []
           : (yield* jobs.listOwner("telegram", ownerFor(sessionID.value))).filter((job) => job.state === "needs_review")
@@ -628,10 +641,16 @@ export const TelegramDurableExecutorLive: Layer.Layer<
         yield* sendText(chatId, truncate(evidence.join("\n\n")), threadId)
       }).pipe(Effect.provide(context)),
       resolveReview: (chatId, reviewID, threadId) => Effect.gen(function* () {
+        const conversation = conversationId({ chatId, threadId })
+        const sessionID = yield* store.getSessionIDForConversation(conversation)
+        if (Option.isNone(sessionID)) {
+          yield* sendText(chatId, "No session yet.", threadId)
+          return
+        }
         const permissionMatch = /^permission:(\d+)$/.exec(reviewID)
         if (permissionMatch !== null) {
           const token = Number(permissionMatch[1])
-          const retried = Number.isSafeInteger(token) && (yield* permissionRegistry.retryUncertainDelivery(token, chatId))
+          const retried = Number.isSafeInteger(token) && (yield* permissionRegistry.retryUncertainDelivery(token, chatId, sessionID.value))
           yield* sendText(chatId, retried ? "Permission prompt scheduled for retry." : "That permission delivery review was not found.", threadId)
           return
         }
@@ -640,14 +659,8 @@ export const TelegramDurableExecutorLive: Layer.Layer<
           const token = Number(questionMatch[1])
           const questionIndex = Number(questionMatch[2])
           const retried = Number.isSafeInteger(token) && Number.isSafeInteger(questionIndex) &&
-            (yield* questionRegistry.retryUncertainDelivery(token, questionIndex, chatId))
+            (yield* questionRegistry.retryUncertainDelivery(token, questionIndex, chatId, sessionID.value))
           yield* sendText(chatId, retried ? "Question prompt scheduled for retry." : "That question delivery review was not found.", threadId)
-          return
-        }
-        const directory = yield* sessions.directoryFor(clientId(chatId))
-        const sessionID = yield* store.getSessionIDForDirectory(directory)
-        if (Option.isNone(sessionID)) {
-          yield* sendText(chatId, "No session yet.", threadId)
           return
         }
         const resolved = yield* resolveOwnedDurableReview(jobs, ownerFor(sessionID.value), reviewID)

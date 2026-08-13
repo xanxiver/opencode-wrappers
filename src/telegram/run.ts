@@ -9,6 +9,7 @@ import { logBoundary } from "../core/logging.js"
 import { OpenCode, questionRequestFromEvent, type PendingQuestionRequest } from "../core/opencode.js"
 import { isDefinitiveSendRejection, recordDefinitiveSendFailure, TelegramApi, type KeyboardMarkup } from "./api.js"
 import { AppConfigTag, parseRunTimeout } from "../config.js"
+import { renderTelegramMermaid } from "./mermaid.js"
 import { PermissionRegistry, type PermissionRegistryService } from "./permissions.js"
 import type { InteractionStoreError } from "./interaction-store.js"
 import { QuestionRegistry, type QuestionRegistryService } from "./questions.js"
@@ -77,6 +78,7 @@ export interface MediaArtifact {
   readonly name: string
   readonly mime: string
   readonly bytes: Uint8Array
+  readonly delivery?: "document"
 }
 
 export interface RunFinalization {
@@ -345,7 +347,7 @@ const validatedMedia = (
   return { key: `${key}:${mime}`, name, mime, bytes }
 }
 
-const limitMedia = (media: readonly MediaArtifact[]): readonly MediaArtifact[] => {
+export const limitMedia = (media: readonly MediaArtifact[]): readonly MediaArtifact[] => {
   let totalBytes = 0
   const accepted: MediaArtifact[] = []
   for (const item of deduplicateMedia(media)) {
@@ -712,10 +714,6 @@ const handleEvent = (
       return showActivity(state, "Session renamed")
     case "session.forked":
       return showActivity(state, "Session forked")
-    case "session.input.promoted":
-      return showActivity(state, "Input promoted")
-    case "session.input.admitted":
-      return showActivity(state, "Input admitted")
     case "session.execution.started":
       return showActivity(state, "Execution started")
     case "session.instructions.updated":
@@ -752,8 +750,6 @@ const handleEvent = (
       return showActivity(state, "Tool in progress")
     case "session.retry.scheduled":
       return showActivity(state, "Retry scheduled")
-    case "session.compaction.admitted":
-      return showActivity(state, "Compaction admitted")
     case "session.compaction.started":
       return showActivity(state, "Compacting session")
     case "session.compaction.delta":
@@ -1098,9 +1094,9 @@ export const runPrompt = (input: RunInput) =>
     const response = Option.isSome(canonicalResponse)
       ? canonicalResponse.value
       : yield* mediaFromResponseText(finalState.text)
-    const finalMedia = limitMedia([...finalState.media, ...response.media])
-    const finalText = truncate(renderFinal(response.text, outcome) + usageLine)
-    const finalization: RunFinalization = { text: finalText, media: finalMedia }
+    const rendered = yield* renderTelegramMermaid(renderFinal(response.text, outcome) + usageLine)
+    const finalMedia = limitMedia([...rendered.media, ...finalState.media, ...response.media])
+    const finalization: RunFinalization = { text: truncate(rendered.text), media: finalMedia }
     if (input.onFinalizing !== undefined) yield* input.onFinalizing(finalization)
     return finalization
   })

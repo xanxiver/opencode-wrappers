@@ -128,6 +128,28 @@ describe("Store", () => {
     }
   })
 
+  test("switches a conversation directory and clears its session atomically", async () => {
+    const stateFile = makeStateFile()
+    try {
+      const value = await run(
+        Effect.gen(function* () {
+          const store = yield* Store
+          yield* store.setSessionIDForConversation("tg:1", "ses_old")
+          yield* store.switchConversationDirectory("tg:1", "/project-x")
+          return {
+            directory: yield* store.getDirectory("tg:1"),
+            session: yield* store.getSessionIDForConversation("tg:1"),
+          }
+        }),
+        stateFile,
+      )
+      expect(value.directory).toEqual(Option.some("/project-x"))
+      expect(value.session).toEqual(Option.none())
+    } finally {
+      rmSync(stateFile, { force: true })
+    }
+  })
+
   test("lists retained session directories after a client switches projects", async () => {
     const stateFile = makeStateFile()
     try {

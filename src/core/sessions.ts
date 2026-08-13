@@ -36,14 +36,14 @@ export const Live: Layer.Layer<Sessions, never, OpenCode | Store | AppConfig> = 
       lock.withPermit(
         Effect.gen(function* () {
           const directory = yield* directoryFor(clientId)
-          const existing = yield* store.getSessionIDForDirectory(directory)
+          const existing = yield* store.getSessionIDForConversation(clientId)
           return yield* Option.match(existing, {
             onNone: () =>
               Effect.gen(function* () {
                 const session = yield* opencode.createSession(directory).pipe(
                   Effect.mapError(mapError("create session failed")),
                 )
-                yield* store.setSessionIDForDirectory(directory, session.id).pipe(
+                yield* store.setSessionIDForConversation(clientId, session.id).pipe(
                   Effect.mapError(mapError("persist session failed")),
                 )
                 // Track the chat so pending requests can be resurfaced later.
@@ -61,15 +61,22 @@ export const Live: Layer.Layer<Sessions, never, OpenCode | Store | AppConfig> = 
       reset: (clientId) =>
         lock.withPermit(
           Effect.gen(function* () {
-            const directory = yield* directoryFor(clientId)
-            yield* store.removeSessionIDForDirectory(directory).pipe(
+            yield* store.removeSessionIDForConversation(clientId).pipe(
               Effect.mapError(mapError("reset session failed")),
             )
           }),
         ),
       directoryFor,
       setDirectory: (clientId, directory) =>
-        store.setDirectory(clientId, directory).pipe(Effect.mapError(mapError("set directory failed"))),
+        lock.withPermit(
+          Effect.gen(function* () {
+            const current = yield* directoryFor(clientId)
+            const update = current === directory
+              ? store.setDirectory(clientId, directory)
+              : store.switchConversationDirectory(clientId, directory)
+            yield* update.pipe(Effect.mapError(mapError("set directory failed")))
+          }),
+        ),
     }
   }),
 )

@@ -110,8 +110,8 @@ export interface QuestionRegistryService {
   readonly restoreClaim: (claim: QuestionReplyClaim) => Effect.Effect<boolean, InteractionStoreError>
   readonly completeClaim: (token: number, generation: number) => Effect.Effect<boolean, InteractionStoreError>
   /** Make an operator-reviewed ambiguous Telegram send eligible for retry. */
-  readonly retryUncertainDelivery: (token: number, questionIndex: number, chatId: number) => Effect.Effect<boolean, InteractionStoreError>
-  readonly listUncertainDeliveries: (chatId: number) => Effect.Effect<readonly { readonly token: number; readonly questionIndex: number; readonly entry: PendingQuestion; readonly failure: PromptDeliveryFailure }[], InteractionStoreError>
+  readonly retryUncertainDelivery: (token: number, questionIndex: number, chatId: number, sessionID?: string) => Effect.Effect<boolean, InteractionStoreError>
+  readonly listUncertainDeliveries: (chatId: number, sessionID?: string) => Effect.Effect<readonly { readonly token: number; readonly questionIndex: number; readonly entry: PendingQuestion; readonly failure: PromptDeliveryFailure }[], InteractionStoreError>
   readonly remove: (token: number) => Effect.Effect<void, InteractionStoreError>
 }
 
@@ -519,10 +519,10 @@ export const Live: Layer.Layer<QuestionRegistry, InteractionStoreError, Interact
         entries.delete(token)
         return [true, { ...state, entries }]
       }),
-      retryUncertainDelivery: (token, questionIndex, chatId) => modify((state) => {
+      retryUncertainDelivery: (token, questionIndex, chatId, sessionID) => modify((state) => {
         const entry = state.entries.get(token)
         const messageId = entry?.messageIds[questionIndex]
-        if (entry === undefined || entry.chatId !== chatId || (messageId !== DELIVERY_UNCERTAIN_MESSAGE_ID && messageId !== DELIVERY_REJECTED_MESSAGE_ID)) return [false, state]
+        if (entry === undefined || entry.chatId !== chatId || (sessionID !== undefined && entry.sessionID !== sessionID) || (messageId !== DELIVERY_UNCERTAIN_MESSAGE_ID && messageId !== DELIVERY_REJECTED_MESSAGE_ID)) return [false, state]
         const messageIds = [...entry.messageIds]
         messageIds[questionIndex] = 0
         const deliveryClaimedAt = [...entry.deliveryClaimedAt]
@@ -531,11 +531,11 @@ export const Live: Layer.Layer<QuestionRegistry, InteractionStoreError, Interact
         deliveryGenerations[questionIndex] = undefined
         return [true, { ...state, entries: new Map(state.entries).set(token, { ...entry, messageIds, deliveryClaimedAt, deliveryGenerations }) }]
       }),
-      listUncertainDeliveries: (chatId) => Clock.currentTimeMillis.pipe(Effect.flatMap((now) => modify((state) => {
+      listUncertainDeliveries: (chatId, sessionID) => Clock.currentTimeMillis.pipe(Effect.flatMap((now) => modify((state) => {
         const clean = cleanState(state, now)
         const deliveries: Array<{ readonly token: number; readonly questionIndex: number; readonly entry: PendingQuestion; readonly failure: PromptDeliveryFailure }> = []
         for (const entry of clean.entries.values()) {
-          if (entry.chatId !== chatId) continue
+          if (entry.chatId !== chatId || (sessionID !== undefined && entry.sessionID !== sessionID)) continue
           for (const [questionIndex, messageId] of entry.messageIds.entries()) {
             if (messageId === DELIVERY_UNCERTAIN_MESSAGE_ID) deliveries.push({ token: entry.token, questionIndex, entry, failure: "uncertain" })
             else if (messageId === DELIVERY_REJECTED_MESSAGE_ID) deliveries.push({ token: entry.token, questionIndex, entry, failure: "rejected" })

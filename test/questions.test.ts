@@ -267,6 +267,23 @@ describe("QuestionRegistry", () => {
     expect(result.afterReview).toEqual(Option.some(1))
   })
 
+  test("scopes delivery reviews and retries to a session", async () => {
+    const result = await run(Effect.gen(function* () {
+      const registry = yield* QuestionRegistry
+      const first = yield* registry.registerOrResume({ ...base, sessionID: "ses_topic_1", requestID: "req_1" })
+      const second = yield* registry.registerOrResume({ ...base, sessionID: "ses_topic_2", requestID: "req_2" })
+      if (Option.isSome(first)) yield* registry.attachMessageId(first.value, 0, -1)
+      if (Option.isSome(second)) yield* registry.attachMessageId(second.value, 0, -1)
+      const reviews = yield* registry.listUncertainDeliveries(7, "ses_topic_1")
+      const crossTopicRetry = Option.isSome(second) &&
+        (yield* registry.retryUncertainDelivery(second.value, 0, 7, "ses_topic_1"))
+      return { reviews, crossTopicRetry }
+    }))
+
+    expect(result.reviews.map(({ entry }) => entry.sessionID)).toEqual(["ses_topic_1"])
+    expect(result.crossTopicRetry).toBe(false)
+  })
+
   test("claims a complete request before dispatch and restores it after rejection", async () => {
     const result = await run(Effect.gen(function* () {
       const registry = yield* QuestionRegistry

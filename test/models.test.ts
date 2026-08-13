@@ -17,6 +17,7 @@ describe("ModelRegistry", () => {
         const registry = yield* ModelRegistry
         const token = yield* registry.registerPage({
           sessionID: "ses_1",
+          directory: "/project",
           models,
           page: 0,
           total: 2,
@@ -45,7 +46,7 @@ describe("ModelRegistry", () => {
       Effect.gen(function* () {
         const registry = yield* ModelRegistry
         const token = yield* registry.registerPage({
-          sessionID: "s", models, page: 0, total: 2, chatId: 1,
+          sessionID: "s", directory: "/project", models, page: 0, total: 2, chatId: 1,
         })
         yield* registry.take(token, 1, 0)
         return yield* registry.take(token, 1, 0)
@@ -59,7 +60,7 @@ describe("ModelRegistry", () => {
       Effect.gen(function* () {
         const registry = yield* ModelRegistry
         const token = yield* registry.registerPage({
-          sessionID: "s", models, page: 0, total: 2, chatId: 1,
+          sessionID: "s", directory: "/project", models, page: 0, total: 2, chatId: 1,
         })
         yield* registry.attachMessageId(token, 99)
         const entry = yield* registry.take(token, 1, 99)
@@ -74,7 +75,7 @@ describe("ModelRegistry", () => {
       Effect.gen(function* () {
         const registry = yield* ModelRegistry
         const token = yield* registry.registerVariant({
-          sessionID: "s", providerID: "p", modelID: "m", variants: ["v1", "v2"], chatId: 1, messageId: 5,
+          sessionID: "s", directory: "/project", providerID: "p", modelID: "m", variants: ["v1", "v2"], chatId: 1, messageId: 5,
         })
         return yield* registry.take(token, 1, 5)
       }).pipe(Effect.provide(Live)),
@@ -95,10 +96,10 @@ describe("ModelRegistry", () => {
       Effect.gen(function* () {
         const registry = yield* ModelRegistry
         const t1 = yield* registry.registerPage({
-          sessionID: "s", models, page: 0, total: 2, chatId: 1,
+          sessionID: "s", directory: "/project", models, page: 0, total: 2, chatId: 1,
         })
         const t2 = yield* registry.registerVariant({
-          sessionID: "s", providerID: "p", modelID: "m", variants: ["v"], chatId: 1, messageId: 5,
+          sessionID: "s", directory: "/project", providerID: "p", modelID: "m", variants: ["v"], chatId: 1, messageId: 5,
         })
         return [t1, t2] as const
       }).pipe(Effect.provide(Live)),
@@ -111,7 +112,7 @@ describe("ModelRegistry", () => {
       Effect.gen(function* () {
         const registry = yield* ModelRegistry
         const token = yield* registry.registerPage({
-          sessionID: "s", models, page: 0, total: 2, chatId: 1,
+          sessionID: "s", directory: "/project", models, page: 0, total: 2, chatId: 1,
         })
         yield* registry.attachMessageId(token, 10)
         const stale = yield* registry.take(token, 1, 9)
@@ -128,10 +129,10 @@ describe("ModelRegistry", () => {
       Effect.gen(function* () {
         const registry = yield* ModelRegistry
         const page = yield* registry.registerPage({
-          sessionID: "s", models, page: 0, total: 2, chatId: 1,
+          sessionID: "s", directory: "/project", models, page: 0, total: 2, chatId: 1,
         })
         const variant = yield* registry.registerVariant({
-          sessionID: "s", providerID: "p", modelID: "m", variants: ["v"], chatId: 1, messageId: 10,
+          sessionID: "s", directory: "/project", providerID: "p", modelID: "m", variants: ["v"], chatId: 1, messageId: 10,
         })
         yield* registry.attachMessageId(page, 10)
         const cancelled = yield* registry.cancel(page, 1, 10)

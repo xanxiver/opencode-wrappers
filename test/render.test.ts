@@ -199,6 +199,7 @@ describe("renderFinal", () => {
   })
 })
 
+
 describe("renderUsage", () => {
   test("renders token counts and cost", () => {
     const text = renderUsage({
@@ -327,26 +328,26 @@ describe("renderModelPageHeader", () => {
   })
 
   test("multi page shows page numbers and range", () => {
-    expect(renderModelPageHeader(0, 25)).toBe("Select a model (page 1 of 3, 1-10 of 25):")
-    expect(renderModelPageHeader(2, 25)).toBe("Select a model (page 3 of 3, 21-25 of 25):")
+    expect(renderModelPageHeader(0, 25)).toBe("Select a model (page 1 of 5, 1-5 of 25):")
+    expect(renderModelPageHeader(4, 25)).toBe("Select a model (page 5 of 5, 21-25 of 25):")
   })
 })
 
 describe("modelPageKeyboard", () => {
-  const models = Array.from({ length: 10 }, (_, i) => ({ id: `m${i}`, providerID: "p" }))
+  const models = Array.from({ length: 5 }, (_, i) => ({ id: `m${i}`, providerID: "p" }))
 
   test("builds model buttons with per-model callback data", () => {
     const keyboard = modelPageKeyboard(1, models, 0, 25)
     const buttons = keyboard.inline_keyboard.flat()
     expect(buttons.some((b) => b.callback_data === "model:1:0")).toBe(true)
-    expect(buttons.some((b) => b.callback_data === "model:1:9")).toBe(true)
+    expect(buttons.some((b) => b.callback_data === "model:1:4")).toBe(true)
   })
 
   test("uses absolute model indexes on later pages", () => {
     const keyboard = modelPageKeyboard(1, models, 1, 25)
     const buttons = keyboard.inline_keyboard.flat()
-    expect(buttons.some((b) => b.callback_data === "model:1:10")).toBe(true)
-    expect(buttons.some((b) => b.callback_data === "model:1:19")).toBe(true)
+    expect(buttons.some((b) => b.callback_data === "model:1:5")).toBe(true)
+    expect(buttons.some((b) => b.callback_data === "model:1:9")).toBe(true)
   })
 
   test("adds Cancel to every model page", () => {
@@ -369,7 +370,7 @@ describe("modelPageKeyboard", () => {
   })
 
   test("adds Previous on the last page", () => {
-    const keyboard = modelPageKeyboard(3, models, 2, 25)
+    const keyboard = modelPageKeyboard(3, models, 4, 25)
     const flat = keyboard.inline_keyboard.flat()
     expect(flat.some((b) => b.text === "Previous")).toBe(true)
     expect(flat.some((b) => b.text === "Next")).toBe(false)

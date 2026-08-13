@@ -110,7 +110,7 @@ describe("Pickers", () => {
         const session = yield* pickers.registerSession({
           sessionID: "ses_1", directory: "/a", title: Option.none(), chatId: 1,
         })
-        const page = yield* pickers.registerSessionPage({ directory: "/a", chatId: 1 })
+        const page = yield* pickers.registerSessionPage({ directory: "/a", chatId: 1, current: {}, history: [] })
         yield* pickers.attachMessageId(session, 10)
         yield* pickers.attachMessageId(page, 10)
         const cancelled = yield* pickers.cancel(page, 1, 10)

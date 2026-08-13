@@ -4,7 +4,7 @@ import { logBoundary } from "../../core/logging.js"
 import { OpenCode } from "../../core/opencode.js"
 import { Sessions } from "../../core/sessions.js"
 import { Store } from "../../core/store.js"
-import { ModelRegistry } from "../models.js"
+import { ModelRegistry, type ModelEntry } from "../models.js"
 import {
   MODEL_PAGE_SIZE,
   modelPageKeyboard,
@@ -17,19 +17,32 @@ import {
   renderModelPageHeader,
 } from "../render.js"
 import type { CallbackQuery } from "../api.js"
-import { answer, apiEdit, callbackFailure, chunk, clientId, sendMarkup, sendText } from "./shared.js"
+import { answer, apiEdit, callbackFailure, chunk, sendMarkup, sendText } from "./shared.js"
+import { conversationId } from "../conversation.js"
 
 /** Remember the chosen model for the chat's directory. */
-const rememberModel = (chatId: number, model: { readonly id: string; readonly providerID: string; readonly variant?: string }) =>
+const rememberModel = (directory: string, model: { readonly id: string; readonly providerID: string; readonly variant?: string }) =>
   Effect.gen(function* () {
-    const sessions = yield* Sessions
     const store = yield* Store
-    const directory = yield* sessions.directoryFor(clientId(chatId))
     yield* store.setModel(directory, model).pipe(
       Effect.catchCause((cause) =>
         logBoundary("telegram/handlers", "sessions", "remember model failed")(cause),
       ),
     )
+  })
+
+const modelPickerIsCurrent = (entry: ModelEntry) =>
+  Effect.gen(function* () {
+    const sessions = yield* Sessions
+    const store = yield* Store
+    const conversation = conversationId({
+      chatId: entry.chatId,
+      threadId: entry.threadId,
+    })
+    const currentDirectory = yield* sessions.directoryFor(conversation)
+    if (currentDirectory !== entry.directory) return false
+    const currentSession = yield* store.getSessionIDForConversation(conversation)
+    return Option.exists(currentSession, (sessionID) => sessionID === entry.sessionID)
   })
 
 export const handleModelCallback = (query: CallbackQuery, data: string) =>
@@ -47,7 +60,11 @@ export const handleModelCallback = (query: CallbackQuery, data: string) =>
         const entry = yield* registry.take(parsed.token, message.chat.id, message.message_id)
         yield* Option.match(entry, {
           onNone: () => answer(query.id, "Expired."),
-          onSome: (value) => {
+          onSome: (value) => Effect.gen(function* () {
+            if (!(yield* modelPickerIsCurrent(value))) {
+              yield* answer(query.id, "This model picker is no longer current.")
+              return
+            }
             switch (value.kind) {
               case "provider":
                 return answer(query.id, "Choose a model first.")
@@ -66,7 +83,7 @@ export const handleModelCallback = (query: CallbackQuery, data: string) =>
                             sessionID: value.sessionID,
                             model: { id: selected.id, providerID: selected.providerID },
                           }).pipe(
-                            Effect.andThen(rememberModel(value.chatId, selected)),
+                             Effect.andThen(rememberModel(value.directory, selected)),
                             Effect.andThen(apiEdit(value.chatId, value.messageId, `Model switched to ${selected.id}`)),
                             Effect.andThen(answer(query.id, "Switched.")),
                           ),
@@ -77,7 +94,9 @@ export const handleModelCallback = (query: CallbackQuery, data: string) =>
                               providerID: selected.providerID,
                               modelID: selected.id,
                               variants,
+                              directory: value.directory,
                               chatId: value.chatId,
+                              threadId: value.threadId,
                               messageId: value.messageId,
                             })
                             const rows = chunk(
@@ -101,7 +120,7 @@ export const handleModelCallback = (query: CallbackQuery, data: string) =>
                 })
               }
             }
-          },
+          }),
         })
       }).pipe(
         Effect.catchCause(callbackFailure(query, "model callback failed", "Failed.")),
@@ -123,7 +142,11 @@ export const handleModelPageCallback = (query: CallbackQuery, data: string) =>
         const entry = yield* registry.take(parsed.token, message.chat.id, message.message_id)
         yield* Option.match(entry, {
           onNone: () => answer(query.id, "Expired."),
-          onSome: (value) => {
+          onSome: (value) => Effect.gen(function* () {
+            if (!(yield* modelPickerIsCurrent(value))) {
+              yield* answer(query.id, "This model picker is no longer current.")
+              return
+            }
             switch (value.kind) {
               case "provider":
                 return answer(query.id, "Choose a model first.")
@@ -137,9 +160,11 @@ export const handleModelPageCallback = (query: CallbackQuery, data: string) =>
                   const nextToken = yield* registry.registerPage({
                     sessionID: value.sessionID,
                     models: value.models,
+                    directory: value.directory,
                     page: parsed.page,
                     total: value.total,
                     chatId: value.chatId,
+                    threadId: value.threadId,
                   })
                   const from = parsed.page * MODEL_PAGE_SIZE
                   const pageModels = value.models.slice(from, from + MODEL_PAGE_SIZE)
@@ -154,7 +179,7 @@ export const handleModelPageCallback = (query: CallbackQuery, data: string) =>
                 }).pipe(Effect.catchCause(callbackFailure(query, "model page callback failed", "Failed.")))
               }
             }
-          },
+          }),
         })
       }).pipe(
         Effect.catchCause(callbackFailure(query, "model page callback failed", "Failed.")),
@@ -176,7 +201,11 @@ export const handleModelProviderCallback = (query: CallbackQuery, data: string) 
         const entry = yield* registry.take(parsed.token, message.chat.id, message.message_id)
         yield* Option.match(entry, {
           onNone: () => answer(query.id, "Expired."),
-          onSome: (value) => {
+          onSome: (value) => Effect.gen(function* () {
+            if (!(yield* modelPickerIsCurrent(value))) {
+              yield* answer(query.id, "This model picker is no longer current.")
+              return
+            }
             if (value.kind !== "provider") return answer(query.id, "Invalid entry.")
             const provider = Option.fromNullishOr(value.providers[parsed.index])
             return Option.match(provider, {
@@ -185,9 +214,11 @@ export const handleModelProviderCallback = (query: CallbackQuery, data: string) 
                 const token = yield* registry.registerPage({
                   sessionID: value.sessionID,
                   models: selected.models,
+                  directory: value.directory,
                   page: 0,
                   total: selected.models.length,
-                  chatId: value.chatId,
+                    chatId: value.chatId,
+                    threadId: value.threadId,
                 })
                 yield* registry.attachMessageId(token, value.messageId)
                 yield* apiEdit(
@@ -199,7 +230,7 @@ export const handleModelProviderCallback = (query: CallbackQuery, data: string) 
                 yield* answer(query.id, "Choose a model.")
               }),
             })
-          },
+          }),
         })
       }).pipe(Effect.catchCause(callbackFailure(query, "model provider callback failed", "Failed."))),
   })
@@ -219,7 +250,11 @@ export const handleModelVariantCallback = (query: CallbackQuery, data: string) =
         const entry = yield* registry.take(parsed.token, message.chat.id, message.message_id)
         yield* Option.match(entry, {
           onNone: () => answer(query.id, "Expired."),
-          onSome: (value) => {
+          onSome: (value) => Effect.gen(function* () {
+            if (!(yield* modelPickerIsCurrent(value))) {
+              yield* answer(query.id, "This model picker is no longer current.")
+              return
+            }
             switch (value.kind) {
               case "provider":
                 return answer(query.id, "Choose a model first.")
@@ -238,7 +273,7 @@ export const handleModelVariantCallback = (query: CallbackQuery, data: string) =
                       },
                     }).pipe(
                       Effect.andThen(
-                        rememberModel(value.chatId, {
+                        rememberModel(value.directory, {
                           id: value.modelID,
                           providerID: value.providerID,
                           variant,
@@ -251,7 +286,7 @@ export const handleModelVariantCallback = (query: CallbackQuery, data: string) =
                     ),
                 })
             }
-          },
+          }),
         })
       }).pipe(
         Effect.catchCause(callbackFailure(query, "model variant callback failed", "Failed.")),
@@ -288,8 +323,9 @@ export const showModels = (chatId: number, query = "", threadId?: number) =>
     const opencode = yield* OpenCode
     const store = yield* Store
     const registry = yield* ModelRegistry
-    const sessionID = yield* sessions.getOrCreate(clientId(chatId))
-    const directory = yield* sessions.directoryFor(clientId(chatId))
+    const conversation = conversationId({ chatId, threadId })
+    const sessionID = yield* sessions.getOrCreate(conversation)
+    const directory = yield* sessions.directoryFor(conversation)
     const remembered = yield* store.getModel(directory)
     const currentLine = Option.match(remembered, {
       onNone: () => "",
@@ -324,7 +360,9 @@ export const showModels = (chatId: number, query = "", threadId?: number) =>
     const token = yield* registry.registerProviders({
       sessionID,
       providers,
+      directory,
       chatId,
+      threadId,
     })
     const message = yield* sendMarkup(
       chatId,
@@ -348,8 +386,9 @@ export const selectExactModel = (chatId: number, query: string, threadId?: numbe
       yield* sendText(chatId, "Usage: /model <exact-model>", threadId)
       return
     }
-    const directory = yield* sessions.directoryFor(clientId(chatId))
-    const sessionID = yield* sessions.getOrCreate(clientId(chatId))
+    const conversation = conversationId({ chatId, threadId })
+    const directory = yield* sessions.directoryFor(conversation)
+    const sessionID = yield* sessions.getOrCreate(conversation)
     const models = yield* opencode.listModels(directory).pipe(
       Effect.catchCause((cause) => logBoundary("telegram/handlers", "opencode-client", "list models failed")(cause).pipe(
         Effect.andThen(Effect.succeed<readonly Model.Info[]>([])),
@@ -366,6 +405,6 @@ export const selectExactModel = (chatId: number, query: string, threadId?: numbe
       return
     }
     yield* opencode.switchModel({ sessionID, model: { id: selected.id, providerID: selected.providerID } })
-    yield* rememberModel(chatId, { id: selected.id, providerID: selected.providerID })
+    yield* rememberModel(directory, { id: selected.id, providerID: selected.providerID })
     yield* sendText(chatId, `Model switched to ${selected.providerID}/${selected.id}.`, threadId)
   })
