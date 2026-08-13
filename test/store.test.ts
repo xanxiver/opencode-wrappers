@@ -2,9 +2,9 @@ import { describe, expect, test } from "bun:test"
 import { Effect, Exit, Layer, Option } from "effect"
 import { AppConfig, AppConfigTag } from "../src/config.js"
 import { Live as StoreLive, Store } from "../src/core/store.js"
-import { mkdtempSync, rmSync } from "node:fs"
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { dirname, join } from "node:path"
 import { BunFileSystem } from "@effect/platform-bun"
 
 const BunFileSystemLayer = BunFileSystem.layer
@@ -24,7 +24,9 @@ const storeLayer = (stateFile: string) =>
           telegramBotToken: "test-token",
           projectDirectory: "/tmp",
           stateFile,
+          webDatabaseFile: `${stateFile}.sqlite`,
           telegramRunTimeout: "10 minutes",
+          webPort: 3001,
         }),
       ),
       BunFileSystemLayer,
@@ -35,6 +37,20 @@ const run = <A, E>(effect: Effect.Effect<A, E, Store>, stateFile: string) =>
   Effect.runPromise(effect.pipe(Effect.provide(storeLayer(stateFile))))
 
 describe("Store", () => {
+  test("malformed persisted JSON starts with an empty state instead of defecting", async () => {
+    const stateFile = makeStateFile()
+    writeFileSync(stateFile, "{not-json")
+    try {
+      const directory = await run(Effect.gen(function* () {
+        const store = yield* Store
+        return yield* store.getDirectory("tg:1")
+      }), stateFile)
+      expect(Option.isNone(directory)).toBe(true)
+    } finally {
+      rmSync(dirname(stateFile), { recursive: true, force: true })
+    }
+  })
+
   test("a failed write does not change the in-memory state", async () => {
     const unwritableStatePath = mkdtempSync(join(tmpdir(), "opencode2-uis-store-directory-"))
     try {
@@ -107,6 +123,46 @@ describe("Store", () => {
         stateFile,
       )
       expect(value).toEqual(Option.some("/project-x"))
+    } finally {
+      rmSync(stateFile, { force: true })
+    }
+  })
+
+  test("switches a conversation directory and clears its session atomically", async () => {
+    const stateFile = makeStateFile()
+    try {
+      const value = await run(
+        Effect.gen(function* () {
+          const store = yield* Store
+          yield* store.setSessionIDForConversation("tg:1", "ses_old")
+          yield* store.switchConversationDirectory("tg:1", "/project-x")
+          return {
+            directory: yield* store.getDirectory("tg:1"),
+            session: yield* store.getSessionIDForConversation("tg:1"),
+          }
+        }),
+        stateFile,
+      )
+      expect(value.directory).toEqual(Option.some("/project-x"))
+      expect(value.session).toEqual(Option.none())
+    } finally {
+      rmSync(stateFile, { force: true })
+    }
+  })
+
+  test("lists retained session directories after a client switches projects", async () => {
+    const stateFile = makeStateFile()
+    try {
+      const directories = await run(
+        Effect.gen(function* () {
+          const store = yield* Store
+          yield* store.setSessionIDForDirectory("/old-project", "ses_old")
+          yield* store.setDirectory("tg:1", "/new-project")
+          return yield* store.listDirectories()
+        }),
+        stateFile,
+      )
+      expect(new Set(directories)).toEqual(new Set(["/old-project", "/new-project"]))
     } finally {
       rmSync(stateFile, { force: true })
     }

@@ -1,4 +1,4 @@
-import { Effect, Option } from "effect"
+import { Cause, Effect, Option } from "effect"
 import { logBoundary } from "../../core/logging.js"
 import { OpenCode } from "../../core/opencode.js"
 import { QuestionRegistry } from "../questions.js"
@@ -7,8 +7,16 @@ import {
   renderQuestionWithSelection,
 } from "../render.js"
 import type { CallbackQuery } from "../api.js"
+import { questionKeyboard } from "../run.js"
 import { answer, apiEdit, callbackFailure, sendText } from "./shared.js"
 import { isComplete } from "../questions.js"
+import { withClaimLease } from "./claim-lease.js"
+
+const bestEffortConfirmation = <A, R>(effect: Effect.Effect<A, unknown, R>, message: string): Effect.Effect<void, never, R> =>
+  effect.pipe(
+    Effect.asVoid,
+    Effect.catchCause((cause) => logBoundary("telegram/handlers", "telegram-confirmation", message)(cause)),
+  )
 
 /**
  * Record an answer for one question of a pending request.
@@ -29,17 +37,23 @@ export const recordQuestionAnswer = (
       onNone: () => Effect.succeed(false),
       onSome: (current) => {
         if (!isComplete(current)) return Effect.succeed(false)
-        return opencode.replyQuestion({
-          sessionID: current.sessionID,
-          requestID: current.requestID,
-          answers: current.answers.map((answer) => answer ?? []),
-        }).pipe(
-          Effect.andThen(registry.remove(current.token)),
-          Effect.andThen(
-            Effect.forEach(current.messageIds, (messageId) => apiEdit(current.chatId, messageId, "Answered")),
+        return registry.claimComplete(current.token).pipe(Effect.flatMap(Option.match({
+          onNone: () => Effect.succeed(false),
+          onSome: (claim) => withClaimLease(claim.entry.token, opencode.replyQuestion({
+            sessionID: claim.entry.sessionID,
+            requestID: claim.entry.requestID,
+            answers: claim.entry.answers.map((answer) => answer ?? []),
+          }), registry.renewClaim(claim.entry.token, claim.generation)).pipe(
+            Effect.onError(() => registry.restoreClaim(claim).pipe(
+              Effect.catchCause((cause) => Effect.logError("failed to restore question interaction", Cause.pretty(cause))),
+            )),
+            Effect.andThen(registry.completeClaim(claim.entry.token, claim.generation)),
+            Effect.flatMap((completed) => completed
+              ? Effect.forEach(claim.entry.messageIds, (messageId) =>
+                  bestEffortConfirmation(apiEdit(claim.entry.chatId, messageId, "Answered"), "question accepted but message edit failed")).pipe(Effect.as(true))
+              : Effect.succeed(false)),
           ),
-          Effect.as(true),
-        )
+        })))
       },
     })
   })
@@ -107,7 +121,7 @@ export const handleQuestionCallback = (query: CallbackQuery, data: string) =>
                 switch (parsed.choice.kind) {
                   case "skip":
                     return recordQuestionAnswer(parsed.token, parsed.questionIndex, []).pipe(
-                      Effect.andThen(answer(query.id, "Skipped.")),
+                      Effect.andThen(bestEffortConfirmation(answer(query.id, "Skipped."), "question skip acknowledgement failed")),
                     )
                   case "confirm": {
                     if (!(current.multiples[parsed.questionIndex] ?? false)) {
@@ -115,7 +129,7 @@ export const handleQuestionCallback = (query: CallbackQuery, data: string) =>
                     }
                     const value = current.selections[parsed.questionIndex] ?? []
                     return recordQuestionAnswer(parsed.token, parsed.questionIndex, value).pipe(
-                      Effect.andThen(answer(query.id, "Answer recorded.")),
+                      Effect.andThen(bestEffortConfirmation(answer(query.id, "Answer recorded."), "question acknowledgement failed")),
                     )
                   }
                   case "option": {
@@ -136,26 +150,26 @@ export const handleQuestionCallback = (query: CallbackQuery, data: string) =>
                           onSome: (next) => {
                             const messageId = next.messageIds[parsed.questionIndex]
                             const selected = next.selections[parsed.questionIndex] ?? []
-                            return apiEdit(
+                            const question = {
+                              header: "",
+                              question: next.questions[parsed.questionIndex] ?? "",
+                              options: questionOptions.map((item) => ({ label: item, description: "" })),
+                              custom: next.customs[parsed.questionIndex] ?? false,
+                              multiple: next.multiples[parsed.questionIndex] ?? false,
+                            }
+                            return bestEffortConfirmation(apiEdit(
                               next.chatId,
                               messageId,
-                              renderQuestionWithSelection(
-                                {
-                                  header: "",
-                                  question: next.questions[parsed.questionIndex] ?? "",
-                                  options: questionOptions.map((item) => ({ label: item, description: "" })),
-                                  custom: next.customs[parsed.questionIndex] ?? false,
-                                },
-                                selected,
-                              ),
-                            )
+                              renderQuestionWithSelection(question, selected),
+                              questionKeyboard(parsed.token, parsed.questionIndex, question),
+                            ), "question selection edit failed")
                           },
                         })
-                        yield* answer(query.id, "Selection updated.")
+                        yield* bestEffortConfirmation(answer(query.id, "Selection updated."), "question selection acknowledgement failed")
                       }).pipe(Effect.catchCause(callbackFailure(query, "question callback failed", "Failed.")))
                     }
                     return recordQuestionAnswer(parsed.token, parsed.questionIndex, [label]).pipe(
-                      Effect.andThen(answer(query.id, "Answer recorded.")),
+                      Effect.andThen(bestEffortConfirmation(answer(query.id, "Answer recorded."), "question acknowledgement failed")),
                     )
                   }
                 }

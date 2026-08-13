@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { Effect, Layer, Option } from "effect"
+import { Effect, Option } from "effect"
 import { Live, Pickers } from "../src/telegram/pickers.js"
 
 const run = <A>(effect: Effect.Effect<A, never, never>) =>
@@ -20,6 +20,23 @@ describe("Pickers", () => {
     if (Option.isSome(result.entry)) {
       expect(result.entry.value).toEqual({ directory: "/project-x", chatId: 1, messageId: 0 })
     }
+  })
+
+  test("registerDirectoryPage keeps directories and page", async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const pickers = yield* Pickers
+        const token = yield* pickers.registerDirectoryPage({ directories: ["/a", "/b"], page: 1, chatId: 1 })
+        return yield* pickers.take(token, 1, 0)
+      }).pipe(Effect.provide(Live)),
+    )
+    expect(Option.getOrThrow(result)).toEqual({
+      kind: "directory-page",
+      directories: ["/a", "/b"],
+      page: 1,
+      chatId: 1,
+      messageId: 0,
+    })
   })
 
   test("registerSession keeps session id, directory and title", async () => {
@@ -93,7 +110,7 @@ describe("Pickers", () => {
         const session = yield* pickers.registerSession({
           sessionID: "ses_1", directory: "/a", title: Option.none(), chatId: 1,
         })
-        const page = yield* pickers.registerSessionPage({ directory: "/a", chatId: 1 })
+        const page = yield* pickers.registerSessionPage({ directory: "/a", chatId: 1, current: {}, history: [] })
         yield* pickers.attachMessageId(session, 10)
         yield* pickers.attachMessageId(page, 10)
         const cancelled = yield* pickers.cancel(page, 1, 10)

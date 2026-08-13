@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test"
-import { Effect, Layer, Option, Result } from "effect"
+import { Cause, Effect, Exit, Layer, Option, Result } from "effect"
 import { FetchHttpClient } from "effect/unstable/http"
-import { TelegramApi, type Message } from "../src/telegram/api.js"
+import { ApiError, TelegramApi, type Message } from "../src/telegram/api.js"
 import {
   collectAttachments,
   collectRefs,
@@ -49,6 +49,7 @@ describe("kindForExtension", () => {
     expect(kindForExtension("webp")).toEqual(Option.some("webp"))
     expect(kindForExtension("xlsx")).toEqual(Option.some("zip"))
     expect(kindForExtension("docx")).toEqual(Option.some("zip"))
+    expect(kindForExtension("dacpac")).toEqual(Option.some("zip"))
     expect(kindForExtension("csv")).toEqual(Option.some("text"))
     expect(kindForExtension("md")).toEqual(Option.some("text"))
     expect(kindForExtension("mdx")).toEqual(Option.some("text"))
@@ -71,6 +72,7 @@ describe("mimeForExtension", () => {
     expect(mimeForExtension("csv")).toEqual(Option.some("text/csv"))
     expect(mimeForExtension("xlsx")).toEqual(Option.some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"))
     expect(mimeForExtension("docx")).toEqual(Option.some("application/vnd.openxmlformats-officedocument.wordprocessingml.document"))
+    expect(mimeForExtension("dacpac")).toEqual(Option.some("application/octet-stream"))
     expect(mimeForExtension("md")).toEqual(Option.some("text/markdown"))
     expect(mimeForExtension("mdx")).toEqual(Option.some("text/markdown"))
     expect(mimeForExtension("exe")).toEqual(Option.none())
@@ -110,6 +112,7 @@ describe("validateAttachment", () => {
 
     expect(Result.isSuccess(validateAttachment("book.xlsx", ZIP))).toBe(true)
     expect(Result.isSuccess(validateAttachment("notes.docx", ZIP))).toBe(true)
+    expect(Result.isSuccess(validateAttachment("database.DACPAC", ZIP))).toBe(true)
     expect(Result.isSuccess(validateAttachment("README.md", MD))).toBe(true)
     expect(Result.isSuccess(validateAttachment("data.CSV", CSV))).toBe(true)
     expect(Result.isSuccess(validateAttachment("photo.jpeg", JPG))).toBe(true)
@@ -248,16 +251,21 @@ describe("collectRefs", () => {
 })
 
 describe("collectAttachments", () => {
-  const fakeFiles: Record<string, Uint8Array> = {
+  const fakeFiles = {
     "files/doc1.bin": PDF,
     "files/photo.bin": PNG,
     "files/fake.bin": text("not really a pdf"),
     "files/dup.bin": CSV,
-  }
+  } satisfies Readonly<Record<string, Uint8Array>>
+  const fileContents = (filePath: string): Uint8Array =>
+    Object.entries(fakeFiles).find(([path]) => path === filePath)?.[1] ?? new Uint8Array()
 
   const fakeApi = Layer.succeed(TelegramApi, {
     getUpdates: () => Effect.never,
     sendMessage: () => Effect.never,
+    sendPhoto: () => Effect.never,
+    sendVideo: () => Effect.never,
+    sendDocument: () => Effect.never,
     editMessageText: () => Effect.never,
     answerCallbackQuery: () => Effect.never,
     getFile: (fileId: string) =>
@@ -266,7 +274,7 @@ describe("collectAttachments", () => {
         file_path: `files/${fileId}.bin`,
       }),
     downloadFile: (filePath: string) =>
-      Effect.succeed(fakeFiles[filePath] ?? new Uint8Array()),
+      Effect.succeed(fileContents(filePath)),
   })
 
   const run = (message: Message) =>
@@ -307,6 +315,15 @@ describe("collectAttachments", () => {
     await expect(Effect.runPromise(run(message))).rejects.toThrow(/does not match/)
   })
 
+  test("rejects an oversized attachment before downloading it", async () => {
+    const message: Message = {
+      message_id: 4,
+      chat: { id: 42 },
+      document: { file_id: "doc1", file_name: "report.pdf", file_size: 10 * 1024 * 1024 + 1 },
+    }
+    await expect(Effect.runPromise(run(message))).rejects.toThrow(/exceeds 10 MB/)
+  })
+
   test("downloads a duplicate file id only once", async () => {
     const message: Message = {
       message_id: 5,
@@ -321,5 +338,33 @@ describe("collectAttachments", () => {
     const attachments = await Effect.runPromise(run(message))
     expect(attachments.length).toBe(1)
     expect(attachments[0].name).toBe("a.csv")
+  })
+
+  test("preserves transient Telegram download failures for durable retry", async () => {
+    const transientApi = Layer.succeed(TelegramApi, {
+      getUpdates: () => Effect.never,
+      sendMessage: () => Effect.never,
+      sendPhoto: () => Effect.never,
+      sendVideo: () => Effect.never,
+      sendDocument: () => Effect.never,
+      editMessageText: () => Effect.never,
+      answerCallbackQuery: () => Effect.never,
+      getFile: () => Effect.fail(new ApiError({ operation: "getFile", transient: true })),
+      downloadFile: () => Effect.never,
+    })
+    const message: Message = {
+      message_id: 6,
+      chat: { id: 42 },
+      document: { file_id: "temporary", file_name: "report.pdf" },
+    }
+    const exit = await Effect.runPromiseExit(collectAttachments(message).pipe(
+      Effect.provide(transientApi),
+      Effect.provide(FetchHttpClient.layer),
+    ))
+    expect(Exit.isFailure(exit)).toBe(true)
+    if (Exit.isFailure(exit)) {
+      const error = Cause.findErrorOption(exit.cause)
+      expect(Option.isSome(error) && error.value._tag === "AttachmentDownloadError" && error.value.transient).toBe(true)
+    }
   })
 })

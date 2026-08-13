@@ -10,12 +10,23 @@ export interface PageModel {
 /** A page of the model picker, or a variant picked for a chosen model. */
 export type ModelEntry =
   | {
+    readonly kind: "provider"
+    readonly sessionID: string
+    readonly providers: readonly { readonly id: string; readonly models: readonly PageModel[] }[]
+    readonly directory: string
+    readonly chatId: number
+    readonly threadId?: number
+    readonly messageId: number
+  }
+  | {
     readonly kind: "page"
     readonly sessionID: string
     readonly models: readonly PageModel[]
+    readonly directory: string
     readonly page: number
     readonly total: number
     readonly chatId: number
+    readonly threadId?: number
     readonly messageId: number
   }
   | {
@@ -24,24 +35,37 @@ export type ModelEntry =
     readonly providerID: string
     readonly modelID: string
     readonly variants: readonly string[]
+    readonly directory: string
     readonly chatId: number
+    readonly threadId?: number
     readonly messageId: number
   }
 
-export interface ModelRegistryShape {
+export interface ModelRegistryService {
+  readonly registerProviders: (input: {
+    readonly sessionID: string
+    readonly providers: readonly { readonly id: string; readonly models: readonly PageModel[] }[]
+    readonly directory: string
+    readonly chatId: number
+    readonly threadId?: number
+  }) => Effect.Effect<number>
   readonly registerPage: (input: {
     readonly sessionID: string
     readonly models: readonly PageModel[]
+    readonly directory: string
     readonly page: number
     readonly total: number
     readonly chatId: number
+    readonly threadId?: number
   }) => Effect.Effect<number, never>
   readonly registerVariant: (input: {
     readonly sessionID: string
     readonly providerID: string
     readonly modelID: string
     readonly variants: readonly string[]
+    readonly directory: string
     readonly chatId: number
+    readonly threadId?: number
     readonly messageId: number
   }) => Effect.Effect<number, never>
   readonly attachMessageId: (token: number, messageId: number) => Effect.Effect<void, never>
@@ -52,7 +76,7 @@ export interface ModelRegistryShape {
     Effect.Effect<Option.Option<ModelEntry>, never>
 }
 
-export class ModelRegistry extends Context.Service<ModelRegistry, ModelRegistryShape>()(
+export class ModelRegistry extends Context.Service<ModelRegistry, ModelRegistryService>()(
   "opencode2-uis/ModelRegistry",
 ) {}
 
@@ -70,6 +94,13 @@ export const Live: Layer.Layer<ModelRegistry> = Layer.effect(
         Ref.modify(ref, (state) => {
           const token = state.next
           const entry: ModelEntry = { kind: "page", ...input, messageId: 0 }
+          const entries = new Map(state.entries).set(token, entry)
+          return [token, { next: token + 1, entries }]
+          }),
+      registerProviders: (input) =>
+        Ref.modify(ref, (state) => {
+          const token = state.next
+          const entry: ModelEntry = { kind: "provider", ...input, messageId: 0 }
           const entries = new Map(state.entries).set(token, entry)
           return [token, { next: token + 1, entries }]
         }),

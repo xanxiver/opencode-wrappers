@@ -8,7 +8,8 @@ The bot lives in `src/` and `test/` at the repository root. The core
 - Prompt an OpenCode2 session from Telegram, one session per directory.
 - Attach files to prompts: pdf, png, jpg, gif, webp, csv, xlsx, docx, md, mdx.
   Extension AND magic bytes are validated. Reply to a message to use its
-  attachments.
+  attachments. Each file has a 10 MB limit. One prompt has a 10-file and 50 MB
+  total limit.
 - Tool permission approvals via inline keyboard (once / always / reject).
 - Agent questions: option buttons, multi-select with Confirm, skip, or reply
   with text (when the question allows custom answers).
@@ -16,22 +17,48 @@ The bot lives in `src/` and `test/` at the repository root. The core
 - Token usage and cost in the final message.
 - `/model`: paginated model picker (10 per page, Previous/Next).
 - `/compact`: compact the current session.
-- `/resume`: attach to an active run after a bot restart.
+- `/reconnect`: report automatic recovery or durably attach to an active
+  OpenCode run that has no worker.
+- `/forceReconnect`: replace the worker lease when the current worker stopped.
 - `/review [focus]`: review the current repository changes.
+- `/reviews`: list redacted evidence for ambiguous jobs and Telegram prompt sends.
+- `/resolve_review <review-id>`: resolve a job review or explicitly retry an
+  uncertain prompt send.
 - Forum topics: replies land in the thread the user is in.
-- Commands: `/start`, `/help`, `/prompt`, `/new`, `/stop`, `/resume`, `/compact`, `/review`,
-  `/model`, `/status`, `/whoami`, `/projects`, `/project <path>`, `/sessions`.
+- Commands: `/start`, `/help`, `/prompt`, `/new`, `/stop`, `/reconnect`, `/forceReconnect`,
+  `/compact`, `/review`, `/model`, `/status`, `/whoami`, `/projects`, `/project <path>`,
+  `/sessions`.
 - User whitelist via `TELEGRAM_ALLOWED_USERS` (empty = deny all).
 
 ## Reliability
 
-- Telegram API retry with exponential backoff (max 5 retries, 30s cap).
+- Idempotent Telegram API operations retry with exponential backoff (max 5
+  retries, 30s cap). Message creation does not retry at the transport layer.
 - Message edits rate-limited to 1/sec per chat.
 - Event stream reconnect with backoff.
 - Run timeout: 10 minutes, then interrupt the session.
-- Permission/question tokens expire (30 min / 1 hour); after a restart,
-  pending requests are re-surfaced to the affected chats.
-- Message queue while busy: messages run in FIFO order.
+- Permission and question state is stored in SQLite. Tokens expire after 30
+  minutes or 1 hour. Pending requests remain available after a restart. A
+  generation-fenced reply claim prevents a replay while OpenCode processes the
+  reply. A renewable lease keeps the claim active across overlapping bot
+  processes. A stopped process releases the claim when its lease expires.
+- Permission and question delivery is fenced before the Telegram send. An
+  uncertain send is not repeated automatically because Telegram has no
+  idempotency key for message creation. `/reviews` shows the uncertain send.
+  The operator can inspect the chat before an explicit retry. A definitive
+  Telegram rejection also stays fenced for operator review, which prevents a
+  permanent rejection from creating a retry loop.
+- Prompts and accepted attachment bytes remain in SQLite from acceptance to a
+  terminal job state. Completion and permanent failure remove the prompt,
+  attachment bytes, and terminal response from the job row. A manual-review
+  state retains redacted diagnostic evidence until the review is explicitly
+  resolved. Unresolved evidence is removed after 7 days.
+- Failed Telegram updates are logged and quarantined so one poison update does
+  not block later updates. Duplicate prompt messages still resolve to the same
+  durable job.
+- One renewable, generation-fenced lease controls each running job.
+- Waiting prompts run in FIFO order for each OpenCode session.
+- Generated media uses container validation and a 10-file, 50 MB total limit.
 
 ## Stack
 
@@ -78,15 +105,20 @@ are prefixed per UI (`TELEGRAM_*`).
 - `src/core/sessions.ts` — get-or-create session with a lock; chats in the
   same directory share the session.
 - `src/core/attachments.ts` — attachment -> data-URI conversion.
+- `src/core/durable-executor.ts` — durable jobs, state transitions, and
+  generation-fenced worker leases.
 - `src/telegram/api.ts` — Telegram Bot API client with retry/backoff and
   per-chat edit rate limiting.
 - `src/telegram/files.ts` — extension + magic byte validation, downloads.
 - `src/telegram/run.ts` — one prompt run: live message edits, permissions,
   questions, reasoning, usage, reconnect, timeout, auto-compact, model
   re-apply.
+- `src/telegram/durable-executor.ts` — supervised Telegram workers and restart
+  recovery.
+- `src/telegram/interaction-store.ts` — durable permission and question state.
 - `src/telegram/handlers/*` — message/command handling, split by concern:
   `update`, `message`, `run`, `callbacks`, `permission`, `model`, `question`,
-  `picker`, `services` (busy + queue), `shared`, with an `index` barrel.
+  `picker`, `shared`, with an `index` barrel.
 - `src/telegram/{permissions,questions,models,pickers}.ts` — token
   registries for inline keyboard actions.
 - `src/telegram/resurface.ts` — re-surfaces pending requests after restart.

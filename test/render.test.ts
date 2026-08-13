@@ -1,18 +1,24 @@
 import { describe, expect, test } from "bun:test"
-import { Option } from "effect"
+import { unlink } from "node:fs/promises"
+import { Effect, Option } from "effect"
+import { BunFileSystem, BunPath } from "@effect/platform-bun"
 import { EDIT_MIN_INTERVAL_MS, editDelay } from "../src/telegram/api.js"
-import { nextProgressEdit } from "../src/telegram/run.js"
+import { MAX_RECOVERY_MESSAGE_PAGES, assistantResponseForInput, detectSupportedMediaMime, matchesSessionRoute, mediaFromResponseText, nextProgressEdit, recoveredResponseForInput, recoveredResponseFromPages } from "../src/telegram/run.js"
 import {
   MAX_MESSAGE_LENGTH,
   MODEL_PAGE_SIZE,
   REASONING_DISPLAY_LIMIT,
   modelPageKeyboard,
+  modelProviderKeyboard,
   normalizeCommand,
   parseModelCallback,
   parseModelPageCallback,
+  parseModelProviderCallback,
   parseModelVariantCallback,
+  parseDirectoryPageCallback,
   parsePermissionCallback,
   parsePromptCommand,
+  promptWithReply,
   parseQuestionCallback,
   renderFinal,
   renderModelLabel,
@@ -26,6 +32,14 @@ import {
   truncate,
 } from "../src/telegram/render.js"
 
+describe("project picker", () => {
+  test("parses project page callbacks", () => {
+    expect(Option.getOrThrow(parseDirectoryPageCallback("dirp:12:2"))).toEqual({ token: 12, page: 2 })
+    expect(parseDirectoryPageCallback("dirp:12:-1")).toEqual(Option.none())
+    expect(parseDirectoryPageCallback("dirp:nope:2")).toEqual(Option.none())
+  })
+})
+
 describe("normalizeCommand", () => {
   test("strips the bot mention from commands", () => {
     expect(normalizeCommand("/model@MyBot")).toBe("/model")
@@ -36,6 +50,26 @@ describe("normalizeCommand", () => {
   test("leaves plain text unchanged", () => {
     expect(normalizeCommand("hello there")).toBe("hello there")
     expect(normalizeCommand("user@example.com")).toBe("user@example.com")
+  })
+})
+
+describe("model provider picker", () => {
+  test("parses provider callbacks and rejects invalid indexes", () => {
+    expect(Option.getOrThrow(parseModelProviderCallback("modelpr:12:3"))).toEqual({ token: 12, index: 3 })
+    expect(parseModelProviderCallback("modelpr:12:-1")).toEqual(Option.none())
+    expect(parseModelProviderCallback("modelpr:nope:3")).toEqual(Option.none())
+  })
+
+  test("renders providers with a cancel action", () => {
+    expect(modelProviderKeyboard(4, [{ id: "alpha" }, { id: "beta" }])).toEqual({
+      inline_keyboard: [
+        [
+          { text: "alpha", callback_data: "modelpr:4:0" },
+          { text: "beta", callback_data: "modelpr:4:1" },
+        ],
+        [{ text: "Cancel", callback_data: "modelc:4" }],
+      ],
+    })
   })
 })
 
@@ -55,6 +89,22 @@ describe("parsePromptCommand", () => {
     expect(parsePromptCommand("/model")).toEqual(Option.none())
     expect(parsePromptCommand("/promptx")).toEqual(Option.none())
     expect(parsePromptCommand("/prompt@bot")).toEqual(Option.none())
+  })
+})
+
+describe("promptWithReply", () => {
+  test("includes replied message context and the requested task", () => {
+    expect(promptWithReply("summarize this", "A long message")).toBe(
+      "Message to respond to:\n\nA long message\n\nTask:\nsummarize this",
+    )
+  })
+
+  test("uses the replied message when the prompt has no task", () => {
+    expect(promptWithReply("", "A long message")).toBe("Message to respond to:\n\nA long message")
+  })
+
+  test("does not add empty reply context", () => {
+    expect(promptWithReply("summarize this", "  ")).toBe("summarize this")
   })
 })
 
@@ -148,6 +198,7 @@ describe("renderFinal", () => {
     expect(renderFinal("", "done")).toContain("no text output")
   })
 })
+
 
 describe("renderUsage", () => {
   test("renders token counts and cost", () => {
@@ -277,26 +328,26 @@ describe("renderModelPageHeader", () => {
   })
 
   test("multi page shows page numbers and range", () => {
-    expect(renderModelPageHeader(0, 25)).toBe("Select a model (page 1 of 3, 1-10 of 25):")
-    expect(renderModelPageHeader(2, 25)).toBe("Select a model (page 3 of 3, 21-25 of 25):")
+    expect(renderModelPageHeader(0, 25)).toBe("Select a model (page 1 of 5, 1-5 of 25):")
+    expect(renderModelPageHeader(4, 25)).toBe("Select a model (page 5 of 5, 21-25 of 25):")
   })
 })
 
 describe("modelPageKeyboard", () => {
-  const models = Array.from({ length: 10 }, (_, i) => ({ id: `m${i}`, providerID: "p" }))
+  const models = Array.from({ length: 5 }, (_, i) => ({ id: `m${i}`, providerID: "p" }))
 
   test("builds model buttons with per-model callback data", () => {
     const keyboard = modelPageKeyboard(1, models, 0, 25)
     const buttons = keyboard.inline_keyboard.flat()
     expect(buttons.some((b) => b.callback_data === "model:1:0")).toBe(true)
-    expect(buttons.some((b) => b.callback_data === "model:1:9")).toBe(true)
+    expect(buttons.some((b) => b.callback_data === "model:1:4")).toBe(true)
   })
 
   test("uses absolute model indexes on later pages", () => {
     const keyboard = modelPageKeyboard(1, models, 1, 25)
     const buttons = keyboard.inline_keyboard.flat()
-    expect(buttons.some((b) => b.callback_data === "model:1:10")).toBe(true)
-    expect(buttons.some((b) => b.callback_data === "model:1:19")).toBe(true)
+    expect(buttons.some((b) => b.callback_data === "model:1:5")).toBe(true)
+    expect(buttons.some((b) => b.callback_data === "model:1:9")).toBe(true)
   })
 
   test("adds Cancel to every model page", () => {
@@ -319,7 +370,7 @@ describe("modelPageKeyboard", () => {
   })
 
   test("adds Previous on the last page", () => {
-    const keyboard = modelPageKeyboard(3, models, 2, 25)
+    const keyboard = modelPageKeyboard(3, models, 4, 25)
     const flat = keyboard.inline_keyboard.flat()
     expect(flat.some((b) => b.text === "Previous")).toBe(true)
     expect(flat.some((b) => b.text === "Next")).toBe(false)
@@ -417,5 +468,178 @@ describe("nextProgressEdit", () => {
         dirty: true,
       }),
     ).toEqual(Option.none())
+  })
+})
+
+describe("matchesSessionRoute", () => {
+  test("matches only the source chat and topic", () => {
+    const route = { chatId: 7, threadId: 42 }
+    expect(matchesSessionRoute(route, 7, 42)).toBe(true)
+    expect(matchesSessionRoute(route, 8, 42)).toBe(false)
+    expect(matchesSessionRoute(route, 7, 99)).toBe(false)
+    expect(matchesSessionRoute(route, 7)).toBe(false)
+  })
+
+  test("matches a source chat without a topic", () => {
+    expect(matchesSessionRoute({ chatId: 7 }, 7)).toBe(true)
+    expect(matchesSessionRoute({ chatId: 7 }, 7, 42)).toBe(false)
+  })
+})
+
+describe("mediaFromResponseText", () => {
+  const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64")
+
+  test("reads an absolute-path media contract and removes it from text", async () => {
+    const path = `/tmp/telegram-media-test-${process.pid}.png`
+    await Bun.write(path, png)
+    try {
+      const result = await Effect.runPromise(mediaFromResponseText(
+        `Here is the screenshot.\n<telegram-media>{"type":"file","path":"${path}","mime":"image/png","name":"screen.png"}</telegram-media>\n<telegram-media>{"type":"file","path":"${path}","mime":"image/png","name":"screen.png"}</telegram-media>`,
+      ).pipe(Effect.provide(BunFileSystem.layer), Effect.provide(BunPath.layer)))
+      expect(result.text).toBe("Here is the screenshot.")
+      expect(result.media).toHaveLength(1)
+      expect(result.media[0]?.name).toBe("screen.png")
+      expect(result.media[0]?.mime).toBe("image/png")
+      expect(result.media[0]?.bytes.length).toBeGreaterThan(0)
+    } finally {
+      await unlink(path).catch(() => undefined)
+    }
+  })
+
+  test("rejects a non-media file even when it declares an image MIME type", async () => {
+    const path = `/tmp/telegram-media-test-${process.pid}.txt`
+    await Bun.write(path, "private text")
+    try {
+      const result = await Effect.runPromise(mediaFromResponseText(
+        `<telegram-media>{"type":"file","path":"${path}","mime":"image/png","name":"screen.png"}</telegram-media>`,
+      ).pipe(Effect.provide(BunFileSystem.layer), Effect.provide(BunPath.layer)))
+      expect(result.media).toEqual([])
+    } finally {
+      await unlink(path).catch(() => undefined)
+    }
+  })
+
+  test("rejects a supported file when its declared MIME type does not match its bytes", async () => {
+    const path = `/tmp/telegram-media-test-${process.pid}-mismatch.png`
+    await Bun.write(path, png)
+    try {
+      const result = await Effect.runPromise(mediaFromResponseText(
+        `<telegram-media>{"type":"file","path":"${path}","mime":"video/mp4","name":"clip.mp4"}</telegram-media>`,
+      ).pipe(Effect.provide(BunFileSystem.layer), Effect.provide(BunPath.layer)))
+      expect(result.media).toEqual([])
+    } finally {
+      await unlink(path).catch(() => undefined)
+    }
+  })
+
+  test("validates supported image and video containers", () => {
+    expect(detectSupportedMediaMime(png)).toBe("image/png")
+    expect(detectSupportedMediaMime(Buffer.from("/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////2wBDAf//////////////////////////////////////////////////////////////////////////////////////wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAf/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIQAxAAAAF//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABBQJ//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAwEBPwF//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAgEBPwF//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQAGPwJ//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPyF//9oADAMBAAIAAwAAABAf/8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAwEBPxB//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAgEBPxB//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPxB//9k=", "base64"))).toBe("image/jpeg")
+    expect(detectSupportedMediaMime(Uint8Array.from([0x1a, 0x45, 0xdf, 0xa3, 0x18, 0x53, 0x80, 0x67, 0x77, 0x65, 0x62, 0x6d, 0x1f, 0x43, 0xb6, 0x75]))).toBe("video/webm")
+    expect(detectSupportedMediaMime(Uint8Array.from([0, 0, 0, 16, 0x66, 0x74, 0x79, 0x70, 0x6d, 0x70, 0x34, 0x32, 0, 0, 0, 0, 0, 0, 0, 8, 0x6d, 0x64, 0x61, 0x74]))).toBe("video/mp4")
+    expect(detectSupportedMediaMime(Uint8Array.from([0, 0, 0, 16, 0x66, 0x74, 0x79, 0x70, 0x61, 0x76, 0x69, 0x66]))).toBeUndefined()
+    expect(detectSupportedMediaMime(Buffer.from("iVBORw0KGgo=", "base64"))).toBeUndefined()
+    expect(detectSupportedMediaMime(new TextEncoder().encode("plain text"))).toBeUndefined()
+  })
+
+  test("caps the number of persisted media artifacts", async () => {
+    const contracts = Array.from({ length: 12 }, (_, index) => {
+      const bytes = Buffer.from("R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==", "base64")
+      bytes[13] = index
+      const data = `data:image/gif;base64,${bytes.toString("base64")}`
+      return `<telegram-media>{"type":"file","uri":"${data}","mime":"image/gif","name":"image-${index}.gif"}</telegram-media>`
+    }).join("\n")
+    const result = await Effect.runPromise(mediaFromResponseText(contracts).pipe(
+      Effect.provide(BunFileSystem.layer),
+      Effect.provide(BunPath.layer),
+    ))
+    expect(result.media).toHaveLength(10)
+  })
+})
+
+describe("assistantResponseForInput", () => {
+  const messages = [
+    { id: "assistant-newest", type: "assistant", content: [{ type: "text", text: "final response" }] },
+    { id: "assistant-new", type: "assistant", content: [{ type: "text", text: "tool step" }] },
+    { id: "input-new", type: "user", content: [] },
+    { id: "assistant-old", type: "assistant", content: [{ type: "text", text: "old response" }] },
+    { id: "input-old", type: "user", content: [] },
+  ]
+
+  test("selects only the assistant response after the accepted input", () => {
+    expect(assistantResponseForInput(messages, "input-new")).toBe("tool step\n\nfinal response")
+    expect(assistantResponseForInput(messages, "input-old")).toBe("old response")
+  })
+
+  test("does not fall back to an older assistant response", () => {
+    expect(assistantResponseForInput(messages.slice(2), "input-new")).toBeUndefined()
+    expect(assistantResponseForInput(messages, "missing-input")).toBeUndefined()
+  })
+
+  test("recovers media contracts from the complete assistant turn", async () => {
+    const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+    const turn = [
+      { id: "assistant", type: "assistant", content: [{ type: "text", text: `Done\n<telegram-media>{"type":"file","uri":"data:image/png;base64,${png}","mime":"image/png","name":"done.png"}</telegram-media>` }] },
+      { id: "input", type: "user", content: [] },
+    ]
+    const response = await Effect.runPromise(recoveredResponseForInput(turn, "input").pipe(
+      Effect.provide(BunFileSystem.layer),
+      Effect.provide(BunPath.layer),
+    ))
+    expect(Option.isSome(response)).toBe(true)
+    if (Option.isSome(response)) {
+      expect(response.value.text).toBe("Done")
+      expect(response.value.media).toHaveLength(1)
+    }
+  })
+
+  test("recovers tool media when the assistant turn has no text", async () => {
+    const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+    const turn = [
+      { id: "assistant", type: "assistant", content: [{
+        type: "tool",
+        state: { content: [{ type: "file", uri: `data:image/png;base64,${png}`, mime: "image/png", name: "tool.png" }] },
+      }] },
+      { id: "input", type: "user", content: [] },
+    ]
+    const response = await Effect.runPromise(recoveredResponseForInput(turn, "input").pipe(
+      Effect.provide(BunFileSystem.layer),
+      Effect.provide(BunPath.layer),
+    ))
+    expect(Option.isSome(response)).toBe(true)
+    if (Option.isSome(response)) expect(response.value.media).toHaveLength(1)
+  })
+
+  test("pages beyond the newest 100 messages to recover the accepted input", async () => {
+    const newest = Array.from({ length: 100 }, (_, index) => ({
+      id: `assistant-${index}`,
+      type: "assistant",
+      content: [{ type: "text", text: index === 99 ? "Recovered answer" : "" }],
+    }))
+    const cursors: Array<string | undefined> = []
+    const response = await Effect.runPromise(recoveredResponseFromPages("accepted-input", (cursor) => {
+      cursors.push(cursor)
+      return Effect.succeed(cursor === undefined
+        ? { data: newest, cursor: { next: "older-page" } }
+        : { data: [{ id: "accepted-input", type: "user", content: [] }], cursor: {} })
+    }).pipe(
+      Effect.provide(BunFileSystem.layer),
+      Effect.provide(BunPath.layer),
+    ))
+    expect(cursors).toEqual([undefined, "older-page"])
+    expect(Option.isSome(response) && response.value.text).toContain("Recovered answer")
+  })
+
+  test("bounds recovery when the accepted input is absent", async () => {
+    let calls = 0
+    const response = await Effect.runPromise(recoveredResponseFromPages("missing", () => {
+      calls += 1
+      return Effect.succeed({ data: [], cursor: { next: `page-${calls}` } })
+    }).pipe(
+      Effect.provide(BunFileSystem.layer),
+      Effect.provide(BunPath.layer),
+    ))
+    expect(response).toEqual(Option.none())
+    expect(calls).toBe(MAX_RECOVERY_MESSAGE_PAGES)
   })
 })
