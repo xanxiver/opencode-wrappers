@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { Effect, Layer, Option } from "effect"
+import { Effect, Option } from "effect"
 import { Live, ModelRegistry, type ModelEntry, type PageModel } from "../src/telegram/models.js"
 
 const run = <A>(effect: Effect.Effect<A, never, never>) =>

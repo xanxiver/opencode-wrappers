@@ -6,8 +6,30 @@ import { Store } from "../../core/store.js"
 import { Pickers } from "../pickers.js"
 import type { CallbackQuery } from "../api.js"
 import { answer, apiEdit, callbackFailure, chunk, clientId, sendMarkup, sendText } from "./shared.js"
-import { parseSessionPageCallback } from "../render.js"
+import { parseDirectoryPageCallback, parseSessionPageCallback } from "../render.js"
 import { setProjectDirectory } from "./run.js"
+
+const PROJECT_PAGE_SIZE = 10
+
+const projectPickerPage = (directories: readonly string[], page: number, chatId: number) =>
+  Effect.gen(function* () {
+    const pickers = yield* Pickers
+    const pageCount = Math.ceil(directories.length / PROJECT_PAGE_SIZE)
+    const visible = directories.slice(page * PROJECT_PAGE_SIZE, (page + 1) * PROJECT_PAGE_SIZE)
+    const tokens = yield* Effect.forEach(visible, (directory) => pickers.registerDirectory({ directory, chatId }))
+    const pageToken = yield* pickers.registerDirectoryPage({ directories, page, chatId })
+    const rows = [...chunk(visible.map((directory, index) => ({
+      text: directory,
+      callback_data: `dir:${tokens[index]}`,
+    })), 1)]
+    const navigation = [
+      ...(page <= 0 ? [] : [{ text: "Previous", callback_data: `dirp:${pageToken}:${page - 1}` }]),
+      ...(page + 1 >= pageCount ? [] : [{ text: "Next", callback_data: `dirp:${pageToken}:${page + 1}` }]),
+    ]
+    if (navigation.length > 0) rows.push(navigation)
+    rows.push([{ text: "Cancel", callback_data: `dirc:${pageToken}` }])
+    return { rows, tokens, pageToken, pageCount }
+  })
 
 /** `/projects` — list project directories, let the user pick one for this chat. */
 export const showProjects = (chatId: number, threadId?: number) =>
@@ -23,7 +45,11 @@ export const showProjects = (chatId: number, threadId?: number) =>
     )
     const directories = yield* Effect.forEach(projects, (project) =>
       opencode.listProjectDirectories(project.id).pipe(
-        Effect.catchCause(() => Effect.succeed<readonly { directory: string }[]>([])),
+        Effect.catchCause((cause) =>
+          logBoundary("telegram/handlers", "opencode-client", "list project directories failed")(cause).pipe(
+            Effect.andThen(Effect.succeed<readonly { directory: string }[]>([])),
+          ),
+        ),
         Effect.map((items) => items.map((item) => item.directory)),
       ),
     ).pipe(Effect.map((nested) => [...new Set(nested.flat())]))
@@ -31,30 +57,75 @@ export const showProjects = (chatId: number, threadId?: number) =>
       yield* sendText(chatId, "No projects found.", threadId)
       return
     }
-    const visible = directories.slice(0, 20)
-    const tokens = yield* Effect.forEach(visible, (directory) =>
-      pickers.registerDirectory({ directory, chatId })
-    )
-    const rows = [...chunk(
-      visible.map((directory, index) => ({
-        text: directory,
-        callback_data: `dir:${tokens[index]}`,
-      })),
-      1,
-    )]
+    const sorted = [...directories].sort((left, right) => left.localeCompare(right))
+    const page = yield* projectPickerPage(sorted, 0, chatId)
     const message = yield* sendMarkup(
       chatId,
-      directories.length > visible.length
-        ? `Select a project directory (showing ${visible.length} of ${directories.length}):`
-        : `Select a project directory (${directories.length}):`,
-      { inline_keyboard: rows },
+      `Select a project directory (page 1 of ${page.pageCount}):`,
+      { inline_keyboard: page.rows },
       threadId,
     )
     yield* Option.match(message, {
       onNone: () => Effect.void,
       onSome: (sent) =>
-        Effect.forEach(tokens, (token) => pickers.attachMessageId(token, sent.message_id), { discard: true }),
+        Effect.gen(function* () {
+          yield* Effect.forEach(page.tokens, (token) => pickers.attachMessageId(token, sent.message_id), { discard: true })
+          yield* pickers.attachMessageId(page.pageToken, sent.message_id)
+        }),
     })
+  })
+
+/** Navigate the project-directory picker. */
+export const handleDirectoryPageCallback = (query: CallbackQuery, data: string) =>
+  Option.match(parseDirectoryPageCallback(data), {
+    onNone: () => answer(query.id, "Invalid data."),
+    onSome: (parsed) =>
+      Effect.gen(function* () {
+        const pickers = yield* Pickers
+        const message = query.message
+        if (message === undefined) {
+          yield* answer(query.id, "Invalid callback.")
+          return
+        }
+        const entry = yield* pickers.take(parsed.token, message.chat.id, message.message_id)
+        yield* Option.match(entry, {
+          onNone: () => answer(query.id, "Expired."),
+          onSome: (value) => {
+            if (!("kind" in value) || value.kind !== "directory-page") return answer(query.id, "Invalid entry.")
+            const pageCount = Math.ceil(value.directories.length / PROJECT_PAGE_SIZE)
+            if (parsed.page >= pageCount) return answer(query.id, "No more projects.")
+            return Effect.gen(function* () {
+              const page = yield* projectPickerPage(value.directories, parsed.page, value.chatId)
+              yield* Effect.forEach(page.tokens, (token) => pickers.attachMessageId(token, message.message_id), { discard: true })
+              yield* pickers.attachMessageId(page.pageToken, message.message_id)
+              yield* apiEdit(value.chatId, message.message_id, `Select a project directory (page ${parsed.page + 1} of ${page.pageCount}):`, { inline_keyboard: page.rows })
+              yield* answer(query.id, "Page changed.")
+            }).pipe(Effect.catchCause(callbackFailure(query, "directory page callback failed", "Failed.")))
+          },
+        })
+      }).pipe(Effect.catchCause(callbackFailure(query, "directory page callback failed", "Failed."))),
+  })
+
+/** Cancel the project-directory picker without changing the directory. */
+export const handleDirectoryCancelCallback = (query: CallbackQuery, data: string) =>
+  Option.match(parseTokenCallback(data, "dirc"), {
+    onNone: () => answer(query.id, "Invalid data."),
+    onSome: (token) =>
+      Effect.gen(function* () {
+        const pickers = yield* Pickers
+        const message = query.message
+        if (message === undefined) {
+          yield* answer(query.id, "Invalid callback.")
+          return
+        }
+        const entry = yield* pickers.cancel(token, message.chat.id, message.message_id)
+        yield* Option.match(entry, {
+          onNone: () => answer(query.id, "Expired."),
+          onSome: (value) => apiEdit(value.chatId, value.messageId, "Project selection cancelled.").pipe(
+            Effect.andThen(answer(query.id, "Cancelled.")),
+          ),
+        })
+      }).pipe(Effect.catchCause(callbackFailure(query, "directory cancel callback failed", "Failed."))),
   })
 
 /** `/sessions` — list sessions in the chat directory, let the user switch. */
@@ -70,7 +141,7 @@ export const showSessions = (chatId: number, threadId?: number) =>
       Effect.catchCause((cause) =>
         logBoundary("telegram/handlers", "opencode-client", "list sessions failed")(cause).pipe(
           Effect.andThen(Effect.succeed({
-            data: [] as readonly { id: string; title?: string }[],
+            data: [],
             previous: undefined,
             next: undefined,
           })),

@@ -10,8 +10,10 @@ const configLayer = (telegramAllowedUsers: string | undefined) =>
       telegramBotToken: "test-token",
       projectDirectory: "/tmp",
       stateFile: "/tmp/state.json",
+      webDatabaseFile: "/tmp/web.sqlite",
       telegramAllowedUsers,
       telegramRunTimeout: "10 minutes",
+      webPort: 3001,
     }),
   )
 

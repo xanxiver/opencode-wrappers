@@ -1,12 +1,12 @@
 import { Effect, Option } from "effect"
-import { normalizeCommand, parsePromptCommand } from "../render.js"
+import { normalizeCommand, parsePromptCommand, promptWithReply } from "../render.js"
 import type { Message } from "../api.js"
 import { HELP_TEXT, sendText } from "./shared.js"
 import { answerRepliedQuestion } from "./question.js"
 import { runWithFiles } from "./run.js"
-import { showModels } from "./model.js"
+import { selectExactModel, showModels } from "./model.js"
 import { showProjects, showSessions } from "./picker.js"
-import { compactSession, resetSession, resumeRun, setProjectDirectory, setSessionById, showStatus, stopRun } from "./run.js"
+import { compactSession, listDurableReviews, reconnectRun, resetSession, resolveDurableReview, setProjectDirectory, setSessionById, showStatus, stopRun } from "./run.js"
 
 export const handleMessage = (message: Message) =>
   Effect.gen(function* () {
@@ -43,20 +43,37 @@ export const handleMessage = (message: Message) =>
       yield* stopRun(chatId, threadId)
       return
     }
-    if (text === "/resume") {
-      yield* resumeRun(chatId, threadId)
+    if (text === "/reconnect" || text === "/forceReconnect") {
+      yield* reconnectRun(chatId, message, text === "/forceReconnect")
       return
     }
     if (text === "/compact") {
       yield* compactSession(chatId, threadId)
       return
     }
-    if (text === "/model") {
-      yield* showModels(chatId, threadId)
+    if (text === "/models" || (text !== undefined && text.startsWith("/models "))) {
+      const query = text === "/models" ? "" : text.slice("/models ".length).trim()
+      yield* showModels(chatId, query, threadId)
+      return
+    }
+    if (text === "/model" || (text !== undefined && text.startsWith("/model "))) {
+      const query = text === "/model" ? "" : text.slice("/model ".length).trim()
+      yield* selectExactModel(chatId, query, threadId)
       return
     }
     if (text === "/status") {
       yield* showStatus(chatId, threadId)
+      return
+    }
+    if (text === "/reviews") {
+      yield* listDurableReviews(chatId, threadId)
+      return
+    }
+    if (text === "/resolve_review" || (text !== undefined && text.startsWith("/resolve_review "))) {
+      const jobID = text === "/resolve_review" ? "" : text.slice("/resolve_review ".length).trim()
+      yield* jobID.length === 0
+        ? sendText(chatId, "Usage: /resolve_review <job-id>", threadId)
+        : resolveDurableReview(chatId, jobID, threadId)
       return
     }
     if (text === "/projects") {
@@ -103,7 +120,10 @@ export const handleMessage = (message: Message) =>
     // Only /prompt messages are relayed as prompts.
     const prompt = parsePromptCommand(text)
     if (Option.isSome(prompt)) {
-      yield* runWithFiles(chatId, message, prompt.value)
+      const repliedText = replied === undefined
+        ? undefined
+        : replied.text ?? replied.caption
+      yield* runWithFiles(chatId, message, promptWithReply(prompt.value, repliedText))
       return
     }
     // Unknown slash commands are still given a short usage hint.
