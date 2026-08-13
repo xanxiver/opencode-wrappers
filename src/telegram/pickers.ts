@@ -29,7 +29,8 @@ export interface PendingSessionPage {
   readonly kind: "session-page"
   readonly directory: string
   readonly chatId: number
-  readonly previous?: string
+  readonly current: { readonly cursor?: string }
+  readonly history: readonly { readonly cursor?: string }[]
   readonly next?: string
   readonly messageId: number
 }
@@ -53,7 +54,8 @@ export interface PickerService {
   readonly registerSessionPage: (input: {
     readonly directory: string
     readonly chatId: number
-    readonly previous?: string
+    readonly current: { readonly cursor?: string }
+    readonly history: readonly { readonly cursor?: string }[]
     readonly next?: string
   }) => Effect.Effect<number, never>
   readonly attachMessageId: (token: number, messageId: number) => Effect.Effect<void, never>

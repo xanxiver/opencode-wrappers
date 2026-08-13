@@ -5,7 +5,8 @@ import { Sessions } from "../../core/sessions.js"
 import { Store } from "../../core/store.js"
 import { TelegramDurableExecutor } from "../durable-executor.js"
 import type { Message } from "../api.js"
-import { clientId, sendText } from "./shared.js"
+import { sendText } from "./shared.js"
+import { conversationId } from "../conversation.js"
 
 const logHandlerFailure = (chatId: number, threadId: number | undefined, message: string) =>
   (cause: Cause.Cause<unknown>) => logBoundary("telegram/handlers", "durable-executor", message)(cause).pipe(
@@ -18,10 +19,10 @@ export const runWithFiles = (chatId: number, message: Message, text: string) =>
     yield* executor.submit(chatId, message, text)
   })
 
-export const setProjectDirectory = (chatId: number, directory: string, threadId?: number) =>
+export const setProjectDirectory = (chatId: number, directory: string, threadId?: number, notify = true) =>
   Effect.gen(function* () {
     const sessions = yield* Sessions
-    const updated = yield* sessions.setDirectory(clientId(chatId), directory).pipe(
+    const updated = yield* sessions.setDirectory(conversationId({ chatId, threadId }), directory).pipe(
       Effect.as(true),
       Effect.catchCause((cause) =>
         logBoundary("telegram/handlers", "sessions", "set directory failed")(cause).pipe(
@@ -29,18 +30,20 @@ export const setProjectDirectory = (chatId: number, directory: string, threadId?
         ),
       ),
     )
-    yield* sendText(
-      chatId,
-      updated ? `Directory set to ${directory}.` : "The directory could not be changed.",
-      threadId,
-    )
+    if (notify) {
+      yield* sendText(
+        chatId,
+        updated ? `Directory set to ${directory}.` : "The directory could not be changed.",
+        threadId,
+      )
+    }
     return updated
   })
 
 export const resetSession = (chatId: number, threadId?: number) =>
   Effect.gen(function* () {
     const sessions = yield* Sessions
-    const reset = yield* sessions.reset(clientId(chatId)).pipe(
+    const reset = yield* sessions.reset(conversationId({ chatId, threadId })).pipe(
       Effect.as(true),
       Effect.catchCause((cause) =>
         logBoundary("telegram/handlers", "sessions", "reset failed")(cause).pipe(
@@ -59,11 +62,10 @@ export const resetSession = (chatId: number, threadId?: number) =>
 
 export const stopRun = (chatId: number, threadId?: number) =>
   Effect.gen(function* () {
-    const sessions = yield* Sessions
     const opencode = yield* OpenCode
-    const directory = yield* sessions.directoryFor(clientId(chatId))
+    const conversation = conversationId({ chatId, threadId })
     const store = yield* Store
-    const sessionID = yield* store.getSessionIDForDirectory(directory)
+    const sessionID = yield* store.getSessionIDForConversation(conversation)
     yield* Option.match(sessionID, {
       onNone: () => sendText(chatId, "No session yet.", threadId),
       onSome: (id) =>
@@ -100,11 +102,10 @@ export const resolveDurableReview = (chatId: number, jobID: string, threadId?: n
 /** `/compact` — compact the current session without starting a prompt. */
 export const compactSession = (chatId: number, threadId?: number) =>
   Effect.gen(function* () {
-    const sessions = yield* Sessions
     const store = yield* Store
     const opencode = yield* OpenCode
-    const directory = yield* sessions.directoryFor(clientId(chatId))
-    const sessionID = yield* store.getSessionIDForDirectory(directory)
+    const conversation = conversationId({ chatId, threadId })
+    const sessionID = yield* store.getSessionIDForConversation(conversation)
     yield* Option.match(sessionID, {
       onNone: () => sendText(chatId, "No session yet.", threadId),
       onSome: (id) =>
@@ -125,8 +126,9 @@ export const showStatus = (chatId: number, threadId?: number) =>
     const sessions = yield* Sessions
     const opencode = yield* OpenCode
     const store = yield* Store
-    const directory = yield* sessions.directoryFor(clientId(chatId))
-    const sessionID = yield* store.getSessionIDForDirectory(directory)
+    const conversation = conversationId({ chatId, threadId })
+    const directory = yield* sessions.directoryFor(conversation)
+    const sessionID = yield* store.getSessionIDForConversation(conversation)
     const remembered = yield* store.getModel(directory)
     const modelLine = Option.match(remembered, {
       onNone: () => "Model: default",
@@ -178,12 +180,17 @@ export const showStatus = (chatId: number, threadId?: number) =>
 /** `/session <id>` — validate and set the active session for this directory. */
 export const setSessionById = (chatId: number, sessionID: string, threadId?: number) =>
   Effect.gen(function* () {
-    const sessions = yield* Sessions
     const opencode = yield* OpenCode
+    const sessions = yield* Sessions
     const store = yield* Store
-    const directory = yield* sessions.directoryFor(clientId(chatId))
-    yield* opencode.getSession(sessionID)
-    yield* store.setSessionIDForDirectory(directory, sessionID)
+    const conversation = conversationId({ chatId, threadId })
+    const directory = yield* sessions.directoryFor(conversation)
+    const session = yield* opencode.getSession(sessionID)
+    if (session.location.directory !== directory) {
+      yield* sendText(chatId, "That session belongs to another directory.", threadId)
+      return
+    }
+    yield* store.setSessionIDForConversation(conversation, sessionID)
     yield* sendText(chatId, `Active session set to ${sessionID}.`, threadId)
   }).pipe(
     Effect.catchCause((cause) =>

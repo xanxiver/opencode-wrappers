@@ -19,6 +19,8 @@ export interface StoredModel {
 interface State {
   /** directory -> sessionID. Chats sharing a directory share the session. */
   readonly sessions: Record<string, string>
+  /** conversation id -> sessionID. Topic sessions are independent. */
+  readonly conversationSessions: Record<string, string>
   /** clientId -> directory override. Chats without an entry use the default. */
   readonly directories: Record<string, string>
   /** directory -> last chosen model, re-applied when a run starts. */
@@ -33,6 +35,7 @@ const StoredModelSchema = Schema.Struct({
 
 const StateSchema = Schema.Struct({
   sessions: Schema.Record(Schema.String, Schema.String),
+  conversationSessions: Schema.optional(Schema.Record(Schema.String, Schema.String)),
   directories: Schema.Record(Schema.String, Schema.String),
   models: Schema.optional(Schema.Record(Schema.String, StoredModelSchema)),
 })
@@ -41,7 +44,7 @@ const StateSchema = Schema.Struct({
 const LegacySchema = Schema.Record(Schema.String, Schema.String)
 type JsonValue = ReturnType<typeof JSON.parse>
 
-const emptyState = (): State => ({ sessions: {}, directories: {}, models: {} })
+const emptyState = (): State => ({ sessions: {}, conversationSessions: {}, directories: {}, models: {} })
 
 /** Migrate the legacy chat->session map: each chat keeps its session under its own key. */
 const migrateLegacy = (legacy: Record<string, string>): State => {
@@ -49,7 +52,7 @@ const migrateLegacy = (legacy: Record<string, string>): State => {
   for (const clientId of Object.keys(legacy)) {
     directories[clientId] = clientId
   }
-  return { sessions: { ...legacy }, directories, models: {} }
+  return { sessions: { ...legacy }, conversationSessions: { ...legacy }, directories, models: {} }
 }
 
 const parseState = (json: JsonValue): Option.Option<{ readonly state: State; readonly migrated: boolean }> =>
@@ -59,15 +62,28 @@ const parseState = (json: JsonValue): Option.Option<{ readonly state: State; rea
         onNone: () => Option.none(),
         onSome: (legacy) => Option.some({ state: migrateLegacy(legacy), migrated: true }),
       }),
-    onSome: (state) => Option.some({ state: { ...state, models: state.models ?? {} }, migrated: false }),
+    onSome: (state) => {
+      const conversationSessions = state.conversationSessions ?? Object.fromEntries(
+        Object.entries(state.directories).flatMap(([conversation, directory]) => {
+          const sessionID = state.sessions[directory]
+          return sessionID === undefined ? [] : [[conversation, sessionID]]
+        }),
+      )
+      return Option.some({ state: { ...state, conversationSessions, models: state.models ?? {} }, migrated: false })
+    },
   })
 
 export interface StoreService {
+  readonly getSessionIDForConversation: (conversationId: string) => Effect.Effect<Option.Option<string>, never>
+  readonly setSessionIDForConversation: (conversationId: string, sessionID: string) => Effect.Effect<void, StoreError>
+  readonly removeSessionIDForConversation: (conversationId: string) => Effect.Effect<void, StoreError>
   readonly getSessionIDForDirectory: (directory: string) => Effect.Effect<Option.Option<string>, never>
   readonly setSessionIDForDirectory: (directory: string, sessionID: string) => Effect.Effect<void, StoreError>
   readonly removeSessionIDForDirectory: (directory: string) => Effect.Effect<void, StoreError>
   readonly getDirectory: (clientId: string) => Effect.Effect<Option.Option<string>, never>
   readonly setDirectory: (clientId: string, directory: string) => Effect.Effect<void, StoreError>
+  /** Change a conversation directory and clear its incompatible active session atomically. */
+  readonly switchConversationDirectory: (conversationId: string, directory: string) => Effect.Effect<void, StoreError>
   readonly getModel: (directory: string) => Effect.Effect<Option.Option<StoredModel>, never>
   readonly setModel: (directory: string, model: StoredModel) => Effect.Effect<void, StoreError>
   /** Every client id the store knows about. */
@@ -136,6 +152,16 @@ export const Live: Layer.Layer<Store, StoreError, FileSystem.FileSystem | AppCon
         }),
       )
     return {
+      getSessionIDForConversation: (conversationId) =>
+        Ref.get(ref).pipe(Effect.map((state) => Option.fromNullishOr(state.conversationSessions[conversationId]))),
+      setSessionIDForConversation: (conversationId, sessionID) =>
+        commit((state) => ({ ...state, conversationSessions: { ...state.conversationSessions, [conversationId]: sessionID } })),
+      removeSessionIDForConversation: (conversationId) =>
+        commit((state) => {
+          const conversationSessions = { ...state.conversationSessions }
+          delete conversationSessions[conversationId]
+          return { ...state, conversationSessions }
+        }),
       getSessionIDForDirectory: (directory) =>
         Ref.get(ref).pipe(Effect.map((state) => Option.fromNullishOr(state.sessions[directory]))),
       setSessionIDForDirectory: (directory, sessionID) =>
@@ -156,6 +182,16 @@ export const Live: Layer.Layer<Store, StoreError, FileSystem.FileSystem | AppCon
           ...state,
           directories: { ...state.directories, [clientId]: directory },
         })),
+      switchConversationDirectory: (conversationId, directory) =>
+        commit((state) => {
+          const conversationSessions = { ...state.conversationSessions }
+          delete conversationSessions[conversationId]
+          return {
+            ...state,
+            conversationSessions,
+            directories: { ...state.directories, [conversationId]: directory },
+          }
+        }),
       getModel: (directory) =>
         Ref.get(ref).pipe(Effect.map((state) => Option.fromNullishOr(state.models[directory]))),
       setModel: (directory, model) =>

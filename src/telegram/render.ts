@@ -90,6 +90,7 @@ export const renderFinal = (text: string, outcome: RunOutcome): string => {
   }
 }
 
+
 export const renderPermissionDecision = (reply: "once" | "always" | "reject"): string => {
   switch (reply) {
     case "once":
@@ -206,7 +207,7 @@ export const renderModelLabel = (modelID: string, providerID: string): string =>
   `${modelID} (${providerID})`
 
 /** Models shown per page in the picker. */
-export const MODEL_PAGE_SIZE = 10
+export const MODEL_PAGE_SIZE = 5
 
 export const modelProviderKeyboard = (
   token: number,

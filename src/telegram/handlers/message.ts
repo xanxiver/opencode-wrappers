@@ -8,6 +8,23 @@ import { selectExactModel, showModels } from "./model.js"
 import { showProjects, showSessions } from "./picker.js"
 import { compactSession, listDurableReviews, reconnectRun, resetSession, resolveDurableReview, setProjectDirectory, setSessionById, showStatus, stopRun } from "./run.js"
 
+type ParsedCommand = {
+  readonly name: string
+  readonly argument: string
+  readonly hasArgument: boolean
+}
+
+/** Split a normalized slash command once. The dispatcher decides its meaning. */
+export const parseMessageCommand = (text: string): ParsedCommand => {
+  const separator = text.indexOf(" ")
+  if (separator < 0) return { name: text, argument: "", hasArgument: false }
+  return {
+    name: text.slice(0, separator),
+    argument: text.slice(separator + 1).trim(),
+    hasArgument: true,
+  }
+}
+
 export const handleMessage = (message: Message) =>
   Effect.gen(function* () {
     const chatId = message.chat.id
@@ -31,91 +48,79 @@ export const handleMessage = (message: Message) =>
     // Messages without a slash command are not bot requests. Ignore them
     // silently, including attachment-only messages.
     if (text === undefined || !text.startsWith("/")) return
-    if (text === "/start" || text === "/help") {
-      yield* sendText(chatId, HELP_TEXT, threadId)
-      return
-    }
-    if (text === "/new") {
-      yield* resetSession(chatId, threadId)
-      return
-    }
-    if (text === "/stop") {
-      yield* stopRun(chatId, threadId)
-      return
-    }
-    if (text === "/reconnect" || text === "/forceReconnect") {
-      yield* reconnectRun(chatId, message, text === "/forceReconnect")
-      return
-    }
-    if (text === "/compact") {
-      yield* compactSession(chatId, threadId)
-      return
-    }
-    if (text === "/models" || (text !== undefined && text.startsWith("/models "))) {
-      const query = text === "/models" ? "" : text.slice("/models ".length).trim()
-      yield* showModels(chatId, query, threadId)
-      return
-    }
-    if (text === "/model" || (text !== undefined && text.startsWith("/model "))) {
-      const query = text === "/model" ? "" : text.slice("/model ".length).trim()
-      yield* selectExactModel(chatId, query, threadId)
-      return
-    }
-    if (text === "/status") {
-      yield* showStatus(chatId, threadId)
-      return
-    }
-    if (text === "/reviews") {
-      yield* listDurableReviews(chatId, threadId)
-      return
-    }
-    if (text === "/resolve_review" || (text !== undefined && text.startsWith("/resolve_review "))) {
-      const jobID = text === "/resolve_review" ? "" : text.slice("/resolve_review ".length).trim()
-      yield* jobID.length === 0
-        ? sendText(chatId, "Usage: /resolve_review <job-id>", threadId)
-        : resolveDurableReview(chatId, jobID, threadId)
-      return
-    }
-    if (text === "/projects") {
-      yield* showProjects(chatId, threadId)
-      return
-    }
-    if (text === "/sessions") {
-      yield* showSessions(chatId, threadId)
-      return
-    }
-    if (text === "/session" || (text !== undefined && text.startsWith("/session "))) {
-      const sessionID = text === "/session" ? "" : text.slice("/session ".length).trim()
-      if (sessionID.length === 0) {
-        yield* sendText(chatId, "Usage: /session <id>", threadId)
+    const command = parseMessageCommand(text)
+    switch (command.name) {
+      case "/start":
+      case "/help":
+        if (command.hasArgument) break
+        yield* sendText(chatId, HELP_TEXT, threadId)
+        return
+      case "/new":
+        if (command.hasArgument) break
+        yield* resetSession(chatId, threadId)
+        return
+      case "/stop":
+        if (command.hasArgument) break
+        yield* stopRun(chatId, threadId)
+        return
+      case "/reconnect":
+      case "/forceReconnect":
+        if (command.hasArgument) break
+        yield* reconnectRun(chatId, message, command.name === "/forceReconnect")
+        return
+      case "/compact":
+        if (command.hasArgument) break
+        yield* compactSession(chatId, threadId)
+        return
+      case "/models":
+        yield* showModels(chatId, command.argument, threadId)
+        return
+      case "/model":
+        yield* selectExactModel(chatId, command.argument, threadId)
+        return
+      case "/status":
+        if (command.hasArgument) break
+        yield* showStatus(chatId, threadId)
+        return
+      case "/reviews":
+        if (command.hasArgument) break
+        yield* listDurableReviews(chatId, threadId)
+        return
+      case "/resolve_review":
+        yield* command.argument.length === 0
+          ? sendText(chatId, "Usage: /resolve_review <job-id>", threadId)
+          : resolveDurableReview(chatId, command.argument, threadId)
+        return
+      case "/projects":
+        if (command.hasArgument) break
+        yield* showProjects(chatId, threadId)
+        return
+      case "/sessions":
+        if (command.hasArgument) break
+        yield* showSessions(chatId, threadId)
+        return
+      case "/session":
+        yield* command.argument.length === 0
+          ? sendText(chatId, "Usage: /session <id>", threadId)
+          : setSessionById(chatId, command.argument, threadId)
+        return
+      case "/whoami":
+        if (command.hasArgument) break
+        yield* sendText(chatId, message.from === undefined ? "Unknown user." : `Your user id is ${message.from.id}.`, threadId)
+        return
+      case "/review": {
+        const prompt = command.argument.length === 0
+          ? "Review the current changes in this repository. Report bugs, security issues, and missing tests."
+          : `Review the current changes in this repository, with focus on: ${command.argument}`
+        yield* runWithFiles(chatId, message, prompt)
         return
       }
-      yield* setSessionById(chatId, sessionID, threadId)
-      return
-    }
-    if (text === "/whoami") {
-      yield* sendText(
-        chatId,
-        message.from === undefined ? "Unknown user." : `Your user id is ${message.from.id}.`,
-        threadId,
-      )
-      return
-    }
-    if (text === "/review" || (text !== undefined && text.startsWith("/review "))) {
-      const focus = text === "/review" ? "" : text.slice("/review ".length).trim()
-      const prompt = focus.length === 0
-        ? "Review the current changes in this repository. Report bugs, security issues, and missing tests."
-        : `Review the current changes in this repository, with focus on: ${focus}`
-      yield* runWithFiles(chatId, message, prompt)
-      return
-    }
-    if (text !== undefined && text.startsWith("/project ")) {
-      const path = text.slice("/project ".length).trim()
-      yield* Option.match(Option.fromNullishOr(path.length === 0 ? undefined : path), {
-        onNone: () => sendText(chatId, "Usage: /project <path>", threadId),
-        onSome: (directory) => setProjectDirectory(chatId, directory, threadId),
-      })
-      return
+      case "/project":
+        if (!command.hasArgument) break
+        yield* command.argument.length === 0
+          ? sendText(chatId, "Usage: /project <path>", threadId)
+          : setProjectDirectory(chatId, command.argument, threadId)
+        return
     }
     // Only /prompt messages are relayed as prompts.
     const prompt = parsePromptCommand(text)

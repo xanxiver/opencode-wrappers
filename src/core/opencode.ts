@@ -13,7 +13,7 @@ import {
   Question,
   Session,
   SessionMessage,
-  SessionPending,
+  SessionInbox,
 } from "@opencode-ai/client/effect"
 import { Service, type Endpoint } from "@opencode-ai/client/effect/service"
 import type { OpenCodeEvent } from "@opencode-ai/protocol/groups/event"
@@ -105,8 +105,8 @@ export interface OpenCodeService {
     readonly text: string
     readonly files?: readonly PromptInput.FileAttachment[]
     readonly delivery?: "steer" | "queue"
-  }) => Effect.Effect<SessionPending.User, OpenCodeError>
-  readonly listPending: (sessionID: string) => Effect.Effect<readonly SessionPending.Info[], OpenCodeError>
+  }) => Effect.Effect<SessionInbox.User, OpenCodeError>
+  readonly listPending: (sessionID: string) => Effect.Effect<readonly SessionInbox.Info[], OpenCodeError>
   readonly cancelPending: (input: { readonly sessionID: string; readonly inputID: string }) => Effect.Effect<void, OpenCodeError>
   readonly interrupt: (sessionID: string) => Effect.Effect<void, OpenCodeError>
   readonly wait: (sessionID: string) => Effect.Effect<void, OpenCodeError>
@@ -288,12 +288,11 @@ export const Live: Layer.Layer<
           files: input.files ?? [],
           delivery: input.delivery,
         }).pipe(wrap("session.prompt")),
-      listPending: (sessionID) => client.session.pending.list({ sessionID: toSessionID(sessionID) }).pipe(wrap("session.pending.list")),
-      cancelPending: (input) =>
-        authenticatedHttpClient.execute(HttpClientRequest.make("DELETE")(`${endpoint.baseUrl}/session/${encodeURIComponent(input.sessionID)}/pending/${encodeURIComponent(input.inputID)}`)).pipe(
-          Effect.flatMap((response) => response.status >= 200 && response.status < 300 ? Effect.succeed(undefined) : Effect.fail(new Error(`unexpected status ${response.status}`))),
-          wrap("session.pending.cancel"),
-        ),
+       listPending: (sessionID) => client.session.inbox.list({ sessionID: toSessionID(sessionID) }).pipe(wrap("session.inbox.list")),
+       cancelPending: (input) =>
+         client.session.inbox.cancel({ sessionID: toSessionID(input.sessionID), inboxID: toMessageID(input.inputID) }).pipe(
+           wrap("session.inbox.cancel"),
+         ),
       interrupt: (sessionID) =>
         client.session.interrupt({ sessionID: toSessionID(sessionID) }).pipe(wrap("session.interrupt")),
       wait: (sessionID) =>
