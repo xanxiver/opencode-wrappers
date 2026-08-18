@@ -10,7 +10,6 @@ import {
   Permission,
   Project,
   Provider,
-  Question,
   Session,
   SessionMessage,
   SessionInbox,
@@ -39,12 +38,25 @@ export interface AgentQuestion {
   readonly multiple?: boolean
 }
 
-/** A question request normalized across the legacy Question API and V2 forms. */
+/** A question request normalized from a V2 form. */
 export interface PendingQuestionRequest {
   readonly id: string
   readonly sessionID: string
   readonly questions: readonly AgentQuestion[]
 }
+
+type ProjectDirectorySource = {
+  readonly canonical: string
+  readonly sandboxes: readonly string[]
+}
+
+/** Read the canonical checkout and current sandboxes from the V2 project payload. */
+export const projectDirectories = (
+  project: ProjectDirectorySource,
+): readonly { readonly directory: string; readonly strategy: string }[] => [
+  { directory: project.canonical, strategy: "canonical" },
+  ...project.sandboxes.map((directory) => ({ directory, strategy: "sandbox" })),
+]
 
 const isQuestionForm = (form: Form.Info): boolean => form.metadata?.kind === "question"
 
@@ -68,11 +80,9 @@ export const questionRequestFromForm = (form: Form.Info): PendingQuestionRequest
   return questions.length === 0 ? undefined : { id: form.id, sessionID: form.sessionID, questions }
 }
 
-/** Extract a normalized question request from either supported OpenCode event. */
+/** Extract a normalized question request from an OpenCode event. */
 export const questionRequestFromEvent = (event: OpenCodeEvent): PendingQuestionRequest | undefined => {
   switch (event.type) {
-    case "question.asked":
-      return event.data
     case "form.created":
       return questionRequestFromForm(event.data.form)
     default:
@@ -121,7 +131,7 @@ export interface OpenCodeService {
   readonly listMessages: (input: { readonly sessionID: string; readonly limit?: number; readonly cursor?: string; readonly order?: "asc" | "desc" }) =>
     Effect.Effect<{ readonly data: readonly SessionMessage.Info[]; readonly cursor: { readonly previous?: string; readonly next?: string } }, OpenCodeError>
   readonly listProjects: () => Effect.Effect<readonly Project.Info[], OpenCodeError>
-  readonly listProjectDirectories: (projectID: string) =>
+  readonly listProjectDirectories: (project: ProjectDirectorySource) =>
     Effect.Effect<readonly { readonly directory: string; readonly strategy?: string }[], OpenCodeError>
   readonly listPendingPermissions: (directory: string) => Effect.Effect<readonly Permission.Request[], OpenCodeError>
   readonly listPendingQuestions: (directory: string) => Effect.Effect<readonly PendingQuestionRequest[], OpenCodeError>
@@ -236,24 +246,20 @@ const resolveEndpoint = (): Effect.Effect<ResolvedEndpoint, OpenCodeError, FileS
 type SessionID = Schema.Schema.Type<typeof Session.ID>
 type SessionCursor = string & Brand.Brand<"SessionsCursor">
 type PermissionID = Schema.Schema.Type<typeof Permission.ID>
-type QuestionID = Schema.Schema.Type<typeof Question.ID>
 type FormID = Schema.Schema.Type<typeof Form.ID>
 type ModelID = Schema.Schema.Type<typeof Model.ID>
 type ProviderID = Schema.Schema.Type<typeof Provider.ID>
 type VariantID = Schema.Schema.Type<typeof Model.VariantID>
-type ProjectID = Schema.Schema.Type<typeof Project.ID>
 
 const toSessionID = (value: string): SessionID => Schema.decodeUnknownSync(Session.ID)(value)
 const toMessageID = (value: string) => Schema.decodeUnknownSync(SessionMessage.ID)(value)
 const toSessionCursor = (value: string): SessionCursor =>
   Schema.decodeUnknownSync(Schema.String.pipe(Schema.brand("SessionsCursor")))(value)
 const toPermissionID = (value: string): PermissionID => Schema.decodeUnknownSync(Permission.ID)(value)
-const toQuestionID = (value: string): QuestionID => Schema.decodeUnknownSync(Question.ID)(value)
 const toFormID = (value: string): FormID => Schema.decodeUnknownSync(Form.ID)(value)
 const toModelID = (value: string): ModelID => Schema.decodeUnknownSync(Model.ID)(value)
 const toProviderID = (value: string): ProviderID => Schema.decodeUnknownSync(Provider.ID)(value)
 const toVariantID = (value: string): VariantID => Schema.decodeUnknownSync(Model.VariantID)(value)
-const toProjectID = (value: string): ProjectID => Schema.decodeUnknownSync(Project.ID)(value)
 
 export const Live: Layer.Layer<
   OpenCode,
@@ -340,8 +346,7 @@ export const Live: Layer.Layer<
           Effect.map((output) => ({ data: output.data, cursor: output.cursor })),
         ),
       listProjects: () => client.project.list().pipe(wrap("project.list")),
-      listProjectDirectories: (projectID) =>
-        client.project.directories({ projectID: toProjectID(projectID) }).pipe(wrap("project.directories")),
+      listProjectDirectories: (project) => Effect.succeed(projectDirectories(project)),
        listPendingPermissions: (directory) =>
          client.permission.request.list({
            location: { directory },
@@ -350,19 +355,13 @@ export const Live: Layer.Layer<
           Effect.map((output) => output.data),
         ),
        listPendingQuestions: (directory) =>
-         Effect.all([
-           client.question.request.list({ location: { directory } }).pipe(
-             wrap("question.request.list"),
-             Effect.map((output) => output.data),
-           ),
-           client.form.request.list({ location: { directory } }).pipe(
-             wrap("form.request.list"),
-             Effect.map((output) => output.data.flatMap((form) => {
-               const request = questionRequestFromForm(form)
-               return request === undefined ? [] : [request]
-             })),
-           ),
-         ]).pipe(Effect.map(([questions, forms]) => [...questions, ...forms])),
+          client.form.request.list({ location: { directory } }).pipe(
+            wrap("form.request.list"),
+            Effect.map((output) => output.data.flatMap((form) => {
+              const request = questionRequestFromForm(form)
+              return request === undefined ? [] : [request]
+            })),
+          ),
       replyPermission: (input) =>
         client.permission.reply({
           sessionID: toSessionID(input.sessionID),
@@ -397,13 +396,6 @@ export const Live: Layer.Layer<
         }).pipe(wrap("session.switchModel")),
       replyQuestion: (input) => {
         const sessionID = toSessionID(input.sessionID)
-        if (!input.requestID.startsWith("frm_")) {
-          return client.question.reply({
-            sessionID,
-            requestID: toQuestionID(input.requestID),
-            answers: input.answers.map((answer) => [...answer]),
-          }).pipe(wrap("question.reply"))
-        }
         const formID = toFormID(input.requestID)
         return client.form.get({ sessionID, formID }).pipe(
           wrap("form.get"),

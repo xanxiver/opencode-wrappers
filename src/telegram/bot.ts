@@ -1,8 +1,12 @@
-import { Effect, Ref, Schedule } from "effect"
+import { Cause, Effect, Option, Ref, Schedule } from "effect"
 import { logBoundary } from "../core/logging.js"
-import { TelegramApi, type Update } from "./api.js"
+import { ApiError, TelegramApi, type Update } from "./api.js"
 import { AttachmentDownloadError } from "./files.js"
 import { handleUpdate } from "./handlers/index.js"
+
+/** Telegram permits only one active getUpdates poller for a bot token. */
+export const isPollingConflict = (cause: Cause.Cause<unknown>): boolean =>
+  Option.exists(Cause.findErrorOption(cause), (error) => error instanceof ApiError && error.code === 409)
 
 /** Handle one update and advance the offset whether it succeeds or is quarantined. */
 export const processUpdate = <E, R>(
@@ -43,9 +47,15 @@ export const run = () =>
     })
     yield* pollOnce.pipe(
       Effect.catchCause((cause) =>
-        logBoundary("telegram/bot", "telegram-poll", "poll failed")(cause).pipe(
-          Effect.andThen(Effect.sleep("2 seconds")),
-        ),
+        isPollingConflict(cause)
+          ? logBoundary(
+              "telegram/bot",
+              "telegram-poll",
+              "another Telegram poller is active; stopping this duplicate bot",
+            )(cause).pipe(Effect.andThen(Effect.failCause(cause)))
+          : logBoundary("telegram/bot", "telegram-poll", "poll failed")(cause).pipe(
+              Effect.andThen(Effect.sleep("2 seconds")),
+            ),
       ),
       Effect.repeat(Schedule.spaced("100 millis")),
     )

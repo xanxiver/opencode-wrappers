@@ -1,4 +1,5 @@
 import { Effect, Option } from "effect"
+import type { Project } from "@opencode-ai/client/effect"
 import { logBoundary } from "../../core/logging.js"
 import { OpenCode } from "../../core/opencode.js"
 import { Sessions } from "../../core/sessions.js"
@@ -100,12 +101,12 @@ export const showProjects = (chatId: number, threadId?: number) =>
     const projects = yield* opencode.listProjects().pipe(
       Effect.catchCause((cause) =>
         logBoundary("telegram/handlers", "opencode-client", "list projects failed")(cause).pipe(
-          Effect.andThen(Effect.succeed<readonly { id: string }[]>([])),
+          Effect.andThen(Effect.succeed<readonly Project.Info[]>([])),
         ),
       ),
     )
     const directories = yield* Effect.forEach(projects, (project) =>
-      opencode.listProjectDirectories(project.id).pipe(
+      opencode.listProjectDirectories(project).pipe(
         Effect.catchCause((cause) =>
           logBoundary("telegram/handlers", "opencode-client", "list project directories failed")(cause).pipe(
             Effect.andThen(Effect.succeed<readonly { directory: string }[]>([])),

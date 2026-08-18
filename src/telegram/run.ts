@@ -826,7 +826,6 @@ const handleEvent = (
         yield* registry.attachMessageId(token, message.message_id, claimed.value)
       }).pipe(Effect.catchCause(logTelegramFailure("permission prompt failed")))
     }
-    case "question.asked":
     case "form.created": {
       const request = questionRequestFromEvent(event)
       if (request === undefined) return Effect.void
