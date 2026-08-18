@@ -3,6 +3,7 @@ import { Effect, Schema } from "effect"
 import { Form } from "@opencode-ai/client/effect"
 import {
   normalizeBaseUrl,
+  projectDirectories,
   questionFormAnswer,
   questionRequestFromForm,
   shouldDiscoverOpenCodeService,
@@ -68,6 +69,19 @@ describe("shouldDiscoverOpenCodeService", () => {
 
   test("discovers when no endpoint is configured", () => {
     expect(shouldDiscoverOpenCodeService(undefined)).toBe(true)
+  })
+})
+
+describe("projectDirectories", () => {
+  test("uses the canonical checkout and sandboxes from the V2 project payload", () => {
+    expect(projectDirectories({
+      canonical: "/workspace/project",
+      sandboxes: ["/workspace/project-a", "/workspace/project-b"],
+    })).toEqual([
+      { directory: "/workspace/project", strategy: "canonical" },
+      { directory: "/workspace/project-a", strategy: "sandbox" },
+      { directory: "/workspace/project-b", strategy: "sandbox" },
+    ])
   })
 })
 

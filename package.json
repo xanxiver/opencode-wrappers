@@ -13,9 +13,9 @@
     "opencode:restart": "opencode2 service restart"
   },
   "dependencies": {
-    "@effect/platform-bun": "4.0.0-beta.101",
-    "@opencode-ai/client": "0.0.0-next-17403",
-    "effect": "4.0.0-beta.101",
+    "@effect/platform-bun": "4.0.0-beta.107",
+    "@opencode-ai/client": "0.0.0-beta-17577",
+    "effect": "4.0.0-beta.107",
     "@resvg/resvg-js": "2.6.2",
     "@vercel/beautiful-mermaid": "0.1.5",
     "geist": "1.7.2"

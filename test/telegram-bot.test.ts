@@ -1,8 +1,24 @@
-import { Effect, Exit, Ref } from "effect"
+import { Cause, Effect, Exit, Ref } from "effect"
 import { expect, test } from "bun:test"
-import { processUpdate } from "../src/telegram/bot.js"
+import { isPollingConflict, processUpdate } from "../src/telegram/bot.js"
+import { ApiError } from "../src/telegram/api.js"
 
 const update = { update_id: 41 }
+
+test("detects a competing Telegram getUpdates poller", () => {
+  expect(isPollingConflict(Cause.fail(new ApiError({
+    operation: "getUpdates",
+    code: 409,
+    description: "Conflict",
+    transient: false,
+  })))).toBe(true)
+  expect(isPollingConflict(Cause.fail(new ApiError({
+    operation: "getUpdates",
+    code: 502,
+    description: "Bad Gateway",
+    transient: true,
+  })))).toBe(false)
+})
 
 test("processUpdate advances the offset after successful handling", async () => {
   const offset = await Effect.runPromise(Ref.make(0))
