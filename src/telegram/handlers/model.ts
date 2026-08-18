@@ -20,6 +20,18 @@ import type { CallbackQuery } from "../api.js"
 import { answer, apiEdit, callbackFailure, chunk, sendMarkup, sendText } from "./shared.js"
 import { conversationId } from "../conversation.js"
 
+const logModelSelection = (
+  stage: string,
+  details: Readonly<Record<string, string | number | boolean | undefined>> = {},
+) => Effect.logInfo("model selection event").pipe(
+  Effect.annotateLogs({
+    component: "telegram/handlers",
+    boundary: "model-selection",
+    stage,
+    ...details,
+  }),
+)
+
 /** Remember the chosen model for the chat's directory. */
 const rememberModel = (directory: string, model: { readonly id: string; readonly providerID: string; readonly variant?: string }) =>
   Effect.gen(function* () {
@@ -50,6 +62,7 @@ export const handleModelCallback = (query: CallbackQuery, data: string) =>
     onNone: () => answer(query.id, "Invalid data."),
     onSome: (parsed) =>
       Effect.gen(function* () {
+        yield* logModelSelection("model-callback-received", { index: parsed.index })
         const registry = yield* ModelRegistry
         const opencode = yield* OpenCode
         const message = query.message
@@ -59,36 +72,53 @@ export const handleModelCallback = (query: CallbackQuery, data: string) =>
         }
         const entry = yield* registry.take(parsed.token, message.chat.id, message.message_id)
         yield* Option.match(entry, {
-          onNone: () => answer(query.id, "Expired."),
+          onNone: () => logModelSelection("registry-entry-missing", { action: "model" }).pipe(
+            Effect.andThen(answer(query.id, "Expired.")),
+          ),
           onSome: (value) => Effect.gen(function* () {
+            yield* logModelSelection("registry-entry-accepted", { action: "model", kind: value.kind })
             if (!(yield* modelPickerIsCurrent(value))) {
+              yield* logModelSelection("picker-not-current", { action: "model" })
               yield* answer(query.id, "This model picker is no longer current.")
               return
             }
             switch (value.kind) {
               case "provider":
-                return answer(query.id, "Choose a model first.")
+                return yield* answer(query.id, "Choose a model first.")
               case "variant":
-                return answer(query.id, "Invalid entry.")
+                return yield* answer(query.id, "Invalid entry.")
               case "page": {
                 const model = Option.fromNullishOr(value.models[parsed.index])
-                return Option.match(model, {
+                return yield* Option.match(model, {
                   onNone: () => answer(query.id, "Invalid model."),
                   onSome: (selected) =>
                     Option.match(
                       Option.fromNullishOr(selected.variants.length === 0 ? undefined : selected.variants),
                       {
                         onNone: () =>
-                          opencode.switchModel({
-                            sessionID: value.sessionID,
-                            model: { id: selected.id, providerID: selected.providerID },
+                          logModelSelection("model-switch-requested", {
+                            model: selected.id,
+                            provider: selected.providerID,
                           }).pipe(
+                            Effect.andThen(opencode.switchModel({
+                              sessionID: value.sessionID,
+                              model: { id: selected.id, providerID: selected.providerID },
+                            })),
                              Effect.andThen(rememberModel(value.directory, selected)),
+                            Effect.tap(() => logModelSelection("model-switched", {
+                              model: selected.id,
+                              provider: selected.providerID,
+                            })),
                             Effect.andThen(apiEdit(value.chatId, value.messageId, `Model switched to ${selected.id}`)),
                             Effect.andThen(answer(query.id, "Switched.")),
                           ),
                         onSome: (variants) =>
                           Effect.gen(function* () {
+                            yield* logModelSelection("variant-picker-opened", {
+                              model: selected.id,
+                              provider: selected.providerID,
+                              variants: variants.length,
+                            })
                             const variantToken = yield* registry.registerVariant({
                               sessionID: value.sessionID,
                               providerID: selected.providerID,
@@ -133,6 +163,7 @@ export const handleModelPageCallback = (query: CallbackQuery, data: string) =>
     onNone: () => answer(query.id, "Invalid data."),
     onSome: (parsed) =>
       Effect.gen(function* () {
+        yield* logModelSelection("page-callback-received", { page: parsed.page })
         const registry = yield* ModelRegistry
         const message = query.message
         if (message === undefined) {
@@ -141,22 +172,26 @@ export const handleModelPageCallback = (query: CallbackQuery, data: string) =>
         }
         const entry = yield* registry.take(parsed.token, message.chat.id, message.message_id)
         yield* Option.match(entry, {
-          onNone: () => answer(query.id, "Expired."),
+          onNone: () => logModelSelection("registry-entry-missing", { action: "page" }).pipe(
+            Effect.andThen(answer(query.id, "Expired.")),
+          ),
           onSome: (value) => Effect.gen(function* () {
+            yield* logModelSelection("registry-entry-accepted", { action: "page", kind: value.kind })
             if (!(yield* modelPickerIsCurrent(value))) {
+              yield* logModelSelection("picker-not-current", { action: "page" })
               yield* answer(query.id, "This model picker is no longer current.")
               return
             }
             switch (value.kind) {
               case "provider":
-                return answer(query.id, "Choose a model first.")
+                return yield* answer(query.id, "Choose a model first.")
               case "variant":
-                return answer(query.id, "Invalid entry.")
+                return yield* answer(query.id, "Invalid entry.")
               case "page": {
                 if (parsed.page < 0 || parsed.page * MODEL_PAGE_SIZE >= value.total) {
-                  return answer(query.id, "Invalid page.")
+                  return yield* answer(query.id, "Invalid page.")
                 }
-                return Effect.gen(function* () {
+                return yield* Effect.gen(function* () {
                   const nextToken = yield* registry.registerPage({
                     sessionID: value.sessionID,
                     models: value.models,
@@ -192,6 +227,7 @@ export const handleModelProviderCallback = (query: CallbackQuery, data: string) 
     onNone: () => answer(query.id, "Invalid data."),
     onSome: (parsed) =>
       Effect.gen(function* () {
+        yield* logModelSelection("provider-callback-received", { index: parsed.index })
         const registry = yield* ModelRegistry
         const message = query.message
         if (message === undefined) {
@@ -200,17 +236,25 @@ export const handleModelProviderCallback = (query: CallbackQuery, data: string) 
         }
         const entry = yield* registry.take(parsed.token, message.chat.id, message.message_id)
         yield* Option.match(entry, {
-          onNone: () => answer(query.id, "Expired."),
+          onNone: () => logModelSelection("registry-entry-missing", { action: "provider" }).pipe(
+            Effect.andThen(answer(query.id, "Expired.")),
+          ),
           onSome: (value) => Effect.gen(function* () {
+            yield* logModelSelection("registry-entry-accepted", { action: "provider", kind: value.kind })
             if (!(yield* modelPickerIsCurrent(value))) {
+              yield* logModelSelection("picker-not-current", { action: "provider" })
               yield* answer(query.id, "This model picker is no longer current.")
               return
             }
-            if (value.kind !== "provider") return answer(query.id, "Invalid entry.")
+            if (value.kind !== "provider") return yield* answer(query.id, "Invalid entry.")
             const provider = Option.fromNullishOr(value.providers[parsed.index])
-            return Option.match(provider, {
+            return yield* Option.match(provider, {
               onNone: () => answer(query.id, "Invalid provider."),
               onSome: (selected) => Effect.gen(function* () {
+                yield* logModelSelection("provider-selected", {
+                  provider: selected.id,
+                  models: selected.models.length,
+                })
                 const token = yield* registry.registerPage({
                   sessionID: value.sessionID,
                   models: selected.models,
@@ -240,6 +284,7 @@ export const handleModelVariantCallback = (query: CallbackQuery, data: string) =
     onNone: () => answer(query.id, "Invalid data."),
     onSome: (parsed) =>
       Effect.gen(function* () {
+        yield* logModelSelection("variant-callback-received", { index: parsed.index })
         const registry = yield* ModelRegistry
         const opencode = yield* OpenCode
         const message = query.message
@@ -249,29 +294,38 @@ export const handleModelVariantCallback = (query: CallbackQuery, data: string) =
         }
         const entry = yield* registry.take(parsed.token, message.chat.id, message.message_id)
         yield* Option.match(entry, {
-          onNone: () => answer(query.id, "Expired."),
+          onNone: () => logModelSelection("registry-entry-missing", { action: "variant" }).pipe(
+            Effect.andThen(answer(query.id, "Expired.")),
+          ),
           onSome: (value) => Effect.gen(function* () {
+            yield* logModelSelection("registry-entry-accepted", { action: "variant", kind: value.kind })
             if (!(yield* modelPickerIsCurrent(value))) {
+              yield* logModelSelection("picker-not-current", { action: "variant" })
               yield* answer(query.id, "This model picker is no longer current.")
               return
             }
             switch (value.kind) {
               case "provider":
-                return answer(query.id, "Choose a model first.")
+                return yield* answer(query.id, "Choose a model first.")
               case "page":
-                return answer(query.id, "Invalid entry.")
+                return yield* answer(query.id, "Invalid entry.")
               case "variant":
-                return Option.match(Option.fromNullishOr(value.variants[parsed.index]), {
+                return yield* Option.match(Option.fromNullishOr(value.variants[parsed.index]), {
                   onNone: () => answer(query.id, "Invalid variant."),
                   onSome: (variant) =>
-                    opencode.switchModel({
-                      sessionID: value.sessionID,
-                      model: {
-                        id: value.modelID,
-                        providerID: value.providerID,
-                        variant,
-                      },
+                    logModelSelection("model-switch-requested", {
+                      model: value.modelID,
+                      provider: value.providerID,
+                      variant,
                     }).pipe(
+                      Effect.andThen(opencode.switchModel({
+                        sessionID: value.sessionID,
+                        model: {
+                          id: value.modelID,
+                          providerID: value.providerID,
+                          variant,
+                        },
+                      })),
                       Effect.andThen(
                         rememberModel(value.directory, {
                           id: value.modelID,
@@ -279,6 +333,11 @@ export const handleModelVariantCallback = (query: CallbackQuery, data: string) =
                           variant,
                         }),
                       ),
+                      Effect.tap(() => logModelSelection("model-variant-switched", {
+                        model: value.modelID,
+                        provider: value.providerID,
+                        variant,
+                      })),
                       Effect.andThen(
                         apiEdit(value.chatId, value.messageId, `Model switched to ${value.modelID} (${variant})`),
                       ),
@@ -299,6 +358,7 @@ export const handleModelCancelCallback = (query: CallbackQuery, data: string) =>
     onNone: () => answer(query.id, "Invalid data."),
     onSome: (token) =>
       Effect.gen(function* () {
+        yield* logModelSelection("cancel-callback-received")
         const registry = yield* ModelRegistry
         const message = query.message
         if (message === undefined) {
@@ -324,6 +384,7 @@ export const showModels = (chatId: number, query = "", threadId?: number) =>
     const store = yield* Store
     const registry = yield* ModelRegistry
     const conversation = conversationId({ chatId, threadId })
+    yield* logModelSelection("picker-requested", { hasQuery: query.trim().length > 0 })
     const sessionID = yield* sessions.getOrCreate(conversation)
     const directory = yield* sessions.directoryFor(conversation)
     const remembered = yield* store.getModel(directory)
@@ -338,6 +399,7 @@ export const showModels = (chatId: number, query = "", threadId?: number) =>
         ),
       ),
     )
+    yield* logModelSelection("models-loaded", { models: models.length })
     const normalizedQuery = query.trim().toLocaleLowerCase()
     const filteredModels = normalizedQuery.length === 0
       ? models
@@ -357,6 +419,10 @@ export const showModels = (chatId: number, query = "", threadId?: number) =>
         variants: model.variants.map((variant) => variant.id),
       })),
     }))
+    yield* logModelSelection("provider-picker-opened", {
+      providers: providers.length,
+      models: filteredModels.length,
+    })
     const token = yield* registry.registerProviders({
       sessionID,
       providers,
