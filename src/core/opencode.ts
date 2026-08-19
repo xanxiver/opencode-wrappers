@@ -157,6 +157,31 @@ export interface OpenCodeService {
 
 export class OpenCode extends Context.Service<OpenCode, OpenCodeService>()("opencode2-uis/OpenCode") {}
 
+/** Safety bound for climbing a session tree; subagent trees are shallow. */
+export const ROOT_SESSION_CLIMB_LIMIT = 10
+
+/**
+ * Walk a session tree up to its root. Subagent (child) sessions carry a
+ * parentID; the root is the session a Telegram run started. Best-effort:
+ * a session without a parent, or the climb limit, resolve to the input.
+ */
+export const rootSessionID = (
+  opencode: Pick<OpenCodeService, "getSession">,
+  sessionID: string,
+): Effect.Effect<string, OpenCodeError> => {
+  const climb = (current: string, depth: number): Effect.Effect<string, OpenCodeError> =>
+    depth >= ROOT_SESSION_CLIMB_LIMIT
+      ? Effect.succeed(current)
+      : opencode.getSession(current).pipe(
+          Effect.flatMap((session) =>
+            session.parentID === undefined
+              ? Effect.succeed(current)
+              : climb(session.parentID, depth + 1),
+          ),
+        )
+  return climb(sessionID, 0)
+}
+
 /**
  * Log the failure at the client boundary, then preserve the original
  * typed failure wrapped in `OpenCodeError`.
