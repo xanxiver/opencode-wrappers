@@ -1,7 +1,8 @@
 import { Effect } from "effect"
 import { FetchHttpClient } from "effect/unstable/http"
-import { BunCrypto, BunFileSystem, BunPath, BunRuntime } from "@effect/platform-bun"
+import { BunChildProcessSpawner, BunCrypto, BunFileSystem, BunPath, BunRuntime } from "@effect/platform-bun"
 import { AppConfigTag, ConfigError, Live as ConfigLive } from "../config.js"
+import { GitChangesLive } from "../core/git-changes.js"
 import { Live as OpenCodeLive } from "../core/opencode.js"
 import { Live as SessionsLive } from "../core/sessions.js"
 import { Live as StoreLive } from "../core/store.js"
@@ -33,6 +34,8 @@ const app = program.pipe(
   // Layers with requirements must be provided BEFORE their dependencies,
   // because Effect.provide re-adds a layer's requirements to R.
   Effect.provide(TelegramDurableExecutorLive),
+  Effect.provide(GitChangesLive),
+  Effect.provide(BunChildProcessSpawner.layer),
   Effect.provide(SessionsLive),
   Effect.provide(TelegramApiLive),
   Effect.provide(AccessLive),

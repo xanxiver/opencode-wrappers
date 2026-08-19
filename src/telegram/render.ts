@@ -1,4 +1,5 @@
 import { Option } from "effect"
+import type { ChangesSummaryResult } from "../core/git-changes.js"
 
 export const MAX_MESSAGE_LENGTH = 4096
 
@@ -339,3 +340,63 @@ export const parseQuestionCallback = (
 /** Question text with the current multi-select state appended. */
 export const renderQuestionWithSelection = (view: QuestionView, selected: readonly string[]): string =>
   `${renderQuestion(view)}\n\nSelected: ${selected.length === 0 ? "(none)" : selected.join(", ")}`
+
+/** Maximum number of changed files shown in a changes summary. */
+export const CHANGES_MAX_FILES = 8
+
+/** Soft size budget for the changes block; far below Telegram's limit. */
+export const CHANGES_BLOCK_LIMIT = 800
+
+const sanitizeFileName = (path: string): string => path.replace(/[\u0000-\u001f\u007f]/g, "?")
+
+/**
+ * Render the working-tree changes block. The summary is a snapshot of the
+ * current tree, not an attribution of the listed changes to one run.
+ */
+export const renderChangesSummary = (result: ChangesSummaryResult): Option.Option<string> => {
+  switch (result.kind) {
+    case "none":
+      return Option.none()
+    case "unavailable":
+      return Option.some("Changes: unavailable.")
+    case "summary": {
+      const summary = result.summary
+      const lines: string[] = ["Current changes"]
+      const branch = Option.getOrElse(summary.branch, () => "detached HEAD")
+      lines.push(Option.match(summary.commit, {
+        onNone: () => `Branch: ${branch}`,
+        onSome: (commit) => `Branch: ${branch} @ ${commit}`,
+      }))
+      if (summary.files.length === 0) {
+        lines.push("Clean working tree")
+      } else {
+        lines.push(`Files: ${summary.files.length} changed`)
+        if (Option.isSome(summary.insertions) && Option.isSome(summary.deletions)) {
+          lines.push(`Tracked diff: +${summary.insertions.value} -${summary.deletions.value}`)
+        }
+        if (summary.binaryFiles > 0) lines.push(`Binary files: ${summary.binaryFiles}`)
+        lines.push("")
+        const shown = summary.files.slice(0, CHANGES_MAX_FILES)
+        for (const file of shown) {
+          lines.push(`${file.status} ${sanitizeFileName(file.path)}`)
+        }
+        if (summary.files.length > shown.length) {
+          lines.push(`… and ${summary.files.length - shown.length} more`)
+        }
+      }
+      const block = lines.join("\n")
+      return Option.some(block.length <= CHANGES_BLOCK_LIMIT ? block : truncate(block, CHANGES_BLOCK_LIMIT))
+    }
+  }
+}
+
+/**
+ * Append the changes block to a final response. The block lands after the
+ * existing head-and-tail truncation, so both the response start and the
+ * summary remain visible within Telegram's message limit.
+ */
+export const appendChangesSummary = (text: string, result: ChangesSummaryResult): string =>
+  Option.match(renderChangesSummary(result), {
+    onNone: () => text,
+    onSome: (block) => truncate(`${text}\n\n${block}`),
+  })

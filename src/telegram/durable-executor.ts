@@ -13,6 +13,7 @@ import {
   type DurableExecutorRepository,
 } from "../core/durable-executor.js"
 import { logBoundary } from "../core/logging.js"
+import { GitChanges, type GitChangesService } from "../core/git-changes.js"
 import { OpenCode, type OpenCodeError } from "../core/opencode.js"
 import { Sessions, type SessionsError } from "../core/sessions.js"
 import { Store, type StoreError } from "../core/store.js"
@@ -25,7 +26,7 @@ import { PermissionRegistry } from "./permissions.js"
 import { QuestionRegistry } from "./questions.js"
 import { reconcilePendingSession } from "./resurface.js"
 import type { InteractionStoreError } from "./interaction-store.js"
-import { renderFinal, truncate } from "./render.js"
+import { renderFinal, truncate, appendChangesSummary } from "./render.js"
 import { renderTelegramMermaid } from "./mermaid.js"
 
 const TelegramJobPayload = Schema.Struct({
@@ -162,10 +163,34 @@ export const resolveOwnedDurableReview = (
   return yield* jobs.resolveReview(reviewID)
 })
 
+/**
+ * Append a bounded working-tree changes summary to a finalization. The
+ * enriched text is persisted with the job, so a later Telegram retry replays
+ * the same summary instead of resampling a repository that may have changed.
+ * Git failures never fail the run: the cause is logged and the block is
+ * marked unavailable.
+ */
+export const withChangesSummaryUsing = (
+  gitChanges: GitChangesService,
+  result: RunFinalization,
+  directory: string,
+): Effect.Effect<RunFinalization, never> =>
+  gitChanges.summarize(directory).pipe(
+    Effect.map((changes) => ({ ...result, text: appendChangesSummary(result.text, changes) })),
+    Effect.catchCause((cause) =>
+      logBoundary("telegram/executor", "git-changes", "changes summary collection failed")(cause).pipe(
+        Effect.map(() => ({
+          ...result,
+          text: appendChangesSummary(result.text, { kind: "unavailable" } as const),
+        })),
+      ),
+    ),
+  )
+
 export const TelegramDurableExecutorLive: Layer.Layer<
   TelegramDurableExecutor,
   never,
-  DurableExecutorStore | Sessions | Store | OpenCode | TelegramApi | AppConfig | FileSystem.FileSystem | Path.Path | HttpClient.HttpClient | PermissionRegistry | QuestionRegistry
+  DurableExecutorStore | Sessions | Store | OpenCode | TelegramApi | AppConfig | FileSystem.FileSystem | Path.Path | HttpClient.HttpClient | PermissionRegistry | QuestionRegistry | GitChanges
 > = Layer.effect(
   TelegramDurableExecutor,
   Effect.gen(function* () {
@@ -179,7 +204,8 @@ export const TelegramDurableExecutorLive: Layer.Layer<
     yield* Path.Path
     const permissionRegistry = yield* PermissionRegistry
     const questionRegistry = yield* QuestionRegistry
-    const context = yield* Effect.context<DurableExecutorStore | Sessions | Store | OpenCode | TelegramApi | AppConfig | FileSystem.FileSystem | Path.Path | HttpClient.HttpClient | PermissionRegistry | QuestionRegistry>()
+    const gitChanges = yield* GitChanges
+    const context = yield* Effect.context<DurableExecutorStore | Sessions | Store | OpenCode | TelegramApi | AppConfig | FileSystem.FileSystem | Path.Path | HttpClient.HttpClient | PermissionRegistry | QuestionRegistry | GitChanges>()
     const fibers = yield* FiberMap.make<string, void, never>()
     yield* Effect.addFinalizer(() => FiberMap.clear(fibers).pipe(
       Effect.andThen(jobs.releaseWorkerLeases),
@@ -296,10 +322,11 @@ export const TelegramDurableExecutorLive: Layer.Layer<
               const response = yield* recoveredResponseFromHistory(payload.sessionID, lease.job.inputID)
               if (Option.isSome(response)) {
                 const rendered = yield* renderTelegramMermaid(renderFinal(response.value.text, "done"))
-                yield* jobs.markFinalizing(lease.job.id, lease.generation, encodeFinalization({
+                const finalization = yield* withChangesSummaryUsing(gitChanges, {
                   text: truncate(rendered.text),
                   media: limitMedia([...rendered.media, ...response.value.media]),
-                }))
+                }, payload.directory)
+                yield* jobs.markFinalizing(lease.job.id, lease.generation, encodeFinalization(finalization))
                 const current = yield* jobs.get(lease.job.id)
                 if (Option.isSome(current)) {
                   yield* deliverPersistedFinal({ ...lease, job: current.value, recoveredFrom: "finalizing" }, payload)
@@ -369,7 +396,11 @@ export const TelegramDurableExecutorLive: Layer.Layer<
           onDispatching: () => jobs.markDispatching(lease.job.id, lease.generation),
           onProgressMessage: (messageID) => jobs.markProgressMessage(lease.job.id, lease.generation, messageID),
           onAccepted: (inputID) => jobs.markRunning(lease.job.id, lease.generation, inputID),
-          onFinalizing: (result) => jobs.markFinalizing(lease.job.id, lease.generation, encodeFinalization(result)),
+          onFinalizing: (result) => withChangesSummaryUsing(gitChanges, result, payload.directory).pipe(
+            Effect.andThen((enriched) =>
+              jobs.markFinalizing(lease.job.id, lease.generation, encodeFinalization(enriched))
+            ),
+          ),
         })
         const current = yield* jobs.get(lease.job.id)
         if (Option.isNone(current)) return
