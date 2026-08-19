@@ -6,12 +6,11 @@ import type { Attachment } from "../core/attachments.js"
 import { toFileAttachment } from "../core/attachments.js"
 import type { DurableExecutorError, DurableLeaseLost } from "../core/durable-executor.js"
 import { logBoundary } from "../core/logging.js"
-import { OpenCode, questionRequestFromEvent, type PendingQuestionRequest } from "../core/opencode.js"
+import { OpenCode, questionRequestFromEvent, rootSessionID, type OpenCodeService, type PendingQuestionRequest } from "../core/opencode.js"
 import { isDefinitiveSendRejection, recordDefinitiveSendFailure, TelegramApi, type KeyboardMarkup } from "./api.js"
 import { AppConfigTag, parseRunTimeout } from "../config.js"
 import { renderTelegramMermaid } from "./mermaid.js"
 import { PermissionRegistry, type PermissionRegistryService } from "./permissions.js"
-import type { InteractionStoreError } from "./interaction-store.js"
 import { QuestionRegistry, type QuestionRegistryService } from "./questions.js"
 import {
   renderFinal,
@@ -600,15 +599,38 @@ export const matchesSessionRoute = (
   threadId?: number,
 ): boolean => route.chatId === chatId && route.threadId === threadId
 
-const isSourceRoute = (
-  registry: PermissionRegistryService,
+/**
+ * Confirm a permission or question request surfaced by this run's event
+ * stream belongs to the destination (chat/topic) of this run. Requests may
+ * belong to a child (subagent) session; the session tree is climbed to the
+ * run's root session, whose Telegram route must match this destination.
+ * Foreign sessions never show prompts here.
+ */
+export const sessionRequestMatchesRoute = (
+  registry: Pick<PermissionRegistryService, "getSessionRoute">,
+  opencode: Pick<OpenCodeService, "getSession">,
   sessionID: string,
   chatId: number,
   threadId: Option.Option<number>,
-): Effect.Effect<boolean, InteractionStoreError> =>
-  registry.getSessionRoute(sessionID).pipe(Effect.map(Option.exists((route) =>
-    matchesSessionRoute(route, chatId, Option.getOrUndefined(threadId))
-  )))
+): Effect.Effect<boolean, never> =>
+  registry.getSessionRoute(sessionID).pipe(
+    Effect.flatMap(Option.match({
+      onSome: (route) =>
+        Effect.succeed(matchesSessionRoute(route, chatId, Option.getOrUndefined(threadId))),
+      onNone: () =>
+        rootSessionID(opencode, sessionID).pipe(
+          Effect.flatMap((root) => registry.getSessionRoute(root)),
+          Effect.map(Option.exists((route) =>
+            matchesSessionRoute(route, chatId, Option.getOrUndefined(threadId)),
+          )),
+        ),
+    })),
+    Effect.catchCause((cause) =>
+      logBoundary("telegram/run", "opencode-client", "session route lookup failed")(cause).pipe(
+        Effect.as(false),
+      ),
+    ),
+  )
 
 const chunk = <A>(items: readonly A[], size: number): ReadonlyArray<readonly A[]> => {
   const rows: A[][] = []
@@ -800,7 +822,8 @@ const handleEvent = (
     }
     case "permission.asked": {
       return Effect.gen(function* () {
-        if (!(yield* isSourceRoute(registry, event.data.sessionID, chatId, threadId))) return
+        const opencode = yield* OpenCode
+        if (!(yield* sessionRequestMatchesRoute(registry, opencode, event.data.sessionID, chatId, threadId))) return
         const tokenOption = yield* registry.registerOrResume({
           sessionID: event.data.sessionID,
           requestID: event.data.id,
@@ -829,15 +852,11 @@ const handleEvent = (
     case "form.created": {
       const request = questionRequestFromEvent(event)
       if (request === undefined) return Effect.void
-      return registry.getSessionRoute(request.sessionID).pipe(
-        Effect.flatMap(Option.match({
-          onNone: () => Effect.void,
-          onSome: (route) => matchesSessionRoute(route, chatId, Option.getOrUndefined(threadId))
-            ? surfaceQuestion(request, chatId, threadId, questionRegistry)
-            : Effect.void,
-        })),
-        Effect.catchCause(logTelegramFailure("read question session route failed")),
-      )
+      return Effect.gen(function* () {
+        const opencode = yield* OpenCode
+        if (!(yield* sessionRequestMatchesRoute(registry, opencode, request.sessionID, chatId, threadId))) return
+        yield* surfaceQuestion(request, chatId, threadId, questionRegistry)
+      }).pipe(Effect.catchCause(logTelegramFailure("read question session route failed")))
     }
     case "session.execution.succeeded": {
       return Effect.all([
@@ -1002,7 +1021,29 @@ export const runPrompt = (input: RunInput) =>
             ? Effect.asVoid(Deferred.succeed(eventReady, undefined))
             : Effect.void,
         ),
-        Stream.filter(isSessionEvent(input.sessionID)),
+        // The global event bus carries events from every session on the
+        // server, including child (subagent) sessions of this run and
+        // unrelated sessions. Track the run session and any request
+        // (permission, question) whose session tree resolves to it.
+        Stream.filterEffect((event) => {
+          const eventSessionID = event.type === "permission.asked"
+            ? event.data.sessionID
+            : event.type === "form.created"
+              ? event.data.form.sessionID
+              : isSessionEvent(input.sessionID)(event)
+                ? input.sessionID
+                : undefined
+          if (eventSessionID === undefined) return Effect.succeed(false)
+          if (eventSessionID === input.sessionID) return Effect.succeed(true)
+          return rootSessionID(opencode, eventSessionID).pipe(
+            Effect.map((root) => root === input.sessionID),
+            Effect.catchCause((cause) =>
+              logBoundary("telegram/run", "opencode-client", "session tree lookup failed")(cause).pipe(
+                Effect.as(false),
+              ),
+            ),
+          )
+        }),
         Stream.takeUntil(isTerminalEvent),
         Stream.runForEach((event) =>
           handleEvent(

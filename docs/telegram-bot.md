@@ -13,6 +13,9 @@ The bot lives in `src/` and `test/` at the repository root. The core
 - Tool permission approvals via inline keyboard (once / always / reject).
 - Agent questions: option buttons, multi-select with Confirm, skip, or reply
   with text (when the question allows custom answers).
+- Subagent requests are surfaced too: when a primary agent spawns subagents
+  (child sessions), their permission and question prompts are delivered in the
+  parent run's chat and topic, and answers reply to the child session.
 - Live progress: text, reasoning, and tool activity update one message.
 - Token usage and cost in the final message.
 - Working-tree changes summary in the final message (branch, changed files, and

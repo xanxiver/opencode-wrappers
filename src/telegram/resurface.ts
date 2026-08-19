@@ -1,13 +1,14 @@
 import { Cause, Effect, Option, Schedule } from "effect"
 import { AppConfigTag } from "../config.js"
 import { logBoundary } from "../core/logging.js"
-import { OpenCode } from "../core/opencode.js"
+import { OpenCode, rootSessionID, type OpenCodeService } from "../core/opencode.js"
 import { Store } from "../core/store.js"
 import { recordDefinitiveSendFailure, TelegramApi } from "./api.js"
-import { PermissionRegistry } from "./permissions.js"
+import { PermissionRegistry, type SessionRoute } from "./permissions.js"
 import { QuestionRegistry } from "./questions.js"
 import { renderPermission, renderQuestion } from "./render.js"
 import { questionKeyboard } from "./run.js"
+import type { InteractionStoreError } from "./interaction-store.js"
 
 interface PendingPermissionRequest {
   readonly id: string
@@ -106,11 +107,55 @@ export const reconcilePendingSession = (
     opencode.listPendingPermissions(directory),
     opencode.listPendingQuestions(directory),
   ])
-  yield* Effect.forEach(permissions.filter((request) => request.sessionID === sessionID), (request) =>
-    surfacePermission(request, effectiveRoute))
-  yield* Effect.forEach(questions.filter((request) => request.sessionID === sessionID), (request) =>
-    surfaceQuestions(request, effectiveQuestionRoute))
+  yield* Effect.forEach(permissions, (request) =>
+    belongsToRoot(opencode, request.sessionID, sessionID).pipe(
+      Effect.flatMap((keep) => keep ? surfacePermission(request, effectiveRoute) : Effect.void),
+    ))
+  yield* Effect.forEach(questions, (request) =>
+    belongsToRoot(opencode, request.sessionID, sessionID).pipe(
+      Effect.flatMap((keep) => keep ? surfaceQuestions(request, effectiveQuestionRoute) : Effect.void),
+    ))
 })
+
+/**
+ * A request belongs to the root session when it is that session, or when
+ * climbing the session tree (through subagent children) reaches it.
+ */
+const belongsToRoot = (
+  opencode: OpenCodeService,
+  requestSessionID: string,
+  rootSessionIDValue: string,
+): Effect.Effect<boolean, never> =>
+  requestSessionID === rootSessionIDValue
+    ? Effect.succeed(true)
+    : rootSessionID(opencode, requestSessionID).pipe(
+        Effect.map((root) => root === rootSessionIDValue),
+        Effect.catchCause((cause) =>
+          logPendingFailure("session tree lookup failed")(cause).pipe(
+            Effect.as(false),
+          ),
+        ),
+      )
+
+/**
+ * Resolve the Telegram destination for a pending request by climbing a
+ * session tree. Requests from subagent (child) sessions have no route of
+ * their own; the root run session provides it.
+ */
+const destinationFor = (
+  getSessionRoute: (sessionID: string) => Effect.Effect<Option.Option<SessionRoute>, InteractionStoreError>,
+  opencode: OpenCodeService,
+  sessionID: string,
+): Effect.Effect<Option.Option<SessionRoute>, InteractionStoreError> =>
+  getSessionRoute(sessionID).pipe(
+    Effect.flatMap(Option.match({
+      onSome: (route) => Effect.succeed(Option.some(route)),
+      onNone: () => rootSessionID(opencode, sessionID).pipe(
+        Effect.flatMap((root) => getSessionRoute(root)),
+        Effect.catchCause(() => Effect.succeed(Option.none<SessionRoute>())),
+      ),
+    })),
+  )
 
 /**
  * After a bot restart, re-surface pending permission requests and
@@ -144,14 +189,22 @@ export const resurfacePending = () =>
                          ),
                        )
       for (const request of permissions) {
-        const routeOption = yield* permissionRegistry.getSessionRoute(request.sessionID)
+        const routeOption = yield* destinationFor(permissionRegistry.getSessionRoute, opencode, request.sessionID).pipe(
+          Effect.catchCause((cause) =>
+            logPendingFailure("permission destination lookup failed")(cause).pipe(Effect.as(Option.none<SessionRoute>())),
+          ),
+        )
         if (Option.isNone(routeOption)) continue
         yield* surfacePermission(request, routeOption.value).pipe(
           Effect.catchCause(logPendingFailure("resurface permission failed")),
         )
       }
       for (const request of questions) {
-        const routeOption = yield* questionRegistry.getSessionRoute(request.sessionID)
+        const routeOption = yield* destinationFor(questionRegistry.getSessionRoute, opencode, request.sessionID).pipe(
+          Effect.catchCause((cause) =>
+            logPendingFailure("question destination lookup failed")(cause).pipe(Effect.as(Option.none<SessionRoute>())),
+          ),
+        )
         if (Option.isNone(routeOption)) continue
         yield* surfaceQuestions(request, routeOption.value).pipe(
           Effect.catchCause(logPendingFailure("resurface question failed")),
