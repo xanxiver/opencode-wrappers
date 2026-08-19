@@ -15,6 +15,10 @@ The bot lives in `src/` and `test/` at the repository root. The core
   with text (when the question allows custom answers).
 - Live progress: text, reasoning, and tool activity update one message.
 - Token usage and cost in the final message.
+- Working-tree changes summary in the final message (branch, changed files, and
+  tracked diff line totals) when the project directory is inside a Git
+  repository. The summary is a snapshot of the current tree, not an attribution
+  of the listed changes to one run.
 - `/model`: paginated model picker (10 per page, Previous/Next).
 - `/compact`: compact the current session.
 - `/reconnect`: report automatic recovery or durably attach to an active
