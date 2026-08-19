@@ -41,6 +41,7 @@ export const HELP_TEXT = [
   "/status — show the directory, session, and model",
   "/reviews — list ambiguous durable jobs for the current session",
   "/resolve_review <job-id> — resolve a durable review and remove retained data",
+  "/queue — show the running and queued runs for this session",
   "/sessions — list and switch sessions in this directory",
   "/session <id> — set the active session by ID",
   "",

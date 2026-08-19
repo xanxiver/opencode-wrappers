@@ -23,6 +23,8 @@ import {
   parseQuestionCallback,
   renderChangesSummary,
   appendChangesSummary,
+  renderRunQueue,
+  runQueueStateLabel,
   renderFinal,
   renderModelLabel,
   renderModelPageHeader,
@@ -747,5 +749,54 @@ describe("renderChangesSummary", () => {
     const appended = appendChangesSummary(long, { kind: "summary", summary })
     expect(appended.length).toBeLessThanOrEqual(MAX_MESSAGE_LENGTH)
     expect(appended).toContain("Current changes")
+  })
+})
+
+describe("renderRunQueue", () => {
+  test("shows the empty queue message", () => {
+    expect(renderRunQueue([])).toBe("No runs queued for this session.")
+  })
+
+  test("renders the pipeline in order with human state labels", () => {
+    const text = renderRunQueue([
+      { id: "j1", state: "running", text: "Fix the model picker" },
+      { id: "j2", state: "pending", text: "Add a diff command" },
+      { id: "j3", state: "pending", text: "Bump the dependency" },
+    ])
+    expect(text).toContain("Queue for this session (3)")
+    expect(text).toContain("1. Running: \"Fix the model picker\"")
+    expect(text).toContain("2. Queued: \"Add a diff command\"")
+    expect(text).toContain("3. Queued: \"Bump the dependency\"")
+  })
+
+  test("labels starting and finishing states", () => {
+    const text = renderRunQueue([
+      { id: "j1", state: "dispatching", text: "Start" },
+      { id: "j2", state: "finalizing", text: "Finish" },
+    ])
+    expect(text).toContain("1. Starting: \"Start\"")
+    expect(text).toContain("2. Finishing: \"Finish\"")
+  })
+
+  test("marks an empty prompt", () => {
+    const text = renderRunQueue([{ id: "j1", state: "running", text: "" }])
+    expect(text).toContain("(empty prompt)")
+  })
+
+  test("truncates long prompts", () => {
+    const text = renderRunQueue([{ id: "j1", state: "pending", text: "x".repeat(500) }])
+    expect(text).toContain("truncated")
+    expect(text.length).toBeLessThan(400)
+  })
+
+  test("collapses newlines in multi-line prompts", () => {
+    const text = renderRunQueue([{ id: "j1", state: "pending", text: "line one\n\nline two" }])
+    expect(text).toContain("\"line one line two\"")
+    expect(text).toContain("1. Queued:")
+  })
+
+  test("keeps unknown states visible as-is", () => {
+    expect(runQueueStateLabel("retrying")).toBe("retrying")
+    expect(runQueueStateLabel("queued")).toBe("queued")
   })
 })

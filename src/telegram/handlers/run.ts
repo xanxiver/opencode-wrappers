@@ -99,6 +99,17 @@ export const resolveDurableReview = (chatId: number, jobID: string, threadId?: n
     yield* executor.resolveReview(chatId, jobID, threadId)
   }).pipe(Effect.catchCause(logHandlerFailure(chatId, threadId, "resolve durable review failed")))
 
+/** `/queue` — show the durable run pipeline (running and queued runs). */
+export const listRunQueue = (chatId: number, threadId?: number) =>
+  Effect.gen(function* () {
+    const executor = yield* TelegramDurableExecutor
+    yield* executor.listQueue(chatId, threadId)
+  }).pipe(Effect.catchCause((cause) =>
+    logBoundary("telegram/handlers", "durable-executor", "list run queue failed")(cause).pipe(
+      Effect.andThen(sendText(chatId, "The run queue could not be listed.", threadId)),
+    ),
+  ))
+
 /** `/compact` — compact the current session without starting a prompt. */
 export const compactSession = (chatId: number, threadId?: number) =>
   Effect.gen(function* () {

@@ -6,7 +6,7 @@ import { answerRepliedQuestion } from "./question.js"
 import { runWithFiles } from "./run.js"
 import { selectExactModel, showModels } from "./model.js"
 import { showProjects, showSessions } from "./picker.js"
-import { compactSession, listDurableReviews, reconnectRun, resetSession, resolveDurableReview, setProjectDirectory, setSessionById, showStatus, stopRun } from "./run.js"
+import { compactSession, listDurableReviews, listRunQueue, reconnectRun, resetSession, resolveDurableReview, setProjectDirectory, setSessionById, showStatus, stopRun } from "./run.js"
 
 type ParsedCommand = {
   readonly name: string
@@ -85,6 +85,10 @@ export const handleMessage = (message: Message) =>
       case "/reviews":
         if (command.hasArgument) break
         yield* listDurableReviews(chatId, threadId)
+        return
+      case "/queue":
+        if (command.hasArgument) break
+        yield* listRunQueue(chatId, threadId)
         return
       case "/resolve_review":
         yield* command.argument.length === 0

@@ -16,7 +16,7 @@ import {
   type DurableExecutorRepository,
 } from "../src/core/durable-executor.js"
 import { GitChangesError, type ChangesSummaryResult, type GitChangesService } from "../src/core/git-changes.js"
-import { decodeAttachmentSnapshots, encodeAttachmentSnapshots, finalEditDisposition, redactedReviewEvidence, resolveOwnedDurableReview, settleFinalEditError, withChangesSummaryUsing } from "../src/telegram/durable-executor.js"
+import { decodeAttachmentSnapshots, encodeAttachmentSnapshots, finalEditDisposition, redactedReviewEvidence, resolveOwnedDurableReview, runQueueItems, settleFinalEditError, withChangesSummaryUsing } from "../src/telegram/durable-executor.js"
 import { ApiError } from "../src/telegram/api.js"
 
 const config = () => new AppConfig({
@@ -431,5 +431,53 @@ describe("withChangesSummaryUsing", () => {
       withChangesSummaryUsing(gitChanges, { text: "Done.", media: [] }, "/tmp/project"),
     )
     expect(result.text).toContain("Changes: unavailable.")
+  })
+})
+
+describe("runQueueItems", () => {
+  const payload = (text: string): string => JSON.stringify({
+    chatId: 1,
+    threadId: 42,
+    message: { message_id: 1, chat: { id: 1 } },
+    text,
+    sessionID: "ses_1",
+    directory: "/tmp/project",
+  })
+
+  const job = (overrides: Partial<DurableJob> & { readonly id: string; readonly state: DurableJob["state"]; readonly payload: string }): DurableJob => ({
+    sourceKey: "telegram:1:1",
+    channel: "telegram",
+    owner: "session:ses_1",
+    attempt: 1,
+    availableAt: 0,
+    deliveredMediaCount: 0,
+    createdAt: 0,
+    updatedAt: 0,
+    ...overrides,
+  })
+
+  test("keeps only pipeline states in creation order", async () => {
+    const items = await Effect.runPromise(runQueueItems([
+      job({ id: "j-completed", state: "completed", payload: payload("old") }),
+      job({ id: "j-running", state: "running", payload: payload("Current run") }),
+      job({ id: "j-pending", state: "pending", payload: payload("Next") }),
+      job({ id: "j-review", state: "needs_review", payload: payload("review me") }),
+      job({ id: "j-finalizing", state: "finalizing", payload: payload("Finishing") }),
+    ]))
+    expect(items.map((item) => item.id)).toEqual(["j-running", "j-pending", "j-finalizing"])
+  })
+
+  test("decodes the prompt text from the job payload", async () => {
+    const items = await Effect.runPromise(runQueueItems([
+      job({ id: "j1", state: "pending", payload: payload("Add a /diff command") }),
+    ]))
+    expect(items[0]?.text).toBe("Add a /diff command")
+  })
+
+  test("shows an empty prompt when the payload cannot be decoded", async () => {
+    const items = await Effect.runPromise(runQueueItems([
+      job({ id: "j1", state: "pending", payload: "not a telegram payload" }),
+    ]))
+    expect(items[0]?.text).toBe("")
   })
 })

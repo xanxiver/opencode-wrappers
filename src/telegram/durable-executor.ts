@@ -10,6 +10,7 @@ import {
   PROGRESS_DELIVERY_IN_FLIGHT_MESSAGE_ID,
   type DurableJob,
   type DurableJobLease,
+  type DurableJobState,
   type DurableExecutorRepository,
 } from "../core/durable-executor.js"
 import { logBoundary } from "../core/logging.js"
@@ -26,7 +27,7 @@ import { PermissionRegistry } from "./permissions.js"
 import { QuestionRegistry } from "./questions.js"
 import { reconcilePendingSession } from "./resurface.js"
 import type { InteractionStoreError } from "./interaction-store.js"
-import { renderFinal, truncate, appendChangesSummary } from "./render.js"
+import { renderFinal, truncate, appendChangesSummary, renderRunQueue, type RunQueueItem } from "./render.js"
 import { renderTelegramMermaid } from "./mermaid.js"
 
 const TelegramJobPayload = Schema.Struct({
@@ -96,6 +97,7 @@ export interface TelegramDurableExecutorService {
   readonly reconnect: (chatId: number, message: Message, force: boolean) => Effect.Effect<void, DurableExecutorError | InteractionStoreError | OpenCodeError | SessionsError | StoreError>
   readonly listReviews: (chatId: number, threadId?: number) => Effect.Effect<void, DurableExecutorError | SessionsError | InteractionStoreError>
   readonly resolveReview: (chatId: number, reviewID: string, threadId?: number) => Effect.Effect<void, DurableExecutorError | SessionsError | InteractionStoreError>
+  readonly listQueue: (chatId: number, threadId?: number) => Effect.Effect<void, DurableExecutorError>
 }
 
 export class TelegramDurableExecutor extends Context.Service<TelegramDurableExecutor, TelegramDurableExecutorService>()(
@@ -108,6 +110,28 @@ const decodePayload = (job: DurableJob): Effect.Effect<TelegramJobPayload, unkno
   )
 
 const ownerFor = (sessionID: string): string => `session:${sessionID}`
+
+/** Job states that occupy the run pipeline and are not yet terminal. */
+export const RUN_PIPELINE_STATES: readonly DurableJobState[] = ["pending", "dispatching", "running", "finalizing"]
+
+/**
+ * Build read-only queue items from the run-pipeline jobs of a session, in
+ * creation order. A job whose payload cannot be decoded still appears with
+ * an empty prompt so the queue stays visible.
+ */
+export const runQueueItems = (jobs: readonly DurableJob[]): Effect.Effect<readonly RunQueueItem[], never> =>
+  Effect.forEach(
+    jobs.filter((job) => RUN_PIPELINE_STATES.includes(job.state)),
+    (job) =>
+      decodePayload(job).pipe(
+        Effect.option,
+        Effect.map((payload) => ({
+          id: job.id,
+          state: job.state,
+          text: Option.isSome(payload) ? payload.value.text : "",
+        })),
+      ),
+  )
 
 export const finalEditDisposition = (error: Pick<ApiError, "description" | "transient">): "accepted" | "retry" | "fail" => {
   if (error.description?.toLowerCase().includes("message is not modified") === true) return "accepted"
@@ -670,6 +694,15 @@ export const TelegramDurableExecutorLive: Layer.Layer<
           return
         }
         yield* sendText(chatId, truncate(evidence.join("\n\n")), threadId)
+      }).pipe(Effect.provide(context)),
+      listQueue: (chatId, threadId) => Effect.gen(function* () {
+        const conversation = conversationId({ chatId, threadId })
+        const sessionID = yield* store.getSessionIDForConversation(conversation)
+        const ownedJobs = Option.isNone(sessionID)
+          ? []
+          : (yield* jobs.listOwner("telegram", ownerFor(sessionID.value)))
+        const items = yield* runQueueItems(ownedJobs)
+        yield* sendText(chatId, truncate(renderRunQueue(items)), threadId)
       }).pipe(Effect.provide(context)),
       resolveReview: (chatId, reviewID, threadId) => Effect.gen(function* () {
         const conversation = conversationId({ chatId, threadId })

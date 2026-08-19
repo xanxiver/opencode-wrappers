@@ -341,6 +341,40 @@ export const parseQuestionCallback = (
 export const renderQuestionWithSelection = (view: QuestionView, selected: readonly string[]): string =>
   `${renderQuestion(view)}\n\nSelected: ${selected.length === 0 ? "(none)" : selected.join(", ")}`
 
+/** One run in the durable pipeline for a session. */
+export interface RunQueueItem {
+  readonly id: string
+  readonly state: string
+  readonly text: string
+}
+
+/** Human state label for a run in the queue. */
+export const runQueueStateLabel = (state: string): string => {
+  switch (state) {
+    case "dispatching":
+      return "Starting"
+    case "running":
+      return "Running"
+    case "finalizing":
+      return "Finishing"
+    case "pending":
+      return "Queued"
+    default:
+      return state
+  }
+}
+
+/** Render the read-only run pipeline for a session. */
+export const renderRunQueue = (items: readonly RunQueueItem[]): string => {
+  if (items.length === 0) return "No runs queued for this session."
+  const lines = items.map((item, index) => {
+    const prompt = item.text.replace(/\s+/g, " ").trim()
+    const preview = prompt.length === 0 ? "(empty prompt)" : `"${truncate(prompt, 200)}"`
+    return `${index + 1}. ${runQueueStateLabel(item.state)}: ${preview}`
+  })
+  return `Queue for this session (${items.length})\n${lines.join("\n")}`
+}
+
 /** Maximum number of changed files shown in a changes summary. */
 export const CHANGES_MAX_FILES = 8
 
