@@ -32,9 +32,11 @@ The bot lives in `src/` and `test/` at the repository root. The core
 - `/resolve_review <review-id>`: resolve a job review or explicitly retry an
   uncertain prompt send.
 - Forum topics: replies land in the thread the user is in.
+- `/queue`: show the durable run pipeline for the current session (starting,
+  running, finishing, and queued runs with their prompts), read-only.
 - Commands: `/start`, `/help`, `/prompt`, `/new`, `/stop`, `/reconnect`, `/forceReconnect`,
   `/compact`, `/review`, `/model`, `/status`, `/whoami`, `/projects`, `/project <path>`,
-  `/sessions`.
+  `/sessions`, `/queue`.
 - User whitelist via `TELEGRAM_ALLOWED_USERS` (empty = deny all).
 
 ## Reliability
