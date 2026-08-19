@@ -19,6 +19,7 @@ export const HELP_TEXT = [
   "Use /prompt to run a task: /prompt <text>.",
   "Attach a file (pdf, png, jpg, gif, webp, csv, xlsx, docx, md, mdx) to include it.",
   "Reply to a message with /prompt to use its attachments.",
+  "Completed runs include a summary of the current git changes in the project.",
   "",
   "Commands",
   "",

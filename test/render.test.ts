@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test"
 import { unlink } from "node:fs/promises"
 import { Effect, Option } from "effect"
 import { BunFileSystem, BunPath } from "@effect/platform-bun"
+import type { ChangesSummary } from "../src/core/git-changes.js"
 import { EDIT_MIN_INTERVAL_MS, editDelay } from "../src/telegram/api.js"
 import { MAX_RECOVERY_MESSAGE_PAGES, assistantResponseForInput, detectSupportedMediaMime, matchesSessionRoute, mediaFromResponseText, nextProgressEdit, recoveredResponseForInput, recoveredResponseFromPages } from "../src/telegram/run.js"
 import {
@@ -20,6 +21,8 @@ import {
   parsePromptCommand,
   promptWithReply,
   parseQuestionCallback,
+  renderChangesSummary,
+  appendChangesSummary,
   renderFinal,
   renderModelLabel,
   renderModelPageHeader,
@@ -641,5 +644,108 @@ describe("assistantResponseForInput", () => {
     ))
     expect(response).toEqual(Option.none())
     expect(calls).toBe(MAX_RECOVERY_MESSAGE_PAGES)
+  })
+})
+
+describe("renderChangesSummary", () => {
+  const base: ChangesSummary = {
+    branch: Option.some("main"),
+    commit: Option.some("abc1234"),
+    files: [],
+    insertions: Option.some(0),
+    deletions: Option.some(0),
+    binaryFiles: 0,
+  }
+
+  test("shows the clean working tree state", () => {
+    const text = Option.getOrThrow(renderChangesSummary({ kind: "summary", summary: base }))
+    expect(text).toContain("Current changes")
+    expect(text).toContain("Branch: main @ abc1234")
+    expect(text).toContain("Clean working tree")
+  })
+
+  test("lists changed files with Git status columns and the tracked diff", () => {
+    const text = Option.getOrThrow(renderChangesSummary({
+      kind: "summary",
+      summary: {
+        ...base,
+        files: [
+          { path: "src/a.ts", status: "M " },
+          { path: "src/b.ts", status: " M" },
+          { path: "test/new.test.ts", status: "??" },
+        ],
+        insertions: Option.some(84),
+        deletions: Option.some(17),
+      },
+    }))
+    expect(text).toContain("Files: 3 changed")
+    expect(text).toContain("Tracked diff: +84 -17")
+    expect(text).toContain("M  src/a.ts")
+    expect(text).toContain(" M src/b.ts")
+    expect(text).toContain("?? test/new.test.ts")
+  })
+
+  test("omits the tracked diff when line statistics are unavailable", () => {
+    const text = Option.getOrThrow(renderChangesSummary({
+      kind: "summary",
+      summary: { ...base, insertions: Option.none(), deletions: Option.none() },
+    }))
+    expect(text).not.toContain("Tracked diff")
+  })
+
+  test("caps the file list and reports the remainder", () => {
+    const files = Array.from({ length: 12 }, (_, index) => ({ path: `file-${index}.ts`, status: "??" }))
+    const text = Option.getOrThrow(renderChangesSummary({ kind: "summary", summary: { ...base, files } }))
+    expect(text).toContain("… and 4 more")
+  })
+
+  test("reports binary files", () => {
+    const text = Option.getOrThrow(renderChangesSummary({
+      kind: "summary",
+      summary: { ...base, files: [{ path: "logo.png", status: "M " }], binaryFiles: 1 },
+    }))
+    expect(text).toContain("Binary files: 1")
+  })
+
+  test("shows a detached HEAD", () => {
+    const text = Option.getOrThrow(renderChangesSummary({
+      kind: "summary",
+      summary: { ...base, branch: Option.none() },
+    }))
+    expect(text).toContain("detached HEAD")
+  })
+
+  test("escapes control characters in file names", () => {
+    const text = Option.getOrThrow(renderChangesSummary({
+      kind: "summary",
+      summary: { ...base, files: [{ path: "bad\u0001name.ts", status: "??" }] },
+    }))
+    expect(text).toContain("?? bad?name.ts")
+    expect(text).not.toContain("\u0001")
+  })
+
+  test("returns none outside a repository", () => {
+    expect(renderChangesSummary({ kind: "none" })).toEqual(Option.none())
+  })
+
+  test("marks an unavailable summary", () => {
+    expect(renderChangesSummary({ kind: "unavailable" })).toEqual(Option.some("Changes: unavailable."))
+  })
+
+  test("does not append when nothing should be shown", () => {
+    expect(appendChangesSummary("Done.", { kind: "none" })).toBe("Done.")
+  })
+
+  test("keeps the final message within Telegram limits", () => {
+    const long = "x".repeat(4000)
+    const summary: ChangesSummary = {
+      ...base,
+      files: [{ path: "src/a.ts", status: "M " }],
+      insertions: Option.some(10),
+      deletions: Option.some(2),
+    }
+    const appended = appendChangesSummary(long, { kind: "summary", summary })
+    expect(appended.length).toBeLessThanOrEqual(MAX_MESSAGE_LENGTH)
+    expect(appended).toContain("Current changes")
   })
 })

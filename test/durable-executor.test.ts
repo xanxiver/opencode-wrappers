@@ -15,7 +15,8 @@ import {
   type DurableExecutorError,
   type DurableExecutorRepository,
 } from "../src/core/durable-executor.js"
-import { decodeAttachmentSnapshots, encodeAttachmentSnapshots, finalEditDisposition, redactedReviewEvidence, resolveOwnedDurableReview, settleFinalEditError } from "../src/telegram/durable-executor.js"
+import { GitChangesError, type ChangesSummaryResult, type GitChangesService } from "../src/core/git-changes.js"
+import { decodeAttachmentSnapshots, encodeAttachmentSnapshots, finalEditDisposition, redactedReviewEvidence, resolveOwnedDurableReview, settleFinalEditError, withChangesSummaryUsing } from "../src/telegram/durable-executor.js"
 import { ApiError } from "../src/telegram/api.js"
 
 const config = () => new AppConfig({
@@ -386,5 +387,49 @@ describe("DurableExecutorStore", () => {
     if (result === undefined || Option.isNone(result)) return
     expect(result.value.job.mediaDeliveryIndex).toBe(0)
     expect(result.value.job.deliveredMediaCount).toBe(0)
+  })
+})
+
+describe("withChangesSummaryUsing", () => {
+  const summary: ChangesSummaryResult = {
+    kind: "summary",
+    summary: {
+      branch: Option.some("main"),
+      commit: Option.some("abc1234"),
+      files: [{ path: "src/a.ts", status: "M " }],
+      insertions: Option.some(1),
+      deletions: Option.some(0),
+      binaryFiles: 0,
+    },
+  }
+
+  test("appends the changes summary to the finalization", async () => {
+    const gitChanges: GitChangesService = { summarize: () => Effect.succeed(summary) }
+    const result = await Effect.runPromise(
+      withChangesSummaryUsing(gitChanges, { text: "Done.", media: [] }, "/tmp/project"),
+    )
+    expect(result.text).toContain("Current changes")
+    expect(result.text).toContain("M  src/a.ts")
+    expect(result.media).toEqual([])
+  })
+
+  test("keeps the text unchanged outside a git repository", async () => {
+    const gitChanges: GitChangesService = { summarize: () => Effect.succeed({ kind: "none" }) }
+    const result = await Effect.runPromise(
+      withChangesSummaryUsing(gitChanges, { text: "Done.", media: [] }, "/tmp/project"),
+    )
+    expect(result.text).toBe("Done.")
+  })
+
+  test("marks the summary unavailable instead of failing the run", async () => {
+    const gitChanges: GitChangesService = {
+      summarize: () => Effect.fail(
+        new GitChangesError({ operation: "status", directory: "/tmp/project", cause: new Error("boom") }),
+      ),
+    }
+    const result = await Effect.runPromise(
+      withChangesSummaryUsing(gitChanges, { text: "Done.", media: [] }, "/tmp/project"),
+    )
+    expect(result.text).toContain("Changes: unavailable.")
   })
 })
