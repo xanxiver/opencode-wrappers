@@ -1026,13 +1026,10 @@ export const runPrompt = (input: RunInput) =>
         // unrelated sessions. Track the run session and any request
         // (permission, question) whose session tree resolves to it.
         Stream.filterEffect((event) => {
-          const eventSessionID = event.type === "permission.asked"
-            ? event.data.sessionID
-            : event.type === "form.created"
-              ? event.data.form.sessionID
-              : isSessionEvent(input.sessionID)(event)
-                ? input.sessionID
-                : undefined
+          let eventSessionID: string | undefined
+          if (event.type === "permission.asked") eventSessionID = event.data.sessionID
+          else if (event.type === "form.created") eventSessionID = event.data.form.sessionID
+          else if (isSessionEvent(input.sessionID)(event)) eventSessionID = input.sessionID
           if (eventSessionID === undefined) return Effect.succeed(false)
           if (eventSessionID === input.sessionID) return Effect.succeed(true)
           return rootSessionID(opencode, eventSessionID).pipe(
