@@ -19,6 +19,32 @@ const bestEffortConfirmation = <A, R>(effect: Effect.Effect<A, unknown, R>, mess
   )
 
 /**
+ * A Telegram callback expires quickly. Acknowledge it before persistence,
+ * OpenCode requests, or message edits, then report any later failure in chat.
+ */
+const runAcknowledgedQuestionAction = <A, E, R>(
+  query: CallbackQuery,
+  acknowledgement: string,
+  action: Effect.Effect<A, E, R>,
+) => {
+  const message = query.message
+  if (message === undefined) return answer(query.id, "Invalid callback.")
+  return answer(query.id, acknowledgement).pipe(
+    Effect.andThen(action),
+    Effect.asVoid,
+    Effect.catchCause((cause) =>
+      logBoundary("telegram/handlers", "question-callback", "acknowledged question action failed")(cause).pipe(
+        Effect.andThen(sendText(
+          message.chat.id,
+          "The answer could not be recorded. Please try again.",
+          message.message_thread_id,
+        )),
+      ),
+    ),
+  )
+}
+
+/**
  * Record an answer for one question of a pending request.
  * When every question is answered, submit all answers to OpenCode,
  * remove the request and mark the question messages as answered.
@@ -120,16 +146,20 @@ export const handleQuestionCallback = (query: CallbackQuery, data: string) =>
               onSome: (questionOptions) => {
                 switch (parsed.choice.kind) {
                   case "skip":
-                    return recordQuestionAnswer(parsed.token, parsed.questionIndex, []).pipe(
-                      Effect.andThen(bestEffortConfirmation(answer(query.id, "Skipped."), "question skip acknowledgement failed")),
+                    return runAcknowledgedQuestionAction(
+                      query,
+                      "Skipped.",
+                      recordQuestionAnswer(parsed.token, parsed.questionIndex, []),
                     )
                   case "confirm": {
                     if (!(current.multiples[parsed.questionIndex] ?? false)) {
                       return answer(query.id, "Invalid action.")
                     }
                     const value = current.selections[parsed.questionIndex] ?? []
-                    return recordQuestionAnswer(parsed.token, parsed.questionIndex, value).pipe(
-                      Effect.andThen(bestEffortConfirmation(answer(query.id, "Answer recorded."), "question acknowledgement failed")),
+                    return runAcknowledgedQuestionAction(
+                      query,
+                      "Answer recorded.",
+                      recordQuestionAnswer(parsed.token, parsed.questionIndex, value),
                     )
                   }
                   case "option": {
@@ -139,37 +169,42 @@ export const handleQuestionCallback = (query: CallbackQuery, data: string) =>
                     )
                     if (label === "") return answer(query.id, "Invalid option.")
                     if (current.multiples[parsed.questionIndex] ?? false) {
-                      return Effect.gen(function* () {
-                        const updated = yield* registry.toggleSelection(
-                          parsed.token,
-                          parsed.questionIndex,
-                          label,
-                        )
-                        yield* Option.match(updated, {
-                          onNone: () => answer(query.id, "Expired."),
-                          onSome: (next) => {
-                            const messageId = next.messageIds[parsed.questionIndex]
-                            const selected = next.selections[parsed.questionIndex] ?? []
-                            const question = {
-                              header: "",
-                              question: next.questions[parsed.questionIndex] ?? "",
-                              options: questionOptions.map((item) => ({ label: item, description: "" })),
-                              custom: next.customs[parsed.questionIndex] ?? false,
-                              multiple: next.multiples[parsed.questionIndex] ?? false,
-                            }
-                            return bestEffortConfirmation(apiEdit(
-                              next.chatId,
-                              messageId,
-                              renderQuestionWithSelection(question, selected),
-                              questionKeyboard(parsed.token, parsed.questionIndex, question),
-                            ), "question selection edit failed")
-                          },
-                        })
-                        yield* bestEffortConfirmation(answer(query.id, "Selection updated."), "question selection acknowledgement failed")
-                      }).pipe(Effect.catchCause(callbackFailure(query, "question callback failed", "Failed.")))
+                      return runAcknowledgedQuestionAction(
+                        query,
+                        "Selection updated.",
+                        Effect.gen(function* () {
+                          const updated = yield* registry.toggleSelection(
+                            parsed.token,
+                            parsed.questionIndex,
+                            label,
+                          )
+                          yield* Option.match(updated, {
+                            onNone: () => Effect.void,
+                            onSome: (next) => {
+                              const messageId = next.messageIds[parsed.questionIndex]
+                              const selected = next.selections[parsed.questionIndex] ?? []
+                              const question = {
+                                header: "",
+                                question: next.questions[parsed.questionIndex] ?? "",
+                                options: questionOptions.map((item) => ({ label: item, description: "" })),
+                                custom: next.customs[parsed.questionIndex] ?? false,
+                                multiple: next.multiples[parsed.questionIndex] ?? false,
+                              }
+                              return bestEffortConfirmation(apiEdit(
+                                next.chatId,
+                                messageId,
+                                renderQuestionWithSelection(question, selected),
+                                questionKeyboard(parsed.token, parsed.questionIndex, question),
+                              ), "question selection edit failed")
+                            },
+                          })
+                        }),
+                      )
                     }
-                    return recordQuestionAnswer(parsed.token, parsed.questionIndex, [label]).pipe(
-                      Effect.andThen(bestEffortConfirmation(answer(query.id, "Answer recorded."), "question acknowledgement failed")),
+                    return runAcknowledgedQuestionAction(
+                      query,
+                      "Answer recorded.",
+                      recordQuestionAnswer(parsed.token, parsed.questionIndex, [label]),
                     )
                   }
                 }
