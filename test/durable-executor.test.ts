@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { Effect, Option } from "effect"
+import { Cause, Effect, Option } from "effect"
 import { TestClock } from "effect/testing"
 import { BunCrypto, BunFileSystem, BunPath } from "@effect/platform-bun"
 import { tmpdir } from "node:os"
@@ -16,8 +16,9 @@ import {
   type DurableExecutorRepository,
 } from "../src/core/durable-executor.js"
 import { GitChangesError, type ChangesSummaryResult, type GitChangesService } from "../src/core/git-changes.js"
-import { decodeAttachmentSnapshots, encodeAttachmentSnapshots, finalEditDisposition, redactedReviewEvidence, resolveOwnedDurableReview, runQueueItems, settleFinalEditError, withChangesSummaryUsing } from "../src/telegram/durable-executor.js"
+import { agentSwitchRetriesExhausted, decodeAttachmentSnapshots, encodeAttachmentSnapshots, finalEditDisposition, redactedReviewEvidence, resolveOwnedDurableReview, runQueueItems, settleFinalEditError, withChangesSummaryUsing } from "../src/telegram/durable-executor.js"
 import { ApiError } from "../src/telegram/api.js"
+import { AgentSwitchError } from "../src/telegram/run.js"
 
 const config = () => new AppConfig({
   telegramBotToken: "test-token",
@@ -479,5 +480,21 @@ describe("runQueueItems", () => {
       job({ id: "j1", state: "pending", payload: "not a telegram payload" }),
     ]))
     expect(items[0]?.text).toBe("")
+  })
+})
+
+describe("agent switch retries", () => {
+  const failure = Cause.fail(new AgentSwitchError({
+    agent: "removed-agent",
+    cause: Cause.fail(new Error("not found")),
+  }))
+
+  test("allows bounded retries before failing the queued job", () => {
+    expect(agentSwitchRetriesExhausted(failure, 2)).toBe(false)
+    expect(agentSwitchRetriesExhausted(failure, 3)).toBe(true)
+  })
+
+  test("does not classify unrelated pending failures as agent exhaustion", () => {
+    expect(agentSwitchRetriesExhausted(Cause.fail(new Error("network")), 3)).toBe(false)
   })
 })
