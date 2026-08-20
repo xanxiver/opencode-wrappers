@@ -4,15 +4,17 @@ import { Session } from "@opencode-ai/client/effect"
 import { OpenCodeError, rootSessionID } from "../src/core/opencode.js"
 import { sessionRequestMatchesRoute } from "../src/telegram/run.js"
 
-const sessionInfo = (id: string, parentID?: string) => Schema.decodeUnknownSync(Session.Info)({
-  id,
-  ...(parentID === undefined ? {} : { parentID }),
-  projectID: "project",
-  location: { directory: "/tmp/project" },
-  cost: 0,
-  tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
-  time: { created: 1, updated: 1 },
-})
+const sessionInfo = (id: string, parentID?: string) => {
+  const base = {
+    id,
+    projectID: "project",
+    location: { directory: "/tmp/project" },
+    cost: 0,
+    tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+    time: { created: 1, updated: 1 },
+  }
+  return Schema.decodeUnknownSync(Session.Info)(parentID === undefined ? base : { ...base, parentID })
+}
 
 type SessionRow = readonly { readonly id: string; readonly parentID?: string }[]
 

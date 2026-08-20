@@ -381,7 +381,11 @@ export const CHANGES_MAX_FILES = 8
 /** Soft size budget for the changes block; far below Telegram's limit. */
 export const CHANGES_BLOCK_LIMIT = 800
 
-const sanitizeFileName = (path: string): string => path.replace(/[\u0000-\u001f\u007f]/g, "?")
+const sanitizeFileName = (path: string): string =>
+  Array.from(path, (char) => {
+    const code = char.charCodeAt(0)
+    return code < 32 || code === 127 ? "?" : char
+  }).join("")
 
 /**
  * Render the working-tree changes block. The summary is a snapshot of the
