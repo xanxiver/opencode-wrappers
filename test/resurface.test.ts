@@ -142,15 +142,17 @@ describe("pending interaction reconciliation", () => {
 })
 
 describe("child session reconciliation", () => {
-  const sessionInfo = (id: string, parentID?: string) => Schema.decodeUnknownSync(Session.Info)({
-    id,
-    ...(parentID === undefined ? {} : { parentID }),
-    projectID: "project",
-    location: { directory: "/work" },
-    cost: 0,
-    tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
-    time: { created: 1, updated: 1 },
-  })
+  const sessionInfo = (id: string, parentID?: string) => {
+    const base = {
+      id,
+      projectID: "project",
+      location: { directory: "/work" },
+      cost: 0,
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      time: { created: 1, updated: 1 },
+    }
+    return Schema.decodeUnknownSync(Session.Info)(parentID === undefined ? base : { ...base, parentID })
+  }
 
   /** Build a session tree where each key has the listed parent (undefined = root). */
   const treeOpenCode = (
