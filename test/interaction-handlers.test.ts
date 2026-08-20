@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { Effect, Layer, Option, Ref, Stream } from "effect"
+import { Deferred, Effect, Fiber, Layer, Option, Ref, Stream } from "effect"
 import { FetchHttpClient } from "effect/unstable/http"
 import { OpenCode, type OpenCodeService } from "../src/core/opencode.js"
 import { TelegramApi, type CallbackQuery, type TelegramApiClient } from "../src/telegram/api.js"
@@ -128,5 +128,61 @@ describe("interaction callback claim fencing", () => {
     ))
     const update = await Effect.runPromise(Ref.get(edited))
     expect(update?.replyMarkup?.inline_keyboard.flat().some((button) => button.text === "Confirm")).toBe(true)
+  })
+
+  test("acknowledges a completed multi-question callback before submitting it to OpenCode", async () => {
+    await Effect.runPromise(Effect.gen(function* () {
+      const registry = yield* QuestionRegistry
+      const order = yield* Ref.make<readonly string[]>([])
+      const replyStarted = yield* Deferred.make<void>()
+      const releaseReply = yield* Deferred.make<void>()
+      const permissionCalls = yield* Ref.make(0)
+      const questionCalls = yield* Ref.make(0)
+      const token = yield* registry.register({
+        sessionID: "ses_1",
+        requestID: "que_multi_complete",
+        chatId: 7,
+        questions: ["Continue?", "Choose"],
+        options: [["Yes"], ["One", "Two"]],
+        customs: [false, false],
+        multiples: [false, true],
+      })
+      yield* registry.attachMessageId(token, 0, 10)
+      yield* registry.attachMessageId(token, 1, 11)
+      yield* registry.answer(token, 0, ["Yes"])
+      yield* registry.toggleSelection(token, 1, "One")
+
+      const api: TelegramApiClient = {
+        ...telegramApi,
+        answerCallbackQuery: () => Ref.update(order, (events) => [...events, "acknowledged"]).pipe(Effect.as(true)),
+        editMessageText: (input) => Effect.succeed({ message_id: input.messageId, chat: { id: input.chatId } }),
+      }
+      const client: OpenCodeService = {
+        ...openCode(permissionCalls, questionCalls),
+        replyQuestion: () => Ref.update(order, (events) => [...events, "submitted"]).pipe(
+          Effect.andThen(Deferred.succeed(replyStarted, undefined)),
+          Effect.andThen(Deferred.await(releaseReply)),
+        ),
+      }
+      const query: CallbackQuery = {
+        id: "callback-multi-complete",
+        from: { id: 7 },
+        message: { message_id: 11, chat: { id: 7 } },
+      }
+      const fiber = yield* handleQuestionCallback(query, `q:${token}:1:confirm`).pipe(
+        Effect.provide(Layer.succeed(TelegramApi, api)),
+        Effect.provide(Layer.succeed(OpenCode, client)),
+        Effect.provide(FetchHttpClient.layer),
+        Effect.forkChild,
+      )
+
+      yield* Deferred.await(replyStarted)
+      expect(yield* Ref.get(order)).toEqual(["acknowledged", "submitted"])
+      yield* Deferred.succeed(releaseReply, undefined)
+      yield* Fiber.join(fiber)
+    }).pipe(
+      Effect.provide(QuestionRegistryLive),
+      Effect.provide(InteractionStoreMemory),
+    ))
   })
 })
