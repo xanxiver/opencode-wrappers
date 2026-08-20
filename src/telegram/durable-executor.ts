@@ -21,7 +21,7 @@ import { Store, type StoreError } from "../core/store.js"
 import { AttachmentDownloadError, collectAttachments, FileValidationError } from "./files.js"
 import { sendText } from "./handlers/shared.js"
 import { conversationId } from "./conversation.js"
-import { limitMedia, recoveredResponseFromHistory, runPrompt, type RunFinalization } from "./run.js"
+import { AgentSwitchError, limitMedia, recoveredResponseFromHistory, runPrompt, type RunFinalization } from "./run.js"
 import { MessageSchema, TelegramApi, type ApiError, type Message } from "./api.js"
 import { PermissionRegistry } from "./permissions.js"
 import { QuestionRegistry } from "./questions.js"
@@ -48,6 +48,7 @@ const TelegramJobPayload = Schema.Struct({
     providerID: Schema.String,
     variant: Schema.optional(Schema.String),
   })),
+  agent: Schema.optional(Schema.String),
 })
 type TelegramJobPayload = Schema.Schema.Type<typeof TelegramJobPayload>
 
@@ -93,7 +94,7 @@ const decodeFinalization = (value: string): Effect.Effect<PersistedFinalization,
   )
 
 export interface TelegramDurableExecutorService {
-  readonly submit: (chatId: number, message: Message, text: string) => Effect.Effect<void, DurableExecutorError | SessionsError | StoreError | AttachmentDownloadError>
+  readonly submit: (chatId: number, message: Message, text: string, agent?: string) => Effect.Effect<void, DurableExecutorError | SessionsError | StoreError | AttachmentDownloadError>
   readonly reconnect: (chatId: number, message: Message, force: boolean) => Effect.Effect<void, DurableExecutorError | InteractionStoreError | OpenCodeError | SessionsError | StoreError>
   readonly listReviews: (chatId: number, threadId?: number) => Effect.Effect<void, DurableExecutorError | SessionsError | InteractionStoreError>
   readonly resolveReview: (chatId: number, reviewID: string, threadId?: number) => Effect.Effect<void, DurableExecutorError | SessionsError | InteractionStoreError>
@@ -113,6 +114,11 @@ const ownerFor = (sessionID: string): string => `session:${sessionID}`
 
 /** Job states that occupy the run pipeline and are not yet terminal. */
 export const RUN_PIPELINE_STATES: readonly DurableJobState[] = ["pending", "dispatching", "running", "finalizing"]
+
+export const agentSwitchRetriesExhausted = (cause: Cause.Cause<unknown>, attempt: number): boolean =>
+  attempt >= 3 && Cause.findErrorOption(cause).pipe(
+    Option.exists((error) => error instanceof AgentSwitchError),
+  )
 
 /**
  * Build read-only queue items from the run-pipeline jobs of a session, in
@@ -408,6 +414,7 @@ export const TelegramDurableExecutorLive: Layer.Layer<
           files,
           threadId: payload.threadId,
           model: payload.model,
+          agent: payload.agent,
           reconnect,
           inputID: lease.job.inputID,
           progressMessageID: lease.job.progressMessageID,
@@ -461,6 +468,24 @@ export const TelegramDurableExecutorLive: Layer.Layer<
                             true,
                           )
                         }
+                        if (agentSwitchRetriesExhausted(cause, current.attempt)) {
+                          return jobs.fail(
+                            lease.job.id,
+                            lease.generation,
+                            Cause.pretty(cause),
+                          ).pipe(Effect.andThen(
+                            decodePayload(lease.job).pipe(
+                              Effect.flatMap((payload) => sendText(
+                                payload.chatId,
+                                "The selected agent is unavailable. The prompt was not run.",
+                                payload.threadId,
+                              )),
+                              Effect.catchCause((notificationCause) =>
+                                logBoundary("telegram/executor", "telegram-notification", "agent failure notification failed")(notificationCause)
+                              ),
+                            ),
+                          ))
+                        }
                         return jobs.retry(lease.job.id, lease.generation, Cause.pretty(cause), delay)
                       }
                       if (current.state !== "dispatching" && current.state !== "running") return Effect.void
@@ -504,7 +529,7 @@ export const TelegramDurableExecutorLive: Layer.Layer<
     ))
 
     return {
-      submit: (chatId: number, message: Message, text: string) => Effect.gen(function* () {
+      submit: (chatId: number, message: Message, text: string, agent?: string) => Effect.gen(function* () {
         const attachments = yield* collectAttachments(message).pipe(
           Effect.map(Option.some),
           Effect.catchTags({
@@ -533,6 +558,7 @@ export const TelegramDurableExecutorLive: Layer.Layer<
         }
         if (message.message_thread_id !== undefined) Object.assign(payload, { threadId: message.message_thread_id })
         if (model !== undefined) Object.assign(payload, { model })
+        if (agent !== undefined) Object.assign(payload, { agent })
         const submitted = yield* jobs.submit({
            sourceKey: `telegram:${conversation}:${message.message_id}`,
           channel: "telegram",

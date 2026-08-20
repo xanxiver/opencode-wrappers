@@ -1,11 +1,12 @@
 import { Effect, Option } from "effect"
-import { normalizeCommand, parsePromptCommand, promptWithReply } from "../render.js"
+import { normalizeCommand, parseAgentPromptCommand, parsePromptCommand, promptWithReply } from "../render.js"
 import type { Message } from "../api.js"
 import { HELP_TEXT, sendText } from "./shared.js"
 import { answerRepliedQuestion } from "./question.js"
 import { runWithFiles } from "./run.js"
 import { selectExactModel, showModels } from "./model.js"
 import { showProjects, showSessions } from "./picker.js"
+import { promptWithAgent, showAgents } from "./agent.js"
 import { compactSession, listDurableReviews, listRunQueue, reconnectRun, resetSession, resolveDurableReview, setProjectDirectory, setSessionById, showStatus, stopRun } from "./run.js"
 
 type ParsedCommand = {
@@ -78,6 +79,25 @@ export const handleMessage = (message: Message) =>
       case "/model":
         yield* selectExactModel(chatId, command.argument, threadId)
         return
+      case "/agents":
+        if (command.hasArgument) break
+        yield* showAgents(chatId, threadId)
+        return
+      case "/pwa": {
+        const parsed = parseAgentPromptCommand(text)
+        if (Option.isNone(parsed)) {
+          yield* sendText(chatId, "Usage: /pwa <agent> <prompt>", threadId)
+          return
+        }
+        const repliedText = replied === undefined ? undefined : replied.text ?? replied.caption
+        yield* promptWithAgent(
+          chatId,
+          message,
+          parsed.value.agent,
+          promptWithReply(parsed.value.prompt, repliedText),
+        )
+        return
+      }
       case "/status":
         if (command.hasArgument) break
         yield* showStatus(chatId, threadId)

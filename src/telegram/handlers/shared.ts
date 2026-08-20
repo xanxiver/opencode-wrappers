@@ -38,6 +38,8 @@ export const HELP_TEXT = [
   "Models and sessions",
   "/models [query] — choose provider, model, and variant",
   "/model <exact-model> — switch directly to an exact model",
+  "/agents — list and select an agent for the current session",
+  "/pwa <agent> <prompt> — run a prompt with a specific agent",
   "/status — show the directory, session, and model",
   "/reviews — list ambiguous durable jobs for the current session",
   "/resolve_review <job-id> — resolve a durable review and remove retained data",
