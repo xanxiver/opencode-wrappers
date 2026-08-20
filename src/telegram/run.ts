@@ -1,4 +1,4 @@
-import { Cause, Deferred, Duration, Effect, Exit, FileSystem, Fiber, Option, Path, Ref, Schedule, Schema, Stream } from "effect"
+import { Cause, Data, Deferred, Duration, Effect, Exit, FileSystem, Fiber, Option, Path, Ref, Schedule, Schema, Stream } from "effect"
 import { Buffer } from "node:buffer"
 import type { HttpClient } from "effect/unstable/http"
 import type { OpenCodeEvent } from "@opencode-ai/protocol/groups/event"
@@ -32,6 +32,8 @@ export interface RunInput {
   readonly threadId?: number
   /** The model to (re-)apply before prompting, from the per-directory memory. */
   readonly model?: { readonly id: string; readonly providerID: string; readonly variant?: string }
+  /** The agent to apply immediately before this prompt. */
+  readonly agent?: string
   /** Attach to an already running session instead of starting a new prompt. */
   readonly reconnect?: boolean
   /** Accepted OpenCode input used to select only this run's final response. */
@@ -51,6 +53,11 @@ export interface RunInput {
   /** Persist the canonical result before Telegram finalization. */
   readonly onFinalizing?: (result: RunFinalization) => Effect.Effect<void, DurableExecutorError | DurableLeaseLost>
 }
+
+export class AgentSwitchError extends Data.TaggedError("AgentSwitchError")<{
+  readonly agent: string
+  readonly cause: Cause.Cause<unknown>
+}> {}
 
 /** Default max run time; set TELEGRAM_RUN_TIMEOUT=none to disable it. */
 export const RUN_TIMEOUT = Duration.minutes(10)
@@ -1013,6 +1020,16 @@ export const runPrompt = (input: RunInput) =>
             sessionID: input.sessionID,
             model: input.model,
           }).pipe(Effect.catchCause(logOpenCodeFailure("re-apply model failed")))
+        }
+        if (input.agent !== undefined) {
+          yield* opencode.switchAgent({
+            sessionID: input.sessionID,
+            agent: input.agent,
+          }).pipe(Effect.catchCause((cause) =>
+            logOpenCodeFailure("apply agent failed")(cause).pipe(
+              Effect.andThen(Effect.fail(new AgentSwitchError({ agent: input.agent ?? "", cause }))),
+            ),
+          ))
         }
       }
       const eventStream = opencode.events().pipe(

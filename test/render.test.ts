@@ -9,9 +9,13 @@ import {
   MAX_MESSAGE_LENGTH,
   MODEL_PAGE_SIZE,
   REASONING_DISPLAY_LIMIT,
+  agentKeyboard,
   modelPageKeyboard,
   modelProviderKeyboard,
   normalizeCommand,
+  parseAgentCallback,
+  parseAgentCancelCallback,
+  parseAgentPromptCommand,
   parseModelCallback,
   parseModelPageCallback,
   parseModelProviderCallback,
@@ -94,6 +98,38 @@ describe("parsePromptCommand", () => {
     expect(parsePromptCommand("/model")).toEqual(Option.none())
     expect(parsePromptCommand("/promptx")).toEqual(Option.none())
     expect(parsePromptCommand("/prompt@bot")).toEqual(Option.none())
+  })
+})
+
+describe("agent commands", () => {
+  test("parses an agent and prompt", () => {
+    expect(parseAgentPromptCommand("/pwa build fix the queue")).toEqual(
+      Option.some({ agent: "build", prompt: "fix the queue" }),
+    )
+    expect(parseAgentPromptCommand("/pwa  build   fix the queue  ")).toEqual(
+      Option.some({ agent: "build", prompt: "fix the queue" }),
+    )
+  })
+
+  test("rejects incomplete agent prompts", () => {
+    expect(parseAgentPromptCommand("/pwa")).toEqual(Option.none())
+    expect(parseAgentPromptCommand("/pwa build")).toEqual(Option.none())
+    expect(parseAgentPromptCommand("/prompt build task")).toEqual(Option.none())
+  })
+
+  test("parses picker callbacks and renders compact buttons", () => {
+    expect(parseAgentCallback("agent:4:1")).toEqual(Option.some({ token: 4, index: 1 }))
+    expect(parseAgentCallback("agent:0:1")).toEqual(Option.none())
+    expect(parseAgentCancelCallback("agentc:4")).toEqual(Option.some(4))
+    expect(agentKeyboard(4, [{ name: "Build" }, { name: "Plan" }])).toEqual({
+      inline_keyboard: [
+        [
+          { text: "Build", callback_data: "agent:4:0" },
+          { text: "Plan", callback_data: "agent:4:1" },
+        ],
+        [{ text: "Cancel", callback_data: "agentc:4" }],
+      ],
+    })
   })
 })
 

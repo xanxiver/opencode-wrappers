@@ -22,6 +22,19 @@ export const parsePromptCommand = (text: string | undefined): Option.Option<stri
   return Option.none()
 }
 
+/** Parse `/pwa <agent> <prompt>` without allowing an empty agent or prompt. */
+export const parseAgentPromptCommand = (
+  text: string | undefined,
+): Option.Option<{ readonly agent: string; readonly prompt: string }> => {
+  if (text === undefined || !text.startsWith("/pwa ")) return Option.none()
+  const argument = text.slice("/pwa ".length).trim()
+  const separator = argument.indexOf(" ")
+  if (separator <= 0) return Option.none()
+  const agent = argument.slice(0, separator).trim()
+  const prompt = argument.slice(separator + 1).trim()
+  return agent.length === 0 || prompt.length === 0 ? Option.none() : Option.some({ agent, prompt })
+}
+
 /** Include the replied message as context for a prompt reply. */
 export const promptWithReply = (prompt: string, repliedText: string | undefined): string => {
   const context = repliedText?.trim() ?? ""
@@ -222,6 +235,37 @@ export const modelProviderKeyboard = (
     [{ text: "Cancel", callback_data: `modelc:${token}` }],
   ],
 })
+
+export const agentKeyboard = (
+  token: number,
+  agents: readonly { readonly name: string }[],
+) => ({
+  inline_keyboard: [
+    ...chunkButtons(agents.map((agent, index) => ({
+      text: agent.name,
+      callback_data: `agent:${token}:${index}`,
+    })), 2),
+    [{ text: "Cancel", callback_data: `agentc:${token}` }],
+  ],
+})
+
+export const parseAgentCallback = (
+  data: string,
+): Option.Option<{ readonly token: number; readonly index: number }> => {
+  const parts = data.split(":")
+  if (parts.length !== 3 || parts[0] !== "agent") return Option.none()
+  const token = Number(parts[1])
+  const index = Number(parts[2])
+  if (!Number.isInteger(token) || token <= 0 || !Number.isInteger(index) || index < 0) return Option.none()
+  return Option.some({ token, index })
+}
+
+export const parseAgentCancelCallback = (data: string): Option.Option<number> => {
+  const parts = data.split(":")
+  if (parts.length !== 2 || parts[0] !== "agentc") return Option.none()
+  const token = Number(parts[1])
+  return Number.isInteger(token) && token > 0 ? Option.some(token) : Option.none()
+}
 
 const chunkButtons = <A>(items: readonly A[], size: number): A[][] => {
   const result: A[][] = []

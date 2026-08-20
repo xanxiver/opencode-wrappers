@@ -23,6 +23,8 @@ The bot lives in `src/` and `test/` at the repository root. The core
   repository. The summary is a snapshot of the current tree, not an attribution
   of the listed changes to one run.
 - `/model`: paginated model picker (10 per page, Previous/Next).
+- `/agents`: list and select a primary agent for the current session.
+- `/pwa <agent> <prompt>`: run a prompt with an exact agent ID or name.
 - `/compact`: compact the current session.
 - `/reconnect`: report automatic recovery or durably attach to an active
   OpenCode run that has no worker.
@@ -35,7 +37,7 @@ The bot lives in `src/` and `test/` at the repository root. The core
 - `/queue`: show the durable run pipeline for the current session (starting,
   running, finishing, and queued runs with their prompts), read-only.
 - Commands: `/start`, `/help`, `/prompt`, `/new`, `/stop`, `/reconnect`, `/forceReconnect`,
-  `/compact`, `/review`, `/model`, `/status`, `/whoami`, `/projects`, `/project <path>`,
+  `/compact`, `/review`, `/model`, `/agents`, `/pwa <agent> <prompt>`, `/status`, `/whoami`, `/projects`, `/project <path>`,
   `/sessions`, `/queue`.
 - User whitelist via `TELEGRAM_ALLOWED_USERS` (empty = deny all).
 

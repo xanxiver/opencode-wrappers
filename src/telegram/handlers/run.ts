@@ -13,10 +13,10 @@ const logHandlerFailure = (chatId: number, threadId: number | undefined, message
     Effect.andThen(sendText(chatId, "The durable review operation failed.", threadId)),
   )
 
-export const runWithFiles = (chatId: number, message: Message, text: string) =>
+export const runWithFiles = (chatId: number, message: Message, text: string, agent?: string) =>
   Effect.gen(function* () {
     const executor = yield* TelegramDurableExecutor
-    yield* executor.submit(chatId, message, text)
+    yield* executor.submit(chatId, message, text, agent)
   })
 
 export const setProjectDirectory = (chatId: number, directory: string, threadId?: number, notify = true) =>

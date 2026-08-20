@@ -16,6 +16,7 @@ import { Live as ModelRegistryLive } from "./models.js"
 import { Live as PermissionsLive } from "./permissions.js"
 import { Live as PickersLive } from "./pickers.js"
 import { Live as QuestionRegistryLive } from "./questions.js"
+import { Live as AgentRegistryLive } from "./agents.js"
 import { resurfacePending } from "./resurface.js"
 
 const program = Effect.gen(function* () {
@@ -42,6 +43,7 @@ const app = program.pipe(
   Effect.provide(ModelRegistryLive),
   Effect.provide(PermissionsLive),
   Effect.provide(QuestionRegistryLive),
+  Effect.provide(AgentRegistryLive),
   Effect.provide(PickersLive),
   Effect.provide(InteractionStoreLive),
   Effect.provide(DurableExecutorStoreLive),

@@ -8,6 +8,7 @@ import type { ModelRegistry } from "../models.js"
 import type { PermissionRegistry } from "../permissions.js"
 import type { Pickers } from "../pickers.js"
 import type { QuestionRegistry } from "../questions.js"
+import type { AgentRegistry } from "../agents.js"
 import { answer } from "./shared.js"
 import { handlePermissionCallback } from "./permission.js"
 import {
@@ -18,6 +19,7 @@ import {
   handleModelVariantCallback,
 } from "./model.js"
 import { handleQuestionCallback } from "./question.js"
+import { handleAgentCallback, handleAgentCancelCallback } from "./agent.js"
 import {
   handleDirectoryCallback,
   handleDirectoryCancelCallback,
@@ -38,6 +40,7 @@ type CallbackEnv =
   | PermissionRegistry
   | Pickers
   | QuestionRegistry
+  | AgentRegistry
 
 export const handleCallback = (query: CallbackQuery): Effect.Effect<void, never, CallbackEnv> =>
   Option.match(Option.fromNullishOr(query.data), {
@@ -45,6 +48,10 @@ export const handleCallback = (query: CallbackQuery): Effect.Effect<void, never,
     onSome: (data) => {
       const [prefix] = data.split(":")
       switch (prefix) {
+        case "agent":
+          return handleAgentCallback(query, data)
+        case "agentc":
+          return handleAgentCancelCallback(query, data)
         case "perm":
           return handlePermissionCallback(query, data)
         case "model":
