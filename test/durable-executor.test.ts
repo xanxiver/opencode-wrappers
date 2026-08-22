@@ -585,8 +585,12 @@ describe("decideAutoContinue", () => {
     }
   })
 
-  test("reports the limit once reached and ignores disabled mode", () => {
-    expect(decideAutoContinue(true, 3, "failed")).toEqual({ action: "limit" })
+  test("gives up at the cap, clearing the counter without continuing", () => {
+    expect(decideAutoContinue(true, 3, "failed")).toEqual({ action: "giveup" })
+    expect(decideAutoContinue(true, 5, "timeout")).toEqual({ action: "giveup" })
+  })
+
+  test("ignores disabled mode but cleans a stale counter", () => {
     expect(decideAutoContinue(false, 1, "failed")).toEqual({ action: "reset" })
     expect(decideAutoContinue(false, 0, "failed")).toEqual({ action: "none" })
   })
@@ -594,6 +598,18 @@ describe("decideAutoContinue", () => {
   test("ignores outcomes that are not failures", () => {
     expect(decideAutoContinue(true, 0, "interrupted")).toEqual({ action: "none" })
     expect(decideAutoContinue(true, 0, undefined)).toEqual({ action: "none" })
+  })
+
+  test("a failing chain continues three times then gives up with a cleared counter", () => {
+    let count = 0
+    const actions = ["failed", "failed", "failed", "failed"].map((outcome) => {
+      const decision = decideAutoContinue(true, count, outcome)
+      if (decision.action === "continue") count = decision.round
+      if (decision.action === "giveup") count = 0
+      return decision.action
+    })
+    expect(actions).toEqual(["continue", "continue", "continue", "giveup"])
+    expect(count).toBe(0)
   })
 })
 
