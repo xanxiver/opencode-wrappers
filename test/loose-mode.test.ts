@@ -4,6 +4,7 @@ import { FetchHttpClient } from "effect/unstable/http"
 import { OpenCode, OpenCodeError, type OpenCodeService } from "../src/core/opencode.js"
 import { Sessions, type SessionsService } from "../src/core/sessions.js"
 import { Store, type StoreService } from "../src/core/store.js"
+import { GitChanges, type GitChangesService } from "../src/core/git-changes.js"
 import type { Message, TelegramApiClient } from "../src/telegram/api.js"
 import { TelegramApi } from "../src/telegram/api.js"
 import { Live as AgentRegistryLive } from "../src/telegram/agents.js"
@@ -49,6 +50,10 @@ const sessions: SessionsService = {
   reset: () => Effect.void,
   directoryFor: () => Effect.succeed("/work"),
   setDirectory: () => Effect.void,
+}
+
+const gitChangesStub: GitChangesService = {
+  summarize: () => Effect.succeed({ kind: "none" }),
 }
 
 const telegram = (sent: Ref.Ref<readonly string[]>): TelegramApiClient => ({
@@ -107,6 +112,7 @@ describe("loose prompt mode", () => {
         Effect.provide(Layer.succeed(OpenCode, openCode)),
         Effect.provide(Layer.succeed(Sessions, sessions)),
         Effect.provide(Layer.succeed(Store, store)),
+        Effect.provide(Layer.succeed(GitChanges, gitChangesStub)),
         Effect.provide(ModelRegistryLive),
         Effect.provide(PickersLive),
         Effect.provide(AgentRegistryLive),
