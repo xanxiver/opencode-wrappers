@@ -46,7 +46,9 @@ The bot lives in `src/` and `test/` at the repository root. The core
   Slash commands still run first. The setting is stored per conversation.
 - `/continue on|off`: when on, a failed, errored, or timed-out run sends a
   `continue` prompt into the same session automatically. Max 3 consecutive
-  continues; any success resets the count. Stored per conversation.
+  continues; any success resets the count. After giving up at the cap the
+  count clears, so a later failure starts a fresh cycle. Stored per
+  conversation.
 - Commands: `/start`, `/help`, `/prompt`, `/new`, `/stop`, `/reconnect`, `/forceReconnect`,
   `/compact`, `/review`, `/model`, `/agents`, `/pwa <agent> <prompt>`, `/status`, `/whoami`, `/projects`, `/project <path>`,
   `/sessions`, `/queue`, `/move <from> <to>`, `/queue_delete <pos>`, `/queue_clear`,
