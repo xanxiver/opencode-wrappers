@@ -48,7 +48,7 @@ export const HELP_TEXT = [
   "/queue_delete <pos> - remove one queued task",
   "/queue_clear - remove every queued task",
   "/loose on|off - plain messages start runs when on",
-  "/continue on|off - failed runs auto-send continue (max 3)",
+  "/continue on|off - failed runs auto-send continue (max 5)",
   "/sessions — list and switch sessions in this directory",
   "/session <id> — set the active session by ID",
   "",

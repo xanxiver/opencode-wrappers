@@ -16,7 +16,7 @@ import {
   type DurableExecutorRepository,
 } from "../src/core/durable-executor.js"
 import { GitChangesError, type ChangesSummaryResult, type GitChangesService } from "../src/core/git-changes.js"
-import { agentSwitchRetriesExhausted, decideAutoContinue, decodeAttachmentSnapshots, encodeAttachmentSnapshots, finalEditDisposition, finishNotificationWord, redactedReviewEvidence, resolveOwnedDurableReview, runQueueItems, settleFinalEditError, withChangesSummaryUsing } from "../src/telegram/durable-executor.js"
+import { AUTO_CONTINUE_BASE_DELAY_MS, AUTO_CONTINUE_MAX_DELAY_MS, agentSwitchRetriesExhausted, decideAutoContinue, decodeAttachmentSnapshots, encodeAttachmentSnapshots, autoContinueDelayMs, finalEditDisposition, finishNotificationWord, redactedReviewEvidence, resolveOwnedDurableReview, runQueueItems, settleFinalEditError, withChangesSummaryUsing } from "../src/telegram/durable-executor.js"
 import { ApiError } from "../src/telegram/api.js"
 import { AgentSwitchError } from "../src/telegram/run.js"
 
@@ -581,13 +581,13 @@ describe("decideAutoContinue", () => {
   test("continues on qualifying failures while under the cap", () => {
     for (const outcome of ["failed", "error", "timeout"]) {
       expect(decideAutoContinue(true, 0, outcome)).toEqual({ action: "continue", round: 1 })
-      expect(decideAutoContinue(true, 2, outcome)).toEqual({ action: "continue", round: 3 })
+      expect(decideAutoContinue(true, 4, outcome)).toEqual({ action: "continue", round: 5 })
     }
   })
 
   test("gives up at the cap, clearing the counter without continuing", () => {
-    expect(decideAutoContinue(true, 3, "failed")).toEqual({ action: "giveup" })
-    expect(decideAutoContinue(true, 5, "timeout")).toEqual({ action: "giveup" })
+    expect(decideAutoContinue(true, 5, "failed")).toEqual({ action: "giveup" })
+    expect(decideAutoContinue(true, 7, "timeout")).toEqual({ action: "giveup" })
   })
 
   test("ignores disabled mode but cleans a stale counter", () => {
@@ -600,16 +600,38 @@ describe("decideAutoContinue", () => {
     expect(decideAutoContinue(true, 0, undefined)).toEqual({ action: "none" })
   })
 
-  test("a failing chain continues three times then gives up with a cleared counter", () => {
+  test("a failing chain continues five times then gives up with a cleared counter", () => {
     let count = 0
-    const actions = ["failed", "failed", "failed", "failed"].map((outcome) => {
+    const actions = ["failed", "failed", "failed", "failed", "failed", "failed"].map((outcome) => {
       const decision = decideAutoContinue(true, count, outcome)
       if (decision.action === "continue") count = decision.round
       if (decision.action === "giveup") count = 0
       return decision.action
     })
-    expect(actions).toEqual(["continue", "continue", "continue", "giveup"])
+    expect(actions).toEqual(["continue", "continue", "continue", "continue", "continue", "giveup"])
     expect(count).toBe(0)
+  })
+})
+
+describe("autoContinueDelayMs", () => {
+  test("scales exponentially per round within the jitter band", () => {
+    // Full jitter: rand=0 -> half the window; rand≈1 -> the full window.
+    expect(autoContinueDelayMs(1, 0)).toBe(15_000)
+    expect(autoContinueDelayMs(1, 0.999)).toBeLessThan(30_000)
+    expect(autoContinueDelayMs(2, 0)).toBe(30_000)
+    expect(autoContinueDelayMs(3, 0)).toBe(60_000)
+    expect(autoContinueDelayMs(5, 0)).toBe(240_000)
+  })
+
+  test("stays inside the jitter band for any draw", () => {
+    for (let round = 1; round <= 5; round += 1) {
+      const low = (AUTO_CONTINUE_BASE_DELAY_MS * 2 ** Math.min(round - 1, 4)) / 2
+      const high = Math.min(AUTO_CONTINUE_MAX_DELAY_MS, low * 2)
+      const sample = autoContinueDelayMs(round, 0.42)
+      expect(sample).toBeGreaterThanOrEqual(low)
+      expect(sample).toBeLessThanOrEqual(high)
+    }
+    expect(autoContinueDelayMs(9, 0.999)).toBeLessThanOrEqual(AUTO_CONTINUE_MAX_DELAY_MS)
   })
 })
 

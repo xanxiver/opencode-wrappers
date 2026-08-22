@@ -57,6 +57,8 @@ export interface DurableExecutorRepository {
     readonly owner: string
     readonly payload: string
     readonly sessionID?: string
+    /** Earliest claim time for the job; defaults to now. */
+    readonly availableAt?: number
   }) => Effect.Effect<{ readonly job: DurableJob; readonly created: boolean }, DurableExecutorError>
   readonly claimNext: (channel: string) => Effect.Effect<Option.Option<DurableJobLease>, DurableExecutorError>
   readonly forceClaim: (
@@ -288,7 +290,7 @@ export const DurableExecutorStoreLive: Layer.Layer<
             input.channel,
             input.owner,
             input.payload,
-            now,
+            input.availableAt ?? now,
             input.sessionID ?? null,
             now,
             now,
