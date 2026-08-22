@@ -3,7 +3,7 @@ import { unlink } from "node:fs/promises"
 import { Effect, Option } from "effect"
 import { BunFileSystem, BunPath } from "@effect/platform-bun"
 import type { ChangesSummary } from "../src/core/git-changes.js"
-import { EDIT_MIN_INTERVAL_GROUP_MS, EDIT_MIN_INTERVAL_MS, editDelay, editIntervalFor } from "../src/telegram/api.js"
+import { EDIT_MAX_INTERVAL_MS, EDIT_MIN_INTERVAL_GROUP_MS, EDIT_MIN_INTERVAL_MS, editBaseInterval, editDelay, penalizeEditInterval, relaxEditInterval } from "../src/telegram/api.js"
 import { MAX_RECOVERY_MESSAGE_PAGES, assistantResponseForInput, detectSupportedMediaMime, matchesSessionRoute, mediaFromResponseText, nextProgressEdit, recoveredResponseForInput, recoveredResponseFromPages } from "../src/telegram/run.js"
 import {
   MAX_MESSAGE_LENGTH,
@@ -490,12 +490,25 @@ describe("editDelay", () => {
   test("paces group chats with the wider interval", () => {
     const now = Date.now()
     expect(editDelay(GROUP_CHAT, now - 400, now)).toBe(EDIT_MIN_INTERVAL_GROUP_MS - 400)
-    expect(editIntervalFor(GROUP_CHAT)).toBeGreaterThan(editIntervalFor(DM_CHAT))
+    expect(editBaseInterval(GROUP_CHAT)).toBeGreaterThan(editBaseInterval(DM_CHAT))
   })
 
   test("allows edits after the interval has passed", () => {
     const now = Date.now()
     expect(editDelay(DM_CHAT, now - EDIT_MIN_INTERVAL_MS - 100, now)).toBe(0)
+  })
+
+  test("widens the interval on flood and caps it", () => {
+    const base = EDIT_MIN_INTERVAL_GROUP_MS
+    expect(penalizeEditInterval(base, base, undefined)).toBe(base * 2)
+    expect(penalizeEditInterval(base, base, 9000)).toBe(9000)
+    expect(penalizeEditInterval(base, 12000, 500)).toBe(EDIT_MAX_INTERVAL_MS)
+  })
+
+  test("relaxes the interval halfway back after clean edits", () => {
+    const base = EDIT_MIN_INTERVAL_GROUP_MS
+    expect(relaxEditInterval(base, 16000)).toBe(8000)
+    expect(relaxEditInterval(base, 4000)).toBe(base)
   })
 })
 
