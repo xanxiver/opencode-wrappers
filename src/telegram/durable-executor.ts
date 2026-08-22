@@ -99,6 +99,9 @@ export interface TelegramDurableExecutorService {
   readonly listReviews: (chatId: number, threadId?: number) => Effect.Effect<void, DurableExecutorError | SessionsError | InteractionStoreError>
   readonly resolveReview: (chatId: number, reviewID: string, threadId?: number) => Effect.Effect<void, DurableExecutorError | SessionsError | InteractionStoreError>
   readonly listQueue: (chatId: number, threadId?: number) => Effect.Effect<void, DurableExecutorError>
+  readonly moveQueue: (chatId: number, from: number, to: number, threadId?: number) => Effect.Effect<void, DurableExecutorError>
+  readonly clearQueue: (chatId: number, threadId?: number) => Effect.Effect<void, DurableExecutorError>
+  readonly deleteQueue: (chatId: number, position: number, threadId?: number) => Effect.Effect<void, DurableExecutorError>
 }
 
 export class TelegramDurableExecutor extends Context.Service<TelegramDurableExecutor, TelegramDurableExecutorService>()(
@@ -121,8 +124,8 @@ export const agentSwitchRetriesExhausted = (cause: Cause.Cause<unknown>, attempt
   )
 
 /**
- * Build read-only queue items from the run-pipeline jobs of a session, in
- * creation order. A job whose payload cannot be decoded still appears with
+ * Build queue items from the run-pipeline jobs of a session, in execution
+ * order. A job whose payload cannot be decoded still appears with
  * an empty prompt so the queue stays visible.
  */
 export const runQueueItems = (jobs: readonly DurableJob[]): Effect.Effect<readonly RunQueueItem[], never> =>
@@ -135,6 +138,7 @@ export const runQueueItems = (jobs: readonly DurableJob[]): Effect.Effect<readon
           id: job.id,
           state: job.state,
           text: Option.isSome(payload) ? payload.value.text : "",
+          movable: job.state === "pending" && job.leaseGeneration === undefined,
         })),
       ),
   )
@@ -729,6 +733,62 @@ export const TelegramDurableExecutorLive: Layer.Layer<
           : (yield* jobs.listOwner("telegram", ownerFor(sessionID.value)))
         const items = yield* runQueueItems(ownedJobs)
         yield* sendText(chatId, truncate(renderRunQueue(items)), threadId)
+      }).pipe(Effect.provide(context)),
+      moveQueue: (chatId, from, to, threadId) => Effect.gen(function* () {
+        const conversation = conversationId({ chatId, threadId })
+        const sessionID = yield* store.getSessionIDForConversation(conversation)
+        if (Option.isNone(sessionID)) {
+          yield* sendText(chatId, "No session yet.", threadId)
+          return
+        }
+        const owner = ownerFor(sessionID.value)
+        const moved = yield* jobs.movePending("telegram", owner, from, to)
+        if (!moved.moved) {
+          yield* moved.count === 0
+            ? sendText(chatId, "No queued tasks.", threadId)
+            : sendText(chatId, `Choose positions from 1 to ${moved.count}.`, threadId)
+          return
+        }
+        const items = yield* runQueueItems(yield* jobs.listOwner("telegram", owner))
+        yield* sendText(chatId, truncate(`Moved task ${from} to position ${to}.\n\n${renderRunQueue(items)}`), threadId)
+      }).pipe(Effect.provide(context)),
+      clearQueue: (chatId, threadId) => Effect.gen(function* () {
+        const conversation = conversationId({ chatId, threadId })
+        const sessionID = yield* store.getSessionIDForConversation(conversation)
+        if (Option.isNone(sessionID)) {
+          yield* sendText(chatId, "No session yet.", threadId)
+          return
+        }
+        const owner = ownerFor(sessionID.value)
+        const removed = yield* jobs.clearPending("telegram", owner)
+        if (removed === 0) {
+          yield* sendText(chatId, "No queued tasks to clear.", threadId)
+          return
+        }
+        const items = yield* runQueueItems(yield* jobs.listOwner("telegram", owner))
+        yield* sendText(
+          chatId,
+          truncate(`Cleared ${removed} queued ${removed === 1 ? "task" : "tasks"}.\n\n${renderRunQueue(items)}`),
+          threadId,
+        )
+      }).pipe(Effect.provide(context)),
+      deleteQueue: (chatId, position, threadId) => Effect.gen(function* () {
+        const conversation = conversationId({ chatId, threadId })
+        const sessionID = yield* store.getSessionIDForConversation(conversation)
+        if (Option.isNone(sessionID)) {
+          yield* sendText(chatId, "No session yet.", threadId)
+          return
+        }
+        const owner = ownerFor(sessionID.value)
+        const result = yield* jobs.deletePending("telegram", owner, position)
+        if (!result.deleted) {
+          yield* result.count === 0
+            ? sendText(chatId, "No queued tasks.", threadId)
+            : sendText(chatId, `Choose a position from 1 to ${result.count}.`, threadId)
+          return
+        }
+        const items = yield* runQueueItems(yield* jobs.listOwner("telegram", owner))
+        yield* sendText(chatId, truncate(`Deleted task ${position}.\n\n${renderRunQueue(items)}`), threadId)
       }).pipe(Effect.provide(context)),
       resolveReview: (chatId, reviewID, threadId) => Effect.gen(function* () {
         const conversation = conversationId({ chatId, threadId })

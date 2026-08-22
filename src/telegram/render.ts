@@ -390,6 +390,7 @@ export interface RunQueueItem {
   readonly id: string
   readonly state: string
   readonly text: string
+  readonly movable: boolean
 }
 
 /** Human state label for a run in the queue. */
@@ -408,15 +409,23 @@ export const runQueueStateLabel = (state: string): string => {
   }
 }
 
-/** Render the read-only run pipeline for a session. */
+/** Render active work separately from one-based movable queue positions. */
 export const renderRunQueue = (items: readonly RunQueueItem[]): string => {
   if (items.length === 0) return "No runs queued for this session."
-  const lines = items.map((item, index) => {
+  const preview = (item: RunQueueItem): string => {
     const prompt = item.text.replace(/\s+/g, " ").trim()
-    const preview = prompt.length === 0 ? "(empty prompt)" : `"${truncate(prompt, 200)}"`
-    return `${index + 1}. ${runQueueStateLabel(item.state)}: ${preview}`
-  })
-  return `Queue for this session (${items.length})\n${lines.join("\n")}`
+    return prompt.length === 0 ? "(empty prompt)" : `"${truncate(prompt, 200)}"`
+  }
+  const active = items.filter((item) => !item.movable)
+  const queued = items.filter((item) => item.movable)
+  const lines: string[] = [`Queue for this session (${queued.length} queued)`]
+  for (const item of active) {
+    const state = item.state === "pending" ? "Starting" : runQueueStateLabel(item.state)
+    lines.push(`${state}: ${preview(item)}`)
+  }
+  queued.forEach((item, index) => lines.push(`${index + 1}. ${preview(item)}`))
+  if (queued.length === 0) lines.push("No queued tasks.")
+  return lines.join("\n")
 }
 
 /** Maximum number of changed files shown in a changes summary. */

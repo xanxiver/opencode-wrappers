@@ -1,5 +1,7 @@
 import { Effect, Option } from "effect"
+import { Store } from "../../core/store.js"
 import { normalizeCommand, parseAgentPromptCommand, parsePromptCommand, promptWithReply } from "../render.js"
+import { conversationId } from "../conversation.js"
 import type { Message } from "../api.js"
 import { HELP_TEXT, sendText } from "./shared.js"
 import { answerRepliedQuestion } from "./question.js"
@@ -7,7 +9,7 @@ import { runWithFiles } from "./run.js"
 import { selectExactModel, showModels } from "./model.js"
 import { showProjects, showSessions } from "./picker.js"
 import { promptWithAgent, showAgents } from "./agent.js"
-import { compactSession, listDurableReviews, listRunQueue, reconnectRun, resetSession, resolveDurableReview, setProjectDirectory, setSessionById, showStatus, stopRun } from "./run.js"
+import { clearRunQueue, compactSession, deleteRunQueue, listDurableReviews, listRunQueue, moveRunQueue, reconnectRun, resetSession, resolveDurableReview, setLoosePrompts, setProjectDirectory, setSessionById, showStatus, stopRun } from "./run.js"
 
 type ParsedCommand = {
   readonly name: string
@@ -24,6 +26,21 @@ export const parseMessageCommand = (text: string): ParsedCommand => {
     argument: text.slice(separator + 1).trim(),
     hasArgument: true,
   }
+}
+
+export const parseQueueMove = (argument: string): Option.Option<{ readonly from: number; readonly to: number }> => {
+  const parts = argument.trim().split(/\s+/)
+  if (parts.length !== 2) return Option.none()
+  const from = Number(parts[0])
+  const to = Number(parts[1])
+  if (!Number.isSafeInteger(from) || from < 1 || !Number.isSafeInteger(to) || to < 1) return Option.none()
+  return Option.some({ from, to })
+}
+
+/** Parse one one-based queue position for `/queue_delete`. */
+export const parseQueuePosition = (argument: string): Option.Option<number> => {
+  const value = Number(argument.trim())
+  return Number.isSafeInteger(value) && value >= 1 ? Option.some(value) : Option.none()
 }
 
 export const handleMessage = (message: Message) =>
@@ -46,9 +63,20 @@ export const handleMessage = (message: Message) =>
       if (answered) return
     }
 
-    // Messages without a slash command are not bot requests. Ignore them
-    // silently, including attachment-only messages.
-    if (text === undefined || !text.startsWith("/")) return
+    // Plain text starts a run only when loose prompts are enabled for this
+    // conversation. Slash commands always take precedence over loose mode.
+    if (text !== undefined && !text.startsWith("/")) {
+      const prompt = text.trim()
+      if (prompt.length === 0) return
+      const store = yield* Store
+      const loose = yield* store.getLoosePrompts(conversationId({ chatId, threadId }))
+      if (!loose) return
+      const repliedText = replied === undefined ? undefined : replied.text ?? replied.caption
+      yield* runWithFiles(chatId, message, promptWithReply(prompt, repliedText))
+      return
+    }
+    // Attachment-only messages without a slash command are not bot requests.
+    if (text === undefined) return
     const command = parseMessageCommand(text)
     switch (command.name) {
       case "/start":
@@ -109,6 +137,27 @@ export const handleMessage = (message: Message) =>
       case "/queue":
         if (command.hasArgument) break
         yield* listRunQueue(chatId, threadId)
+        return
+      case "/move": {
+        const positions = parseQueueMove(command.argument)
+        yield* Option.match(positions, {
+          onNone: () => sendText(chatId, "Usage: /move <from> <to>", threadId),
+          onSome: ({ from, to }) => moveRunQueue(chatId, from, to, threadId),
+        })
+        return
+      }
+      case "/queue_clear":
+        if (command.hasArgument) break
+        yield* clearRunQueue(chatId, threadId)
+        return
+      case "/queue_delete":
+        yield* Option.match(parseQueuePosition(command.argument), {
+          onNone: () => sendText(chatId, "Usage: /queue_delete <position>", threadId),
+          onSome: (position) => deleteRunQueue(chatId, position, threadId),
+        })
+        return
+      case "/loose":
+        yield* setLoosePrompts(chatId, command.argument, threadId)
         return
       case "/resolve_review":
         yield* command.argument.length === 0

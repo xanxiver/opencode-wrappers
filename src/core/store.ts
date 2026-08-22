@@ -25,6 +25,8 @@ interface State {
   readonly directories: Record<string, string>
   /** directory -> last chosen model, re-applied when a run starts. */
   readonly models: Record<string, StoredModel>
+  /** conversation id -> loose prompts enabled. */
+  readonly loosePrompts: Record<string, boolean>
 }
 
 const StoredModelSchema = Schema.Struct({
@@ -38,13 +40,14 @@ const StateSchema = Schema.Struct({
   conversationSessions: Schema.optional(Schema.Record(Schema.String, Schema.String)),
   directories: Schema.Record(Schema.String, Schema.String),
   models: Schema.optional(Schema.Record(Schema.String, StoredModelSchema)),
+  loosePrompts: Schema.optional(Schema.Record(Schema.String, Schema.Boolean)),
 })
 
 /** Legacy format: clientId -> sessionID (one session per chat). */
 const LegacySchema = Schema.Record(Schema.String, Schema.String)
 type JsonValue = ReturnType<typeof JSON.parse>
 
-const emptyState = (): State => ({ sessions: {}, conversationSessions: {}, directories: {}, models: {} })
+const emptyState = (): State => ({ sessions: {}, conversationSessions: {}, directories: {}, models: {}, loosePrompts: {} })
 
 /** Migrate the legacy chat->session map: each chat keeps its session under its own key. */
 const migrateLegacy = (legacy: Record<string, string>): State => {
@@ -52,7 +55,7 @@ const migrateLegacy = (legacy: Record<string, string>): State => {
   for (const clientId of Object.keys(legacy)) {
     directories[clientId] = clientId
   }
-  return { sessions: { ...legacy }, conversationSessions: { ...legacy }, directories, models: {} }
+  return { sessions: { ...legacy }, conversationSessions: { ...legacy }, directories, models: {}, loosePrompts: {} }
 }
 
 const parseState = (json: JsonValue): Option.Option<{ readonly state: State; readonly migrated: boolean }> =>
@@ -69,7 +72,7 @@ const parseState = (json: JsonValue): Option.Option<{ readonly state: State; rea
           return sessionID === undefined ? [] : [[conversation, sessionID]]
         }),
       )
-      return Option.some({ state: { ...state, conversationSessions, models: state.models ?? {} }, migrated: false })
+      return Option.some({ state: { ...state, conversationSessions, models: state.models ?? {}, loosePrompts: state.loosePrompts ?? {} }, migrated: false })
     },
   })
 
@@ -86,6 +89,9 @@ export interface StoreService {
   readonly switchConversationDirectory: (conversationId: string, directory: string) => Effect.Effect<void, StoreError>
   readonly getModel: (directory: string) => Effect.Effect<Option.Option<StoredModel>, never>
   readonly setModel: (directory: string, model: StoredModel) => Effect.Effect<void, StoreError>
+  /** True when plain messages start runs for this conversation. */
+  readonly getLoosePrompts: (conversationId: string) => Effect.Effect<boolean, never>
+  readonly setLoosePrompts: (conversationId: string, enabled: boolean) => Effect.Effect<void, StoreError>
   /** Every client id the store knows about. */
   readonly listClients: () => Effect.Effect<readonly string[], never>
   /** Every directory retained by a client or session mapping. */
@@ -198,6 +204,13 @@ export const Live: Layer.Layer<Store, StoreError, FileSystem.FileSystem | AppCon
         commit((state) => ({
           ...state,
           models: { ...state.models, [directory]: model },
+        })),
+      getLoosePrompts: (conversationId) =>
+        Ref.get(ref).pipe(Effect.map((state) => state.loosePrompts[conversationId] ?? false)),
+      setLoosePrompts: (conversationId, enabled) =>
+        commit((state) => ({
+          ...state,
+          loosePrompts: { ...state.loosePrompts, [conversationId]: enabled },
         })),
       listClients: () => Ref.get(ref).pipe(Effect.map((state) => Object.keys(state.directories))),
       listDirectories: () => Ref.get(ref).pipe(Effect.map((state) => [

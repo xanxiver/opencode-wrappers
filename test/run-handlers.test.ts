@@ -62,6 +62,8 @@ const store = (selected: Ref.Ref<string | undefined>): StoreService => ({
   switchConversationDirectory: () => Effect.void,
   getModel: () => Effect.succeed(Option.none()),
   setModel: () => Effect.void,
+  getLoosePrompts: () => Effect.succeed(false),
+  setLoosePrompts: () => Effect.void,
   listClients: () => Effect.succeed([]),
   listDirectories: () => Effect.succeed([]),
 })

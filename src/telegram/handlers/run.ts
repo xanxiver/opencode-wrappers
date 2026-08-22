@@ -110,6 +110,63 @@ export const listRunQueue = (chatId: number, threadId?: number) =>
     ),
   ))
 
+/** `/move <from> <to>` — reorder queued tasks using positions from `/queue`. */
+export const moveRunQueue = (chatId: number, from: number, to: number, threadId?: number) =>
+  Effect.gen(function* () {
+    const executor = yield* TelegramDurableExecutor
+    yield* executor.moveQueue(chatId, from, to, threadId)
+  }).pipe(Effect.catchCause((cause) =>
+    logBoundary("telegram/handlers", "durable-executor", "move run queue failed")(cause).pipe(
+      Effect.andThen(sendText(chatId, "The queued task could not be moved.", threadId)),
+    ),
+  ))
+
+/** `/queue_delete <pos>` — remove one queued task by its `/queue` position. */
+export const deleteRunQueue = (chatId: number, position: number, threadId?: number) =>
+  Effect.gen(function* () {
+    const executor = yield* TelegramDurableExecutor
+    yield* executor.deleteQueue(chatId, position, threadId)
+  }).pipe(Effect.catchCause((cause) =>
+    logBoundary("telegram/handlers", "durable-executor", "delete run queue failed")(cause).pipe(
+      Effect.andThen(sendText(chatId, "The queued task could not be deleted.", threadId)),
+    ),
+  ))
+
+/** `/queue_clear` — remove every queued task for this session. */
+export const clearRunQueue = (chatId: number, threadId?: number) =>
+  Effect.gen(function* () {
+    const executor = yield* TelegramDurableExecutor
+    yield* executor.clearQueue(chatId, threadId)
+  }).pipe(Effect.catchCause((cause) =>
+    logBoundary("telegram/handlers", "durable-executor", "clear run queue failed")(cause).pipe(
+      Effect.andThen(sendText(chatId, "The queue could not be cleared.", threadId)),
+    ),
+  ))
+
+/** `/loose [on|off]` — plain messages start runs when enabled. */
+export const setLoosePrompts = (chatId: number, argument: string, threadId?: number) =>
+  Effect.gen(function* () {
+    const store = yield* Store
+    const conversation = conversationId({ chatId, threadId })
+    const mode = argument.trim().toLocaleLowerCase()
+    if (mode !== "on" && mode !== "off") {
+      const current = yield* store.getLoosePrompts(conversation)
+      yield* sendText(
+        chatId,
+        current ? "Loose prompts are on." : "Loose prompts are off. Use /loose on or /loose off.",
+        threadId,
+      )
+      return
+    }
+    const enabled = mode === "on"
+    yield* store.setLoosePrompts(conversation, enabled)
+    yield* sendText(
+      chatId,
+      enabled ? "Loose prompts on. Plain messages now start runs." : "Loose prompts off.",
+      threadId,
+    )
+  })
+
 /** `/compact` — compact the current session without starting a prompt. */
 export const compactSession = (chatId: number, threadId?: number) =>
   Effect.gen(function* () {
