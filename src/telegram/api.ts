@@ -36,10 +36,11 @@ export const EDIT_MIN_INTERVAL_MS = 1000
 
 /**
  * Telegram caps group traffic near 20 messages per minute. Streaming runs
- * editing once a second blow that budget on their own, so group chats start
- * from a wider interval and let flood feedback tune it below.
+ * share that budget with replies, questions, notifications, and button
+ * feedback, so group chats start from a thrifty 6s interval and let flood
+ * feedback widen or tighten it around the real budget.
  */
-export const EDIT_MIN_INTERVAL_GROUP_MS = 3000
+export const EDIT_MIN_INTERVAL_GROUP_MS = 6000
 
 /** Upper bound for the adaptive per-chat edit interval. */
 export const EDIT_MAX_INTERVAL_MS = 20_000

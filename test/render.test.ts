@@ -500,8 +500,10 @@ describe("editDelay", () => {
 
   test("widens the interval on flood and caps it", () => {
     const base = EDIT_MIN_INTERVAL_GROUP_MS
+    // Takes whichever is longer: doubled interval or Telegram's ask.
     expect(penalizeEditInterval(base, base, undefined)).toBe(base * 2)
-    expect(penalizeEditInterval(base, base, 9000)).toBe(9000)
+    expect(penalizeEditInterval(base, base, 9000)).toBe(base * 2)
+    expect(penalizeEditInterval(base, base, 15000)).toBe(15000)
     expect(penalizeEditInterval(base, 12000, 500)).toBe(EDIT_MAX_INTERVAL_MS)
   })
 
