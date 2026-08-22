@@ -238,9 +238,10 @@ export const showStatus = (chatId: number, threadId?: number) =>
           onSome: (session) => session.title === undefined ? `Session: ${id}` : `Session: ${session.title} (${id})`,
         }),
     })
+    const loose = yield* store.getLoosePrompts(conversation)
     yield* sendText(
       chatId,
-      `Directory: ${directory}\n${sessionLine}\n${modelLine}\n${sessionStatus.contextLine}\n${runLine}`,
+      `Directory: ${directory}\n${sessionLine}\n${modelLine}\n${sessionStatus.contextLine}\n${runLine}\nLoose prompts: ${loose ? "on" : "off"}`,
       threadId,
     )
   })
