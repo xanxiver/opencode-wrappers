@@ -90,11 +90,14 @@ export const renderProgress = (state: {
   readonly text: string
   readonly reasoning: string
   readonly activity: Option.Option<string>
+  /** Group chats omit live reasoning to save message budget for replies. */
+  readonly includeReasoning?: boolean
 }): string => {
   // Reasoning deltas can contain adjacent Markdown bold blocks, for example
   // `**first****second**`. Keep separate updates readable in Telegram.
   const formattedReasoning = state.reasoning.replace(/\*\*\*\*/g, "**\n\n**")
-  const reasoning = state.reasoning.length > 0
+  const showReasoning = (state.includeReasoning ?? true) && state.reasoning.length > 0
+  const reasoning = showReasoning
     ? `Thinking: ${truncate(formattedReasoning, REASONING_DISPLAY_LIMIT)}`
     : ""
   const body = Option.match(state.activity, {

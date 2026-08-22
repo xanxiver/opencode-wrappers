@@ -81,6 +81,8 @@ interface RunState {
   readonly usage: Option.Option<UsageView>
   readonly lastSent: string
   readonly dirty: boolean
+  /** Group chats omit live reasoning to save message budget for replies. */
+  readonly includeReasoning: boolean
   readonly media: readonly MediaArtifact[]
   readonly mediaKeys: ReadonlySet<string>
 }
@@ -576,6 +578,7 @@ export const nextProgressEdit = (current: {
   readonly activity: Option.Option<string>
   readonly lastSent: string
   readonly dirty: boolean
+  readonly includeReasoning?: boolean
 }): Option.Option<string> => {
   if (!current.dirty) return Option.none()
   const text = truncate(renderProgress({ ...current, text: visibleResponseText(current.text) }))
@@ -940,6 +943,9 @@ export const runPrompt = (input: RunInput) =>
       usage: Option.none(),
       lastSent: "Working…",
       dirty: false,
+      // Groups share a ~20 msg/min budget with replies and notifications;
+      // dropping the fast-changing reasoning line keeps that budget free.
+      includeReasoning: input.chatId >= 0,
       media: [],
       mediaKeys: new Set(),
     })
