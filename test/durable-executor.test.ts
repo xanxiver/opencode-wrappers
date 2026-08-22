@@ -104,6 +104,7 @@ describe("DurableExecutorStore", () => {
       terminalResult: JSON.stringify({ text: "Recovered response", media: [] }),
       createdAt: 0,
       updatedAt: 0,
+      queueOrder: 0,
     }
     const evidence = await Effect.runPromise(redactedReviewEvidence(job))
     expect(evidence).toContain("Please inspect this deployment")
@@ -126,6 +127,76 @@ describe("DurableExecutorStore", () => {
     expect(result.first.created).toBe(true)
     expect(result.second.created).toBe(false)
     expect(result.second.job.id).toBe(result.first.job.id)
+  })
+
+  test("moves pending jobs by one-based queue position", async () => {
+    const result = await run(Effect.gen(function* () {
+      const store = yield* DurableExecutorStore
+      yield* submit(store, "first")
+      yield* submit(store, "second")
+      yield* submit(store, "third")
+      const moved = yield* store.movePending("telegram", "1", 3, 1)
+      const ordered = yield* store.listOwner("telegram", "1")
+      const claimed = yield* store.claimNext("telegram")
+      return { moved, ordered, claimed }
+    }))
+
+    expect(result.moved).toEqual({ moved: true, count: 3 })
+    expect(result.ordered.map((job) => job.sourceKey)).toEqual(["third", "first", "second"])
+    expect(Option.getOrUndefined(result.claimed)?.job.sourceKey).toBe("third")
+  })
+
+  test("rejects queue positions outside the movable pending jobs", async () => {
+    const result = await run(Effect.gen(function* () {
+      const store = yield* DurableExecutorStore
+      yield* submit(store, "first")
+      yield* submit(store, "second")
+      yield* store.claimNext("telegram")
+      return yield* store.movePending("telegram", "1", 2, 1)
+    }))
+
+    expect(result).toEqual({ moved: false, count: 1 })
+  })
+
+  test("deletes one queued job by position and keeps claimed jobs", async () => {
+    const result = await run(Effect.gen(function* () {
+      const store = yield* DurableExecutorStore
+      yield* submit(store, "first")
+      yield* submit(store, "second")
+      yield* submit(store, "third")
+      const claimed = yield* store.claimNext("telegram")
+      const deleted = yield* store.deletePending("telegram", "1", 2)
+      const ordered = yield* store.listOwner("telegram", "1")
+      const rejected = yield* store.deletePending("telegram", "1", 9)
+      return { claimedJobID: Option.getOrUndefined(claimed)?.job.id, deleted, ordered, rejected }
+    }))
+
+    expect(result.deleted).toEqual({ deleted: true, count: 2 })
+    expect(result.rejected).toEqual({ deleted: false, count: 1 })
+    expect(result.ordered.map((job) => [job.sourceKey, job.state])).toEqual([
+      ["first", "pending"],
+      ["second", "pending"],
+    ])
+    expect(result.ordered.some((job) => job.id === result.claimedJobID)).toBe(true)
+  })
+
+  test("clears every queued job and keeps the running one", async () => {
+    const result = await run(Effect.gen(function* () {
+      const store = yield* DurableExecutorStore
+      yield* submit(store, "first")
+      yield* submit(store, "second")
+      yield* submit(store, "third")
+      const claimed = yield* store.claimNext("telegram")
+      const removed = yield* store.clearPending("telegram", "1")
+      const again = yield* store.clearPending("telegram", "1")
+      const remaining = yield* store.listOwner("telegram", "1")
+      return { claimedJobID: Option.getOrUndefined(claimed)?.job.id, removed, again, remaining }
+    }))
+
+    expect(result.removed).toBe(2)
+    expect(result.again).toBe(0)
+    expect(result.remaining.map((job) => [job.sourceKey, job.state])).toEqual([["first", "pending"]])
+    expect(result.remaining.some((job) => job.id === result.claimedJobID)).toBe(true)
   })
 
   test("a claimed job keeps its payload and is reclaimed in place", async () => {
@@ -454,6 +525,7 @@ describe("runQueueItems", () => {
     deliveredMediaCount: 0,
     createdAt: 0,
     updatedAt: 0,
+    queueOrder: 0,
     ...overrides,
   })
 

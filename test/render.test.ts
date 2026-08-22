@@ -795,40 +795,40 @@ describe("renderRunQueue", () => {
 
   test("renders the pipeline in order with human state labels", () => {
     const text = renderRunQueue([
-      { id: "j1", state: "running", text: "Fix the model picker" },
-      { id: "j2", state: "pending", text: "Add a diff command" },
-      { id: "j3", state: "pending", text: "Bump the dependency" },
+      { id: "j1", state: "running", text: "Fix the model picker", movable: false },
+      { id: "j2", state: "pending", text: "Add a diff command", movable: true },
+      { id: "j3", state: "pending", text: "Bump the dependency", movable: true },
     ])
-    expect(text).toContain("Queue for this session (3)")
-    expect(text).toContain("1. Running: \"Fix the model picker\"")
-    expect(text).toContain("2. Queued: \"Add a diff command\"")
-    expect(text).toContain("3. Queued: \"Bump the dependency\"")
+    expect(text).toContain("Queue for this session (2 queued)")
+    expect(text).toContain("Running: \"Fix the model picker\"")
+    expect(text).toContain("1. \"Add a diff command\"")
+    expect(text).toContain("2. \"Bump the dependency\"")
   })
 
   test("labels starting and finishing states", () => {
     const text = renderRunQueue([
-      { id: "j1", state: "dispatching", text: "Start" },
-      { id: "j2", state: "finalizing", text: "Finish" },
+      { id: "j1", state: "dispatching", text: "Start", movable: false },
+      { id: "j2", state: "finalizing", text: "Finish", movable: false },
     ])
-    expect(text).toContain("1. Starting: \"Start\"")
-    expect(text).toContain("2. Finishing: \"Finish\"")
+    expect(text).toContain("Starting: \"Start\"")
+    expect(text).toContain("Finishing: \"Finish\"")
   })
 
   test("marks an empty prompt", () => {
-    const text = renderRunQueue([{ id: "j1", state: "running", text: "" }])
+    const text = renderRunQueue([{ id: "j1", state: "running", text: "", movable: false }])
     expect(text).toContain("(empty prompt)")
   })
 
   test("truncates long prompts", () => {
-    const text = renderRunQueue([{ id: "j1", state: "pending", text: "x".repeat(500) }])
+    const text = renderRunQueue([{ id: "j1", state: "pending", text: "x".repeat(500), movable: true }])
     expect(text).toContain("truncated")
     expect(text.length).toBeLessThan(400)
   })
 
   test("collapses newlines in multi-line prompts", () => {
-    const text = renderRunQueue([{ id: "j1", state: "pending", text: "line one\n\nline two" }])
+    const text = renderRunQueue([{ id: "j1", state: "pending", text: "line one\n\nline two", movable: true }])
     expect(text).toContain("\"line one line two\"")
-    expect(text).toContain("1. Queued:")
+    expect(text).toContain("1. \"line one line two\"")
   })
 
   test("keeps unknown states visible as-is", () => {

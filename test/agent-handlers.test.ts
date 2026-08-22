@@ -77,6 +77,8 @@ const store: StoreService = {
   switchConversationDirectory: () => Effect.void,
   getModel: () => Effect.succeed(Option.none()),
   setModel: () => Effect.void,
+  getLoosePrompts: () => Effect.succeed(false),
+  setLoosePrompts: () => Effect.void,
   listClients: () => Effect.succeed([]),
   listDirectories: () => Effect.succeed([]),
 }
@@ -108,6 +110,9 @@ describe("Telegram agent handlers", () => {
       listReviews: () => Effect.void,
       resolveReview: () => Effect.void,
       listQueue: () => Effect.void,
+      moveQueue: () => Effect.void,
+      clearQueue: () => Effect.void,
+      deleteQueue: () => Effect.void,
     }
     await Effect.runPromise(promptWithAgent(
       7,
