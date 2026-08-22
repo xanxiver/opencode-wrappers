@@ -67,6 +67,9 @@ export const decodeAttachmentSnapshots = (attachments: NonNullable<TelegramJobPa
 
 const PersistedFinalization = Schema.Struct({
   text: Schema.String,
+  // Older persisted results predate the outcome field; the notification word
+  // then falls back to reading renderFinal's trailing marker.
+  outcome: Schema.optional(Schema.String),
   media: Schema.Array(Schema.Struct({
     key: Schema.String,
     name: Schema.String,
@@ -79,6 +82,7 @@ type PersistedFinalization = Schema.Schema.Type<typeof PersistedFinalization>
 
 const encodeFinalization = (result: RunFinalization): string => JSON.stringify({
   text: result.text,
+  outcome: result.outcome,
   media: result.media.map((media) => ({
     key: media.key,
     name: media.name,
@@ -146,6 +150,25 @@ export const runQueueItems = (jobs: readonly DurableJob[]): Effect.Effect<readon
 export const finalEditDisposition = (error: Pick<ApiError, "description" | "transient">): "accepted" | "retry" | "fail" => {
   if (error.description?.toLowerCase().includes("message is not modified") === true) return "accepted"
   return error.transient ? "retry" : "fail"
+}
+
+/** Short reply word sent under a finished run so Telegram notifies. */
+export type FinishWord = "done" | "fail" | "interrupted" | "timeout"
+
+/**
+ * Map a persisted outcome to its notification word. Legacy results without
+ * an outcome fall back to renderFinal's trailing marker; when truncation
+ * removed that marker too, a finished-looking result is reported as done.
+ */
+export const finishNotificationWord = (outcome: string | undefined, finalText: string): FinishWord => {
+  if (outcome === "done") return "done"
+  if (outcome === "interrupted") return "interrupted"
+  if (outcome === "timeout") return "timeout"
+  if (outcome !== undefined) return "fail"
+  if (finalText.endsWith("Interrupted.")) return "interrupted"
+  if (finalText.endsWith("Timed out.")) return "timeout"
+  if (finalText.endsWith("Failed.") || finalText.endsWith("Error.")) return "fail"
+  return "done"
 }
 
 /** Apply the durable terminal transition for a failed final Telegram edit. */
@@ -287,6 +310,19 @@ export const TelegramDurableExecutorLive: Layer.Layer<
           Effect.catchTag("ApiError", (error) => settleFinalEditError(jobs, lease, error)),
         )
         if (!finalEditSucceeded) return
+        // A new reply (unlike an edit) makes Telegram notify the user that
+        // this run finished, with the outcome as the whole message.
+        const word = finishNotificationWord(result.outcome, result.text)
+        yield* api.sendMessage({
+          chatId: payload.chatId,
+          text: word,
+          messageThreadId: payload.threadId,
+          replyToMessageId: progressMessageID,
+        }).pipe(
+          Effect.catchCause((cause) =>
+            logBoundary("telegram/executor", "telegram-notification", "finish notification failed")(cause),
+          ),
+        )
         for (let index = lease.job.deliveredMediaCount; index < result.media.length; index += 1) {
           const media = result.media[index]
           if (media === undefined) continue
@@ -359,6 +395,7 @@ export const TelegramDurableExecutorLive: Layer.Layer<
                 const finalization = yield* withChangesSummaryUsing(gitChanges, {
                   text: truncate(rendered.text),
                   media: limitMedia([...rendered.media, ...response.value.media]),
+                  outcome: "done",
                 }, payload.directory)
                 yield* jobs.markFinalizing(lease.job.id, lease.generation, encodeFinalization(finalization))
                 const current = yield* jobs.get(lease.job.id)

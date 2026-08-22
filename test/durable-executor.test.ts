@@ -16,7 +16,7 @@ import {
   type DurableExecutorRepository,
 } from "../src/core/durable-executor.js"
 import { GitChangesError, type ChangesSummaryResult, type GitChangesService } from "../src/core/git-changes.js"
-import { agentSwitchRetriesExhausted, decodeAttachmentSnapshots, encodeAttachmentSnapshots, finalEditDisposition, redactedReviewEvidence, resolveOwnedDurableReview, runQueueItems, settleFinalEditError, withChangesSummaryUsing } from "../src/telegram/durable-executor.js"
+import { agentSwitchRetriesExhausted, decodeAttachmentSnapshots, encodeAttachmentSnapshots, finalEditDisposition, finishNotificationWord, redactedReviewEvidence, resolveOwnedDurableReview, runQueueItems, settleFinalEditError, withChangesSummaryUsing } from "../src/telegram/durable-executor.js"
 import { ApiError } from "../src/telegram/api.js"
 import { AgentSwitchError } from "../src/telegram/run.js"
 
@@ -478,7 +478,7 @@ describe("withChangesSummaryUsing", () => {
   test("appends the changes summary to the finalization", async () => {
     const gitChanges: GitChangesService = { summarize: () => Effect.succeed(summary) }
     const result = await Effect.runPromise(
-      withChangesSummaryUsing(gitChanges, { text: "Done.", media: [] }, "/tmp/project"),
+      withChangesSummaryUsing(gitChanges, { text: "Done.", media: [], outcome: "done" }, "/tmp/project"),
     )
     expect(result.text).toContain("Current changes")
     expect(result.text).toContain("M  src/a.ts")
@@ -488,7 +488,7 @@ describe("withChangesSummaryUsing", () => {
   test("keeps the text unchanged outside a git repository", async () => {
     const gitChanges: GitChangesService = { summarize: () => Effect.succeed({ kind: "none" }) }
     const result = await Effect.runPromise(
-      withChangesSummaryUsing(gitChanges, { text: "Done.", media: [] }, "/tmp/project"),
+      withChangesSummaryUsing(gitChanges, { text: "Done.", media: [], outcome: "done" }, "/tmp/project"),
     )
     expect(result.text).toBe("Done.")
   })
@@ -500,7 +500,7 @@ describe("withChangesSummaryUsing", () => {
       ),
     }
     const result = await Effect.runPromise(
-      withChangesSummaryUsing(gitChanges, { text: "Done.", media: [] }, "/tmp/project"),
+      withChangesSummaryUsing(gitChanges, { text: "Done.", media: [], outcome: "done" }, "/tmp/project"),
     )
     expect(result.text).toContain("Changes: unavailable.")
   })
@@ -568,5 +568,25 @@ describe("agent switch retries", () => {
 
   test("does not classify unrelated pending failures as agent exhaustion", () => {
     expect(agentSwitchRetriesExhausted(Cause.fail(new Error("network")), 3)).toBe(false)
+  })
+})
+
+describe("finishNotificationWord", () => {
+  test("maps persisted outcomes to their notification word", () => {
+    expect(finishNotificationWord("done", "anything")).toBe("done")
+    expect(finishNotificationWord("failed", "anything")).toBe("fail")
+    expect(finishNotificationWord("error", "anything")).toBe("fail")
+    expect(finishNotificationWord("interrupted", "anything")).toBe("interrupted")
+    expect(finishNotificationWord("timeout", "anything")).toBe("timeout")
+  })
+
+  test("falls back to renderFinal trailing markers for legacy results", () => {
+    expect(finishNotificationWord(undefined, "answer\n\nDone.")).toBe("done")
+    expect(finishNotificationWord(undefined, "answer\n\nFailed.")).toBe("fail")
+    expect(finishNotificationWord(undefined, "answer\n\nError.")).toBe("fail")
+    expect(finishNotificationWord(undefined, "answer\n\nInterrupted.")).toBe("interrupted")
+    expect(finishNotificationWord(undefined, "answer\n\nTimed out.")).toBe("timeout")
+    // A truncated tail hides the marker; a finished-looking result stays done.
+    expect(finishNotificationWord(undefined, "partial text without marker")).toBe("done")
   })
 })
