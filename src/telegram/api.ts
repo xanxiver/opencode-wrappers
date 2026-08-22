@@ -333,9 +333,10 @@ export const Live: Layer.Layer<TelegramApi, ConfigError, AppConfig> = Layer.effe
           mediaRequest(base, operation, field, input),
         )
       })
-    // Serialize all message edits behind one lock. Combined with the per-chat
-    // slot this guarantees a slow progress edit can never land after the
-    // final edit and overwrite it.
+    // Serialize the request phase of all message edits behind one lock. The
+    // per-chat rate slot is reserved BEFORE taking the lock, so waiting out
+    // the throttle never blocks other chats; FIFO acquisition keeps a slow
+    // progress edit from landing after a newer final edit.
     const editLock = yield* Semaphore.make(1)
     return {
       getUpdates: (offset, timeoutSeconds) =>
@@ -368,9 +369,9 @@ export const Live: Layer.Layer<TelegramApi, ConfigError, AppConfig> = Layer.effe
       sendVideo: (input) => sendMedia("sendVideo", "video", input),
       sendDocument: (input) => sendMedia("sendDocument", "document", input),
       editMessageText: (input) =>
-        editLock.withPermit(
-          waitForEditSlot(input.chatId).pipe(
-            Effect.andThen(
+        waitForEditSlot(input.chatId).pipe(
+          Effect.andThen(
+            editLock.withPermit(
               Effect.gen(function* () {
                 const body = yield* jsonBody("editMessageText", {
                   chat_id: input.chatId,
