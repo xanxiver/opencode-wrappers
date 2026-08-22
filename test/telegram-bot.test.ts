@@ -1,7 +1,7 @@
 import { Cause, Data, Effect, Exit, Ref } from "effect"
 import { FetchHttpClient } from "effect/unstable/http"
 import { expect, test } from "bun:test"
-import { dropUpdateBacklog, isPollingConflict, processUpdate } from "../src/telegram/bot.js"
+import { dropUpdateBacklog, isPollingConflict, isStaleUpdate, processUpdate } from "../src/telegram/bot.js"
 import { ApiError } from "../src/telegram/api.js"
 
 class TestFailure extends Data.TaggedError("TestFailure")<{}> {}
@@ -101,4 +101,10 @@ test("starts from the oldest update when the backlog cannot be read", async () =
   expect(await Effect.runPromise(
     Effect.provide(dropUpdateBacklog(api), FetchHttpClient.layer),
   )).toBe(0)
+})
+
+test("marks updates below the confirmed offset as stale", () => {
+  expect(isStaleUpdate(42, 41)).toBe(true)
+  expect(isStaleUpdate(41, 41)).toBe(false)
+  expect(isStaleUpdate(0, 41)).toBe(false)
 })
