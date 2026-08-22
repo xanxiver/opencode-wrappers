@@ -157,13 +157,15 @@ const AUTO_CONTINUE_OUTCOMES: readonly string[] = ["failed", "error", "timeout"]
 export type AutoContinueDecision =
   | { readonly action: "none" }
   | { readonly action: "reset" }
-  | { readonly action: "limit" }
+  | { readonly action: "giveup" }
   | { readonly action: "continue"; readonly round: number }
 
 /**
  * Decide what to do after a finished run. Success resets the consecutive
  * counter; qualifying failures increment it and continue while under the
- * cap; reaching the cap reports once; disabled mode just cleans up.
+ * cap. A failure at the cap gives up: it clears the counter so a later,
+ * independent failure starts a fresh cycle, and never continues a fourth
+ * time inside one chain.
  */
 export const decideAutoContinue = (
   enabled: boolean,
@@ -173,7 +175,7 @@ export const decideAutoContinue = (
   if (outcome === "done") return currentCount > 0 ? { action: "reset" } : { action: "none" }
   if (!AUTO_CONTINUE_OUTCOMES.includes(outcome ?? "")) return { action: "none" }
   if (!enabled) return currentCount > 0 ? { action: "reset" } : { action: "none" }
-  if (currentCount >= AUTO_CONTINUE_MAX) return { action: "limit" }
+  if (currentCount >= AUTO_CONTINUE_MAX) return { action: "giveup" }
   return { action: "continue", round: currentCount + 1 }
 }
 
@@ -414,8 +416,11 @@ export const TelegramDurableExecutorLive: Layer.Layer<
         return
       }
       if (decision.action !== "continue") {
-        if (decision.action === "limit") {
-          yield* notify(`Auto-continue limit (${AUTO_CONTINUE_MAX}) reached. Send /prompt to try again.`)
+        if (decision.action === "giveup") {
+          yield* interaction.set(autoContinueKey(payload.sessionID), 0).pipe(
+            Effect.catchCause((cause) => logBoundary("telegram/executor", "auto-continue", "counter reset failed")(cause)),
+          )
+          yield* notify(`Auto-continue stopped after ${AUTO_CONTINUE_MAX} attempts. Send /prompt to try again.`)
         }
         return
       }
