@@ -160,6 +160,12 @@ export const setLoosePrompts = (chatId: number, argument: string, threadId?: num
     }
     const enabled = mode === "on"
     yield* store.setLoosePrompts(conversation, enabled)
+    yield* Effect.annotateLogs({
+      component: "telegram/handlers",
+      boundary: "loose-prompts",
+      conversation,
+      enabled,
+    })(Effect.logInfo("loose prompts toggled"))
     yield* sendText(
       chatId,
       enabled ? "Loose prompts on. Plain messages now start runs." : "Loose prompts off.",
