@@ -214,6 +214,18 @@ describe("renderProgress", () => {
     ).toBe("Thinking: thinking hard\n\nanswer")
   })
 
+  test("group chats omit live reasoning to save message budget", () => {
+    const out = renderProgress({
+      text: "answer",
+      reasoning: "thinking hard",
+      activity: Option.some("Tool: bash"),
+      includeReasoning: false,
+    })
+    expect(out).not.toContain("Thinking:")
+    expect(out).toContain("answer")
+    expect(out).toContain("Tool: bash")
+  })
+
   test("separates adjacent bold reasoning updates", () => {
     expect(
       renderProgress({ text: "", reasoning: "**first****second**", activity: Option.none() }),
@@ -533,6 +545,17 @@ describe("nextProgressEdit", () => {
 
   test("proposes nothing when the text equals the last sent text", () => {
     expect(nextProgressEdit({ ...base, lastSent: "hello" })).toEqual(Option.none())
+  })
+
+  test("group mode proposes nothing when only reasoning changed", () => {
+    // Reasoning deltas are invisible in groups, so a reasoning-only change
+    // must not consume message budget.
+    const groupBase = { ...base, text: "", reasoning: "grew", includeReasoning: false }
+    expect(nextProgressEdit({ ...groupBase, lastSent: "Working…" })).toEqual(Option.none())
+    // Contrast: DMs keep live reasoning and do propose the update.
+    const dm = { ...groupBase, includeReasoning: true }
+    const proposed = nextProgressEdit({ ...dm, lastSent: "Working…" })
+    expect(Option.isSome(proposed)).toBe(true)
   })
 
   test("proposes nothing for an empty first tick (same as the working message)", () => {
