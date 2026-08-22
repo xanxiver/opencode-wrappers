@@ -3,7 +3,7 @@ import { logBoundary } from "../../core/logging.js"
 import { OpenCode } from "../../core/opencode.js"
 import { Sessions } from "../../core/sessions.js"
 import { Store } from "../../core/store.js"
-import { TelegramDurableExecutor } from "../durable-executor.js"
+import { TelegramDurableExecutor, AUTO_CONTINUE_MAX } from "../durable-executor.js"
 import type { Message } from "../api.js"
 import { sendText } from "./shared.js"
 import { conversationId } from "../conversation.js"
@@ -142,6 +142,32 @@ export const clearRunQueue = (chatId: number, threadId?: number) =>
       Effect.andThen(sendText(chatId, "The queue could not be cleared.", threadId)),
     ),
   ))
+
+/** `/continue [on|off]` — failed runs auto-send a continue prompt when enabled. */
+export const setAutoContinue = (chatId: number, argument: string, threadId?: number) =>
+  Effect.gen(function* () {
+    const store = yield* Store
+    const conversation = conversationId({ chatId, threadId })
+    const mode = argument.trim().toLocaleLowerCase()
+    if (mode !== "on" && mode !== "off") {
+      const current = yield* store.getAutoContinue(conversation)
+      yield* sendText(
+        chatId,
+        current ? "Auto-continue is on." : "Auto-continue is off. Use /continue on or /continue off.",
+        threadId,
+      )
+      return
+    }
+    const enabled = mode === "on"
+    yield* store.setAutoContinue(conversation, enabled)
+    yield* sendText(
+      chatId,
+      enabled
+        ? `Auto-continue on. Failed runs resend "continue" up to ${AUTO_CONTINUE_MAX} times.`
+        : "Auto-continue off.",
+      threadId,
+    )
+  })
 
 /** `/loose [on|off]` — plain messages start runs when enabled. */
 export const setLoosePrompts = (chatId: number, argument: string, threadId?: number) =>
