@@ -36,9 +36,16 @@ The bot lives in `src/` and `test/` at the repository root. The core
 - Forum topics: replies land in the thread the user is in.
 - `/queue`: show the durable run pipeline for the current session (starting,
   running, finishing, and queued runs with their prompts), read-only.
+- `/move <from> <to>`: reorder queued tasks using the positions shown by
+  `/queue`. The running task cannot be moved.
+- `/queue_delete <pos>`: remove one queued task by its `/queue` position.
+- `/queue_clear`: remove every queued task for the current session.
+- `/loose on|off`: when on, a plain message starts a run without `/prompt`.
+  Slash commands still run first. The setting is stored per conversation.
 - Commands: `/start`, `/help`, `/prompt`, `/new`, `/stop`, `/reconnect`, `/forceReconnect`,
   `/compact`, `/review`, `/model`, `/agents`, `/pwa <agent> <prompt>`, `/status`, `/whoami`, `/projects`, `/project <path>`,
-  `/sessions`, `/queue`.
+  `/sessions`, `/queue`, `/move <from> <to>`, `/queue_delete <pos>`, `/queue_clear`,
+  `/loose on|off`.
 - User whitelist via `TELEGRAM_ALLOWED_USERS` (empty = deny all).
 
 ## Reliability

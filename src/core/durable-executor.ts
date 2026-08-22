@@ -32,6 +32,7 @@ export interface DurableJob {
   readonly lastError?: string
   readonly createdAt: number
   readonly updatedAt: number
+  readonly queueOrder: number
 }
 
 export interface DurableJobLease {
@@ -83,6 +84,21 @@ export interface DurableExecutorRepository {
   readonly releaseWorkerLeases: Effect.Effect<void, DurableExecutorError>
   readonly get: (jobID: string) => Effect.Effect<Option.Option<DurableJob>, DurableExecutorError>
   readonly listOwner: (channel: string, owner: string) => Effect.Effect<readonly DurableJob[], DurableExecutorError>
+  /** Reorder unclaimed pending jobs for one owner using one-based positions. */
+  readonly movePending: (
+    channel: string,
+    owner: string,
+    from: number,
+    to: number,
+  ) => Effect.Effect<{ readonly moved: boolean; readonly count: number }, DurableExecutorError>
+  /** Delete one unclaimed pending job for one owner by one-based position. */
+  readonly deletePending: (
+    channel: string,
+    owner: string,
+    position: number,
+  ) => Effect.Effect<{ readonly deleted: boolean; readonly count: number }, DurableExecutorError>
+  /** Delete every unclaimed pending job for one owner; returns the removed count. */
+  readonly clearPending: (channel: string, owner: string) => Effect.Effect<number, DurableExecutorError>
 }
 
 export class DurableExecutorStore extends Context.Service<DurableExecutorStore, DurableExecutorRepository>()(
@@ -113,6 +129,7 @@ interface JobRow {
   readonly last_error: string | null
   readonly created_at: number
   readonly updated_at: number
+  readonly queue_order: number
 }
 
 const fromRow = (row: JobRow): DurableJob => {
@@ -128,6 +145,7 @@ const fromRow = (row: JobRow): DurableJob => {
     deliveredMediaCount: row.delivered_media_count,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+    queueOrder: row.queue_order,
   }
   if (row.lease_generation !== null) Object.assign(job, { leaseGeneration: row.lease_generation })
   if (row.lease_expires_at !== null) Object.assign(job, { leaseExpiresAt: row.lease_expires_at })
@@ -163,6 +181,7 @@ const migrate = (database: Database): void => {
     last_error TEXT,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
+    queue_order INTEGER,
     completed_at INTEGER
   )`)
   const columns = database.query<{ readonly name: string }, []>("PRAGMA table_info(executor_jobs)").all()
@@ -175,8 +194,13 @@ const migrate = (database: Database): void => {
   if (!columns.some((column) => column.name === "media_delivery_index")) {
     database.run("ALTER TABLE executor_jobs ADD COLUMN media_delivery_index INTEGER")
   }
+  if (!columns.some((column) => column.name === "queue_order")) {
+    database.run("ALTER TABLE executor_jobs ADD COLUMN queue_order INTEGER")
+  }
+  database.run("UPDATE executor_jobs SET queue_order = rowid WHERE queue_order IS NULL")
   database.run("CREATE INDEX IF NOT EXISTS executor_jobs_claim ON executor_jobs(channel, state, available_at, created_at, id)")
   database.run("CREATE INDEX IF NOT EXISTS executor_jobs_owner ON executor_jobs(channel, owner, state, created_at, id)")
+  database.run("CREATE INDEX IF NOT EXISTS executor_jobs_queue ON executor_jobs(channel, owner, state, queue_order)")
 }
 
 export const openDurableExecutorDatabase = (path: string): Database => {
@@ -257,8 +281,8 @@ export const DurableExecutorStoreLive: Layer.Layer<
           const existing = database.query<JobRow, [string]>("SELECT * FROM executor_jobs WHERE source_key = ?").get(input.sourceKey)
           if (existing !== null) return { job: fromRow(existing), created: false }
           database.query(`INSERT INTO executor_jobs (
-            id, source_key, channel, owner, payload, state, attempt, available_at, session_id, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?)`).run(
+            id, source_key, channel, owner, payload, state, attempt, available_at, session_id, created_at, updated_at, queue_order
+          ) VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, (SELECT COALESCE(MAX(queue_order), 0) + 1 FROM executor_jobs))`).run(
             id,
             input.sourceKey,
             input.channel,
@@ -291,8 +315,8 @@ export const DurableExecutorStoreLive: Layer.Layer<
                     AND predecessor.owner = candidate.owner
                     AND predecessor.state IN ('pending', 'dispatching', 'running', 'finalizing')
                     AND (
-                      predecessor.created_at < candidate.created_at
-                      OR (predecessor.created_at = candidate.created_at AND predecessor.rowid < candidate.rowid)
+                       predecessor.queue_order < candidate.queue_order
+                       OR (predecessor.queue_order = candidate.queue_order AND predecessor.rowid < candidate.rowid)
                     )
                 )
               )
@@ -304,7 +328,7 @@ export const DurableExecutorStoreLive: Layer.Layer<
                   AND active.state IN ('dispatching', 'running', 'finalizing')
                   AND active.lease_expires_at >= ?
               )
-            ORDER BY CASE candidate.state WHEN 'pending' THEN 1 ELSE 0 END, candidate.created_at, candidate.rowid
+            ORDER BY CASE candidate.state WHEN 'pending' THEN 1 ELSE 0 END, candidate.queue_order, candidate.rowid
             LIMIT 1`).get(channel, now, now, now)
           if (row === null) return Option.none<DurableJobLease>()
           const updated = database.query(`UPDATE executor_jobs SET
@@ -329,7 +353,7 @@ export const DurableExecutorStoreLive: Layer.Layer<
         return yield* withDatabase("force claim durable job", () => transaction(() => {
           const row = database.query<JobRow, [string, string]>(`SELECT * FROM executor_jobs
             WHERE channel = ? AND owner = ? AND state IN ('dispatching', 'running', 'finalizing')
-            ORDER BY created_at, rowid LIMIT 1`).get(channel, owner)
+            ORDER BY queue_order, rowid LIMIT 1`).get(channel, owner)
           if (row === null) return Option.none<DurableJobLease>()
           database.query(`UPDATE executor_jobs SET lease_worker = ?, lease_generation = ?, lease_expires_at = ?,
             payload = COALESCE(?, payload), progress_message_id = CASE
@@ -435,7 +459,42 @@ export const DurableExecutorStoreLive: Layer.Layer<
       }),
       get: (jobID) => withDatabase("read durable job", () => Option.fromNullishOr(selectByID(jobID)).pipe(Option.map(fromRow))),
       listOwner: (channel, owner) => withDatabase("list owner durable jobs", () =>
-        database.query<JobRow, [string, string]>("SELECT * FROM executor_jobs WHERE channel = ? AND owner = ? ORDER BY created_at, rowid").all(channel, owner).map(fromRow)),
+        database.query<JobRow, [string, string]>("SELECT * FROM executor_jobs WHERE channel = ? AND owner = ? ORDER BY queue_order, rowid").all(channel, owner).map(fromRow)),
+      movePending: (channel, owner, from, to) => withDatabase("move pending durable job", () => transaction(() => {
+        const rows = database.query<Pick<JobRow, "id" | "queue_order">, [string, string]>(`SELECT id, queue_order
+          FROM executor_jobs
+          WHERE channel = ? AND owner = ? AND state = 'pending' AND lease_generation IS NULL
+          ORDER BY queue_order, rowid`).all(channel, owner)
+        if (from < 1 || to < 1 || from > rows.length || to > rows.length) {
+          return { moved: false, count: rows.length }
+        }
+        if (from === to) return { moved: true, count: rows.length }
+        const orders = rows.map((row) => row.queue_order)
+        const selected = rows[from - 1]
+        if (selected === undefined) return { moved: false, count: rows.length }
+        rows.splice(from - 1, 1)
+        rows.splice(to - 1, 0, selected)
+        const update = database.query("UPDATE executor_jobs SET queue_order = ? WHERE id = ? AND state = 'pending' AND lease_generation IS NULL")
+        for (let index = 0; index < rows.length; index += 1) {
+          const row = rows[index]
+          const order = orders[index]
+          if (row === undefined || order === undefined) continue
+          update.run(order, row.id)
+        }
+        return { moved: true, count: rows.length }
+      })),
+      deletePending: (channel, owner, position) => withDatabase("delete pending durable job", () => transaction(() => {
+        const rows = database.query<Pick<JobRow, "id">, [string, string]>(`SELECT id FROM executor_jobs
+          WHERE channel = ? AND owner = ? AND state = 'pending' AND lease_generation IS NULL
+          ORDER BY queue_order, rowid`).all(channel, owner)
+        const selected = position >= 1 ? rows[position - 1] : undefined
+        if (selected === undefined) return { deleted: false, count: rows.length }
+        database.query("DELETE FROM executor_jobs WHERE id = ? AND state = 'pending' AND lease_generation IS NULL").run(selected.id)
+        return { deleted: true, count: rows.length }
+      })),
+      clearPending: (channel, owner) => withDatabase("clear pending durable jobs", () =>
+        database.query("DELETE FROM executor_jobs WHERE channel = ? AND owner = ? AND state = 'pending' AND lease_generation IS NULL")
+          .run(channel, owner).changes),
     }
   }),
 )

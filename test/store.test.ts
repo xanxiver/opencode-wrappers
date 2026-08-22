@@ -212,6 +212,42 @@ describe("Store", () => {
     }
   })
 
+  test("loose prompt mode round-trips per conversation and persists", async () => {
+    const stateFile = makeStateFile()
+    try {
+      const first = await run(
+        Effect.gen(function* () {
+          const store = yield* Store
+          const initial = yield* store.getLoosePrompts("tg:1:10")
+          yield* store.setLoosePrompts("tg:1:10", true)
+          yield* store.setLoosePrompts("tg:1:20", false)
+          const enabled = yield* store.getLoosePrompts("tg:1:10")
+          const disabled = yield* store.getLoosePrompts("tg:1:20")
+          return { initial, enabled, disabled }
+        }),
+        stateFile,
+      )
+      expect(first.initial).toBe(false)
+      expect(first.enabled).toBe(true)
+      expect(first.disabled).toBe(false)
+
+      const second = await run(
+        Effect.gen(function* () {
+          const store = yield* Store
+          return {
+            enabled: yield* store.getLoosePrompts("tg:1:10"),
+            disabled: yield* store.getLoosePrompts("tg:1:20"),
+          }
+        }),
+        stateFile,
+      )
+      expect(second.enabled).toBe(true)
+      expect(second.disabled).toBe(false)
+    } finally {
+      rmSync(stateFile, { force: true })
+    }
+  })
+
   test("state persists across store instances", async () => {
     const stateFile = makeStateFile()
     try {
