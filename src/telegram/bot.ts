@@ -55,6 +55,14 @@ export const dropUpdateBacklog = (api: Pick<TelegramApiClient, "getUpdates">) =>
   )
 
 /**
+ * True when an update is already confirmed by a concurrent handler that
+ * finished after this batch was fetched. Re-running it would duplicate the
+ * reply, so the poller skips it.
+ */
+export const isStaleUpdate = (confirmedOffset: number, updateID: number): boolean =>
+  confirmedOffset > updateID
+
+/**
  * Long-polling loop over the Telegram Bot API.
  * Updates are handled concurrently up to MAX_CONCURRENT_UPDATES; each update
  * confirms its own polling cursor when it finishes. The poll never stops.
@@ -70,6 +78,10 @@ export const run = () =>
       const current = yield* Ref.get(offset)
       const updates = yield* api.getUpdates(current, 30)
       for (const update of updates) {
+        // A concurrent handler may have finished while this batch was in
+        // flight, confirming past this update; re-running it here would
+        // duplicate the reply even though Telegram will not send it again.
+        if (isStaleUpdate(yield* Ref.get(offset), update.update_id)) continue
         if ((yield* FiberMap.size(fibers)) >= MAX_CONCURRENT_UPDATES) {
           // Apply backpressure: handle this update inline before fanning out
           // again, so an unbounded burst cannot pile up fibers.
