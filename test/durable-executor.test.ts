@@ -16,7 +16,7 @@ import {
   type DurableExecutorRepository,
 } from "../src/core/durable-executor.js"
 import { GitChangesError, type ChangesSummaryResult, type GitChangesService } from "../src/core/git-changes.js"
-import { agentSwitchRetriesExhausted, decodeAttachmentSnapshots, encodeAttachmentSnapshots, finalEditDisposition, finishNotificationWord, redactedReviewEvidence, resolveOwnedDurableReview, runQueueItems, settleFinalEditError, withChangesSummaryUsing } from "../src/telegram/durable-executor.js"
+import { agentSwitchRetriesExhausted, decideAutoContinue, decodeAttachmentSnapshots, encodeAttachmentSnapshots, finalEditDisposition, finishNotificationWord, redactedReviewEvidence, resolveOwnedDurableReview, runQueueItems, settleFinalEditError, withChangesSummaryUsing } from "../src/telegram/durable-executor.js"
 import { ApiError } from "../src/telegram/api.js"
 import { AgentSwitchError } from "../src/telegram/run.js"
 
@@ -571,8 +571,33 @@ describe("agent switch retries", () => {
   })
 })
 
-describe("finishNotificationWord", () => {
-  test("maps persisted outcomes to their notification word", () => {
+describe("decideAutoContinue", () => {
+  test("resets the counter on success", () => {
+    expect(decideAutoContinue(true, 2, "done")).toEqual({ action: "reset" })
+    expect(decideAutoContinue(false, 2, "done")).toEqual({ action: "reset" })
+    expect(decideAutoContinue(true, 0, "done")).toEqual({ action: "none" })
+  })
+
+  test("continues on qualifying failures while under the cap", () => {
+    for (const outcome of ["failed", "error", "timeout"]) {
+      expect(decideAutoContinue(true, 0, outcome)).toEqual({ action: "continue", round: 1 })
+      expect(decideAutoContinue(true, 2, outcome)).toEqual({ action: "continue", round: 3 })
+    }
+  })
+
+  test("reports the limit once reached and ignores disabled mode", () => {
+    expect(decideAutoContinue(true, 3, "failed")).toEqual({ action: "limit" })
+    expect(decideAutoContinue(false, 1, "failed")).toEqual({ action: "reset" })
+    expect(decideAutoContinue(false, 0, "failed")).toEqual({ action: "none" })
+  })
+
+  test("ignores outcomes that are not failures", () => {
+    expect(decideAutoContinue(true, 0, "interrupted")).toEqual({ action: "none" })
+    expect(decideAutoContinue(true, 0, undefined)).toEqual({ action: "none" })
+  })
+})
+
+describe("finishNotificationWord", () => {  test("maps persisted outcomes to their notification word", () => {
     expect(finishNotificationWord("done", "anything")).toBe("done")
     expect(finishNotificationWord("failed", "anything")).toBe("fail")
     expect(finishNotificationWord("error", "anything")).toBe("fail")

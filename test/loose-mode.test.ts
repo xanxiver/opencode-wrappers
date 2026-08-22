@@ -84,6 +84,8 @@ describe("loose prompt mode", () => {
       setModel: () => Effect.void,
       getLoosePrompts: () => Ref.get(loose),
       setLoosePrompts: (_conversation, enabled) => Ref.set(loose, enabled),
+      getAutoContinue: () => Effect.succeed(false),
+      setAutoContinue: () => Effect.void,
       listClients: () => Effect.succeed([]),
       listDirectories: () => Effect.succeed([]),
     }
