@@ -51,6 +51,22 @@ describe("Telegram API response decoding", () => {
     expect(finalEditDisposition(error)).toBe("accepted")
   })
 
+  test("captures retry_after from flood-limited responses", () => {
+    const error = decodeTelegramErrorResponse(
+      "sendMessage",
+      429,
+      JSON.stringify({
+        ok: false,
+        error_code: 429,
+        description: "Too Many Requests: retry after 17",
+        parameters: { retry_after: 17 },
+      }),
+    )
+    expect(error.code).toBe(429)
+    expect(error.transient).toBe(true)
+    expect(error.retryAfterMs).toBe(17000)
+  })
+
   test("records a durable rejection only after a definitive Telegram failure", async () => {
     let rejections = 0
     const reject = Effect.sync(() => { rejections += 1; return true })
