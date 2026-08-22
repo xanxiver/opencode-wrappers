@@ -27,6 +27,7 @@ import { PermissionRegistry } from "./permissions.js"
 import { QuestionRegistry } from "./questions.js"
 import { reconcilePendingSession } from "./resurface.js"
 import type { InteractionStoreError } from "./interaction-store.js"
+import { InteractionStore } from "./interaction-store.js"
 import { renderFinal, truncate, appendChangesSummary, renderRunQueue, type RunQueueItem } from "./render.js"
 import { renderTelegramMermaid } from "./mermaid.js"
 
@@ -147,6 +148,35 @@ export const runQueueItems = (jobs: readonly DurableJob[]): Effect.Effect<readon
       ),
   )
 
+/** Max consecutive auto-continue prompts before giving up. */
+export const AUTO_CONTINUE_MAX = 3
+
+/** Outcomes that qualify for an automatic continue prompt. */
+const AUTO_CONTINUE_OUTCOMES: readonly string[] = ["failed", "error", "timeout"]
+
+export type AutoContinueDecision =
+  | { readonly action: "none" }
+  | { readonly action: "reset" }
+  | { readonly action: "limit" }
+  | { readonly action: "continue"; readonly round: number }
+
+/**
+ * Decide what to do after a finished run. Success resets the consecutive
+ * counter; qualifying failures increment it and continue while under the
+ * cap; reaching the cap reports once; disabled mode just cleans up.
+ */
+export const decideAutoContinue = (
+  enabled: boolean,
+  currentCount: number,
+  outcome: string | undefined,
+): AutoContinueDecision => {
+  if (outcome === "done") return currentCount > 0 ? { action: "reset" } : { action: "none" }
+  if (!AUTO_CONTINUE_OUTCOMES.includes(outcome ?? "")) return { action: "none" }
+  if (!enabled) return currentCount > 0 ? { action: "reset" } : { action: "none" }
+  if (currentCount >= AUTO_CONTINUE_MAX) return { action: "limit" }
+  return { action: "continue", round: currentCount + 1 }
+}
+
 export const finalEditDisposition = (error: Pick<ApiError, "description" | "transient">): "accepted" | "retry" | "fail" => {
   if (error.description?.toLowerCase().includes("message is not modified") === true) return "accepted"
   return error.transient ? "retry" : "fail"
@@ -247,7 +277,7 @@ export const withChangesSummaryUsing = (
 export const TelegramDurableExecutorLive: Layer.Layer<
   TelegramDurableExecutor,
   never,
-  DurableExecutorStore | Sessions | Store | OpenCode | TelegramApi | AppConfig | FileSystem.FileSystem | Path.Path | HttpClient.HttpClient | PermissionRegistry | QuestionRegistry | GitChanges
+  DurableExecutorStore | Sessions | Store | OpenCode | TelegramApi | AppConfig | FileSystem.FileSystem | Path.Path | HttpClient.HttpClient | PermissionRegistry | QuestionRegistry | GitChanges | InteractionStore
 > = Layer.effect(
   TelegramDurableExecutor,
   Effect.gen(function* () {
@@ -262,7 +292,8 @@ export const TelegramDurableExecutorLive: Layer.Layer<
     const permissionRegistry = yield* PermissionRegistry
     const questionRegistry = yield* QuestionRegistry
     const gitChanges = yield* GitChanges
-    const context = yield* Effect.context<DurableExecutorStore | Sessions | Store | OpenCode | TelegramApi | AppConfig | FileSystem.FileSystem | Path.Path | HttpClient.HttpClient | PermissionRegistry | QuestionRegistry | GitChanges>()
+    const interaction = yield* InteractionStore
+    const context = yield* Effect.context<DurableExecutorStore | Sessions | Store | OpenCode | TelegramApi | AppConfig | FileSystem.FileSystem | Path.Path | HttpClient.HttpClient | PermissionRegistry | QuestionRegistry | GitChanges | InteractionStore>()
     const fibers = yield* FiberMap.make<string, void, never>()
     yield* Effect.addFinalizer(() => FiberMap.clear(fibers).pipe(
       Effect.andThen(jobs.releaseWorkerLeases),
@@ -344,7 +375,80 @@ export const TelegramDurableExecutorLive: Layer.Layer<
           yield* jobs.markMediaDelivered(lease.job.id, lease.generation, index + 1)
         }
         yield* jobs.complete(lease.job.id, lease.generation)
+        yield* maybeAutoContinue(lease, payload, result.outcome, progressMessageID).pipe(
+          Effect.catchCause((cause) =>
+            logBoundary("telegram/executor", "auto-continue", "auto continue handling failed")(cause),
+          ),
+        )
       })
+
+    const autoContinueKey = (sessionID: string): string => `autocontinue:${sessionID}`
+
+    const maybeAutoContinue = (
+      lease: DurableJobLease,
+      payload: TelegramJobPayload,
+      outcome: string | undefined,
+      progressMessageID: number,
+    ) => Effect.gen(function* () {
+      const conversation = conversationId({ chatId: payload.chatId, threadId: payload.threadId })
+      const enabled = yield* store.getAutoContinue(conversation)
+      const storedCount = yield* interaction.get(autoContinueKey(payload.sessionID))
+      const currentCount = Option.isSome(storedCount) ? Number(storedCount.value) || 0 : 0
+      const decision = decideAutoContinue(enabled, currentCount, outcome)
+
+      const notify = (text: string) => api.sendMessage({
+        chatId: payload.chatId,
+        text,
+        messageThreadId: payload.threadId,
+        replyToMessageId: progressMessageID > 0 ? progressMessageID : undefined,
+      }).pipe(
+        Effect.catchCause((cause) =>
+          logBoundary("telegram/executor", "telegram-notification", "auto continue notice failed")(cause),
+        ),
+      )
+
+      if (decision.action === "reset") {
+        yield* interaction.set(autoContinueKey(payload.sessionID), 0).pipe(
+          Effect.catchCause((cause) => logBoundary("telegram/executor", "auto-continue", "counter reset failed")(cause)),
+        )
+        return
+      }
+      if (decision.action !== "continue") {
+        if (decision.action === "limit") {
+          yield* notify(`Auto-continue limit (${AUTO_CONTINUE_MAX}) reached. Send /prompt to try again.`)
+        }
+        return
+      }
+
+      // Requeue a minimal "continue" prompt into the same session and topic.
+      // Attachments are intentionally not re-downloaded; the model and agent
+      // snapshots carry over so the retry runs with the same configuration.
+      const syntheticMessage: Message = {
+        message_id: progressMessageID > 0 ? progressMessageID : 0,
+        chat: { id: payload.chatId },
+        text: "continue",
+      }
+      if (payload.threadId !== undefined) Object.assign(syntheticMessage, { message_thread_id: payload.threadId })
+      const nextPayload: TelegramJobPayload = {
+        chatId: payload.chatId,
+        message: syntheticMessage,
+        text: "continue",
+        sessionID: payload.sessionID,
+        directory: payload.directory,
+      }
+      if (payload.model !== undefined) Object.assign(nextPayload, { model: payload.model })
+      if (payload.agent !== undefined) Object.assign(nextPayload, { agent: payload.agent })
+      if (payload.threadId !== undefined) Object.assign(nextPayload, { threadId: payload.threadId })
+      yield* jobs.submit({
+        sourceKey: `telegram:${conversation}:continue:${decision.round}:${lease.job.id}`,
+        channel: "telegram",
+        owner: ownerFor(payload.sessionID),
+        sessionID: payload.sessionID,
+        payload: JSON.stringify(nextPayload),
+      })
+      yield* interaction.set(autoContinueKey(payload.sessionID), decision.round)
+      yield* notify(`Auto-continue ${decision.round}/${AUTO_CONTINUE_MAX}…`)
+    })
 
     const execute = (lease: DurableJobLease) =>
       Effect.gen(function* () {

@@ -27,6 +27,8 @@ interface State {
   readonly models: Record<string, StoredModel>
   /** conversation id -> loose prompts enabled. */
   readonly loosePrompts: Record<string, boolean>
+  /** conversation id -> auto-continue on failure enabled. */
+  readonly autoContinue: Record<string, boolean>
 }
 
 const StoredModelSchema = Schema.Struct({
@@ -41,13 +43,14 @@ const StateSchema = Schema.Struct({
   directories: Schema.Record(Schema.String, Schema.String),
   models: Schema.optional(Schema.Record(Schema.String, StoredModelSchema)),
   loosePrompts: Schema.optional(Schema.Record(Schema.String, Schema.Boolean)),
+  autoContinue: Schema.optional(Schema.Record(Schema.String, Schema.Boolean)),
 })
 
 /** Legacy format: clientId -> sessionID (one session per chat). */
 const LegacySchema = Schema.Record(Schema.String, Schema.String)
 type JsonValue = ReturnType<typeof JSON.parse>
 
-const emptyState = (): State => ({ sessions: {}, conversationSessions: {}, directories: {}, models: {}, loosePrompts: {} })
+const emptyState = (): State => ({ sessions: {}, conversationSessions: {}, directories: {}, models: {}, loosePrompts: {}, autoContinue: {} })
 
 /** Migrate the legacy chat->session map: each chat keeps its session under its own key. */
 const migrateLegacy = (legacy: Record<string, string>): State => {
@@ -55,7 +58,7 @@ const migrateLegacy = (legacy: Record<string, string>): State => {
   for (const clientId of Object.keys(legacy)) {
     directories[clientId] = clientId
   }
-  return { sessions: { ...legacy }, conversationSessions: { ...legacy }, directories, models: {}, loosePrompts: {} }
+  return { sessions: { ...legacy }, conversationSessions: { ...legacy }, directories, models: {}, loosePrompts: {}, autoContinue: {} }
 }
 
 const parseState = (json: JsonValue): Option.Option<{ readonly state: State; readonly migrated: boolean }> =>
@@ -72,7 +75,7 @@ const parseState = (json: JsonValue): Option.Option<{ readonly state: State; rea
           return sessionID === undefined ? [] : [[conversation, sessionID]]
         }),
       )
-      return Option.some({ state: { ...state, conversationSessions, models: state.models ?? {}, loosePrompts: state.loosePrompts ?? {} }, migrated: false })
+      return Option.some({ state: { ...state, conversationSessions, models: state.models ?? {}, loosePrompts: state.loosePrompts ?? {}, autoContinue: state.autoContinue ?? {} }, migrated: false })
     },
   })
 
@@ -92,6 +95,9 @@ export interface StoreService {
   /** True when plain messages start runs for this conversation. */
   readonly getLoosePrompts: (conversationId: string) => Effect.Effect<boolean, never>
   readonly setLoosePrompts: (conversationId: string, enabled: boolean) => Effect.Effect<void, StoreError>
+  /** True when failed runs auto-send a continue prompt for this conversation. */
+  readonly getAutoContinue: (conversationId: string) => Effect.Effect<boolean, never>
+  readonly setAutoContinue: (conversationId: string, enabled: boolean) => Effect.Effect<void, StoreError>
   /** Every client id the store knows about. */
   readonly listClients: () => Effect.Effect<readonly string[], never>
   /** Every directory retained by a client or session mapping. */
@@ -211,6 +217,13 @@ export const Live: Layer.Layer<Store, StoreError, FileSystem.FileSystem | AppCon
         commit((state) => ({
           ...state,
           loosePrompts: { ...state.loosePrompts, [conversationId]: enabled },
+        })),
+      getAutoContinue: (conversationId) =>
+        Ref.get(ref).pipe(Effect.map((state) => state.autoContinue[conversationId] ?? false)),
+      setAutoContinue: (conversationId, enabled) =>
+        commit((state) => ({
+          ...state,
+          autoContinue: { ...state.autoContinue, [conversationId]: enabled },
         })),
       listClients: () => Ref.get(ref).pipe(Effect.map((state) => Object.keys(state.directories))),
       listDirectories: () => Ref.get(ref).pipe(Effect.map((state) => [

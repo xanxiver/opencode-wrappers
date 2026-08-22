@@ -79,6 +79,8 @@ const store: StoreService = {
   setModel: () => Effect.void,
   getLoosePrompts: () => Effect.succeed(false),
   setLoosePrompts: () => Effect.void,
+  getAutoContinue: () => Effect.succeed(false),
+  setAutoContinue: () => Effect.void,
   listClients: () => Effect.succeed([]),
   listDirectories: () => Effect.succeed([]),
 }

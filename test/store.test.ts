@@ -248,6 +248,31 @@ describe("Store", () => {
     }
   })
 
+  test("auto continue mode round-trips per conversation and persists", async () => {
+    const stateFile = makeStateFile()
+    try {
+      await run(
+        Effect.gen(function* () {
+          const store = yield* Store
+          expect(yield* store.getAutoContinue("tg:9")).toBe(false)
+          yield* store.setAutoContinue("tg:9", true)
+        }),
+        stateFile,
+      )
+
+      const value = await run(
+        Effect.gen(function* () {
+          const store = yield* Store
+          return yield* store.getAutoContinue("tg:9")
+        }),
+        stateFile,
+      )
+      expect(value).toBe(true)
+    } finally {
+      rmSync(stateFile, { force: true })
+    }
+  })
+
   test("state persists across store instances", async () => {
     const stateFile = makeStateFile()
     try {

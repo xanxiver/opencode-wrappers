@@ -44,10 +44,13 @@ The bot lives in `src/` and `test/` at the repository root. The core
 - `/queue_clear`: remove every queued task for the current session.
 - `/loose on|off`: when on, a plain message starts a run without `/prompt`.
   Slash commands still run first. The setting is stored per conversation.
+- `/continue on|off`: when on, a failed, errored, or timed-out run sends a
+  `continue` prompt into the same session automatically. Max 3 consecutive
+  continues; any success resets the count. Stored per conversation.
 - Commands: `/start`, `/help`, `/prompt`, `/new`, `/stop`, `/reconnect`, `/forceReconnect`,
   `/compact`, `/review`, `/model`, `/agents`, `/pwa <agent> <prompt>`, `/status`, `/whoami`, `/projects`, `/project <path>`,
   `/sessions`, `/queue`, `/move <from> <to>`, `/queue_delete <pos>`, `/queue_clear`,
-  `/loose on|off`.
+  `/loose on|off`, `/continue on|off`.
 - User whitelist via `TELEGRAM_ALLOWED_USERS` (empty = deny all).
 
 ## Reliability
