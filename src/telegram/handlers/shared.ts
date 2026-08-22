@@ -40,7 +40,7 @@ export const HELP_TEXT = [
   "/model <exact-model> — switch directly to an exact model",
   "/agents - list and select an agent for the current session",
   "/pwa <agent> <prompt> - run a prompt with a specific agent",
-  "/status - show the directory, session, model, and loose mode",
+  "/status - show the directory, session, model, git ref, and toggles",
   "/reviews — list ambiguous durable jobs for the current session",
   "/resolve_review <job-id> — resolve a durable review and remove retained data",
   "/queue - show the running and queued runs for this session",
