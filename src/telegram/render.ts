@@ -46,14 +46,40 @@ export const promptWithReply = (prompt: string, repliedText: string | undefined)
 /** How much of the reasoning stream to show in the live message. */
 export const REASONING_DISPLAY_LIMIT = 800
 
-/** Truncate long text for Telegram; keep the head and the tail. */
+/**
+ * Truncate long text for Telegram; keep the head and the tail. Cuts fall on
+ * code-point boundaries so surrogate pairs survive, while the result stays
+ * within the UTF-16 unit budget Telegram enforces.
+ */
 export const truncate = (text: string, maxLength: number = MAX_MESSAGE_LENGTH): string => {
-  if (text.length <= maxLength) return text
+  const units = (chars: readonly string[]): number => chars.reduce((sum, char) => sum + char.length, 0)
+  const chars = Array.from(text)
+  if (units(chars) <= maxLength) return text
   const marker = maxLength >= 20 ? "\n… [truncated] …\n" : "…"
-  const keep = maxLength - marker.length
-  const head = Math.max(1, Math.ceil(keep * 0.6))
-  const tail = Math.max(0, keep - head)
-  return text.slice(0, head) + marker + text.slice(-tail)
+  const budget = Math.max(2, maxLength - marker.length)
+  const headTarget = Math.max(1, Math.ceil(budget * 0.6))
+  const head: string[] = []
+  let used = 0
+  let index = 0
+  for (; index < chars.length; index += 1) {
+    const char = chars[index]
+    const width = char?.length ?? 0
+    if (used > 0 && used + width > headTarget) break
+    if (char !== undefined) head.push(char)
+    used += width
+  }
+  const remaining = chars.slice(index)
+  const tailTarget = Math.max(0, budget - used)
+  const tail: string[] = []
+  let tailUsed = 0
+  for (let cursor = remaining.length - 1; cursor >= 0; cursor -= 1) {
+    const char = remaining[cursor]
+    const width = char?.length ?? 0
+    if (tailUsed + width > tailTarget) break
+    if (char !== undefined) tail.unshift(char)
+    tailUsed += width
+  }
+  return head.join("") + marker + tail.join("")
 }
 
 /**

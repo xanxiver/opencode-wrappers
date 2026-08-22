@@ -1,6 +1,6 @@
-import { Cause, Effect, Option, Ref, Schedule } from "effect"
+import { Cause, Effect, FiberMap, Option, Ref, Schedule } from "effect"
 import { logBoundary } from "../core/logging.js"
-import { ApiError, TelegramApi, type Update } from "./api.js"
+import { ApiError, TelegramApi, type TelegramApiClient, type Update } from "./api.js"
 import { AttachmentDownloadError } from "./files.js"
 import { handleUpdate } from "./handlers/index.js"
 
@@ -8,7 +8,15 @@ import { handleUpdate } from "./handlers/index.js"
 export const isPollingConflict = (cause: Cause.Cause<unknown>): boolean =>
   Option.exists(Cause.findErrorOption(cause), (error) => error instanceof ApiError && error.code === 409)
 
-/** Handle one update and advance the offset whether it succeeds or is quarantined. */
+/** Updates handled concurrently at once; further updates wait in the batch. */
+export const MAX_CONCURRENT_UPDATES = 8
+
+/**
+ * Handle one update and advance the polling cursor whether it succeeds or is
+ * quarantined. The cursor only moves forward: with concurrent handling, a
+ * slow older update must never pull the confirmed offset below one that a
+ * faster newer update already confirmed.
+ */
 export const processUpdate = <E, R>(
   update: Update,
   offset: Ref.Ref<number>,
@@ -22,27 +30,63 @@ export const processUpdate = <E, R>(
         // A poison update must not block all later Telegram updates forever.
         // The complete Cause is logged above; quarantine is represented by
         // advancing the polling cursor after the bounded retry policy.
-        Effect.andThen(Ref.set(offset, update.update_id + 1)),
+        Effect.andThen(Ref.update(offset, (current) => Math.max(current, update.update_id + 1))),
       ),
     ),
-    Effect.tap(() => Ref.set(offset, update.update_id + 1)),
+    Effect.tap(() => Ref.update(offset, (current) => Math.max(current, update.update_id + 1))),
   )
 }
 
 /**
+ * Confirm and drop everything Telegram has queued for this bot. Long-polling
+ * starts from the newest update so prompts typed during downtime are not
+ * executed hours later; jobs already submitted stay idempotent by their
+ * durable source key.
+ */
+export const dropUpdateBacklog = (api: Pick<TelegramApiClient, "getUpdates">) =>
+  api.getUpdates(-1, 0).pipe(
+    Effect.map((latest) => latest.at(-1)?.update_id ?? -1),
+    Effect.map((newest) => newest + 1),
+    Effect.catchCause((cause) =>
+      logBoundary("telegram/bot", "telegram-poll", "could not read the update backlog; starting from the oldest update")(cause).pipe(
+        Effect.as(0),
+      ),
+    ),
+  )
+
+/**
  * Long-polling loop over the Telegram Bot API.
- * Updates are handled in order; the poll never stops.
+ * Updates are handled concurrently up to MAX_CONCURRENT_UPDATES; each update
+ * confirms its own polling cursor when it finishes. The poll never stops.
  */
 export const run = () =>
-  Effect.gen(function* () {
+  Effect.scoped(
+    Effect.gen(function* () {
     const api = yield* TelegramApi
-    const offset = yield* Ref.make(0)
+    const start = yield* dropUpdateBacklog(api)
+    const offset = yield* Ref.make(start)
+    const fibers = yield* FiberMap.make<number, void, unknown>()
     const pollOnce = Effect.gen(function* () {
       const current = yield* Ref.get(offset)
       const updates = yield* api.getUpdates(current, 30)
       for (const update of updates) {
-        yield* processUpdate(update, offset, handleUpdate(update), (error) =>
-          error instanceof AttachmentDownloadError && error.transient)
+        if ((yield* FiberMap.size(fibers)) >= MAX_CONCURRENT_UPDATES) {
+          // Apply backpressure: handle this update inline before fanning out
+          // again, so an unbounded burst cannot pile up fibers.
+          yield* processUpdate(update, offset, handleUpdate(update), (error) =>
+            error instanceof AttachmentDownloadError && error.transient)
+          continue
+        }
+        yield* FiberMap.run(
+          fibers,
+          update.update_id,
+          processUpdate(update, offset, handleUpdate(update), (error) =>
+            error instanceof AttachmentDownloadError && error.transient),
+          // Telegram re-delivers every unconfirmed update on each poll. Skip
+          // an update whose handler is still running instead of interrupting
+          // and restarting it; the handler confirms its own offset when done.
+          { onlyIfMissing: true },
+        )
       }
     })
     yield* pollOnce.pipe(
@@ -59,4 +103,5 @@ export const run = () =>
       ),
       Effect.repeat(Schedule.spaced("100 millis")),
     )
-  })
+    }),
+  )
