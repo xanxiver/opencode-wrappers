@@ -69,8 +69,22 @@ export const handleMessage = (message: Message) =>
       const prompt = text.trim()
       if (prompt.length === 0) return
       const store = yield* Store
-      const loose = yield* store.getLoosePrompts(conversationId({ chatId, threadId }))
-      if (!loose) return
+      const conversation = conversationId({ chatId, threadId })
+      const loose = yield* store.getLoosePrompts(conversation)
+      const meta = {
+        component: "telegram/handlers",
+        boundary: "loose-prompts",
+        conversation,
+        loose,
+        characters: prompt.length,
+      }
+      if (!loose) {
+        yield* Effect.annotateLogs(meta)(
+          Effect.logWarning("plain text ignored; loose prompts are off for this conversation"),
+        )
+        return
+      }
+      yield* Effect.annotateLogs(meta)(Effect.logInfo("loose prompt accepted"))
       const repliedText = replied === undefined ? undefined : replied.text ?? replied.caption
       yield* runWithFiles(chatId, message, promptWithReply(prompt, repliedText))
       return
