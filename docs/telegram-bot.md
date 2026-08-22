@@ -17,6 +17,8 @@ The bot lives in `src/` and `test/` at the repository root. The core
   (child sessions), their permission and question prompts are delivered in the
   parent run's chat and topic, and answers reply to the child session.
 - Live progress: text, reasoning, and tool activity update one message.
+- Finished runs reply `done`, `fail`, `interrupted`, or `timeout` under the
+  run message so the chat notifies on completion.
 - Token usage and cost in the final message.
 - Working-tree changes summary in the final message (branch, changed files, and
   tracked diff line totals) when the project directory is inside a Git

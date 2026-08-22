@@ -96,6 +96,8 @@ export interface MediaArtifact {
 export interface RunFinalization {
   readonly text: string
   readonly media: readonly MediaArtifact[]
+  /** How the run ended; drives the finish notification reply. */
+  readonly outcome: RunOutcome
 }
 
 const ToolFilePartSchema = Schema.Struct({
@@ -1192,7 +1194,7 @@ export const runPrompt = (input: RunInput) =>
       : yield* mediaFromResponseText(finalState.text)
     const rendered = yield* renderTelegramMermaid(renderFinal(response.text, outcome) + usageLine)
     const finalMedia = limitMedia([...rendered.media, ...finalState.media, ...response.media])
-    const finalization: RunFinalization = { text: truncate(rendered.text), media: finalMedia }
+    const finalization: RunFinalization = { text: truncate(rendered.text), media: finalMedia, outcome }
     if (input.onFinalizing !== undefined) yield* input.onFinalizing(finalization)
     return finalization
   })
