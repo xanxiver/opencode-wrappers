@@ -3,6 +3,7 @@ import { logBoundary } from "../../core/logging.js"
 import { OpenCode } from "../../core/opencode.js"
 import { Sessions } from "../../core/sessions.js"
 import { Store } from "../../core/store.js"
+import { GitChanges } from "../../core/git-changes.js"
 import { TelegramDurableExecutor, AUTO_CONTINUE_MAX } from "../durable-executor.js"
 import type { Message } from "../api.js"
 import { sendText } from "./shared.js"
@@ -226,6 +227,7 @@ export const showStatus = (chatId: number, threadId?: number) =>
     const sessions = yield* Sessions
     const opencode = yield* OpenCode
     const store = yield* Store
+    const gitChanges = yield* GitChanges
     const conversation = conversationId({ chatId, threadId })
     const directory = yield* sessions.directoryFor(conversation)
     const sessionID = yield* store.getSessionIDForConversation(conversation)
@@ -235,6 +237,24 @@ export const showStatus = (chatId: number, threadId?: number) =>
       onSome: (model) =>
         `Model: ${model.id} (${model.providerID})${model.variant === undefined ? "" : ` [${model.variant}]`}`,
     })
+    const gitLine = Option.getOrUndefined(yield* gitChanges.summarize(directory).pipe(
+      Effect.map((result): Option.Option<string> => {
+        if (result.kind !== "summary") return Option.none()
+        const ref = Option.match(result.summary.commit, {
+          onNone: () => "",
+          onSome: (commit) => ` @ ${commit}`,
+        })
+        return Option.match(result.summary.branch, {
+          onNone: () => (ref === "" ? Option.none() : Option.some(`Git: detached${ref}`)),
+          onSome: (branch) => Option.some(`Git: ${branch}${ref}`),
+        })
+      }),
+      Effect.catchCause((cause) =>
+        logBoundary("telegram/handlers", "git-changes", "status git lookup failed")(cause).pipe(
+          Effect.as(Option.none<string>()),
+        ),
+      ),
+    ))
     const sessionStatus = yield* Option.match(sessionID, {
       onNone: () => Effect.succeed({ session: Option.none(), contextLine: "Context: none" }),
       onSome: (id) =>
@@ -271,11 +291,18 @@ export const showStatus = (chatId: number, threadId?: number) =>
         }),
     })
     const loose = yield* store.getLoosePrompts(conversation)
-    yield* sendText(
-      chatId,
-      `Directory: ${directory}\n${sessionLine}\n${modelLine}\n${sessionStatus.contextLine}\n${runLine}\nLoose prompts: ${loose ? "on" : "off"}`,
-      threadId,
-    )
+    const autoContinue = yield* store.getAutoContinue(conversation)
+    const lines: string[] = [
+      `Directory: ${directory}`,
+      sessionLine,
+      modelLine,
+      sessionStatus.contextLine,
+      runLine,
+    ]
+    if (gitLine !== undefined) lines.push(gitLine)
+    lines.push(`Loose prompts: ${loose ? "on" : "off"}`)
+    lines.push(`Auto-continue: ${autoContinue ? "on" : "off"}`)
+    yield* sendText(chatId, lines.join("\n"), threadId)
   })
 
 /** `/session <id>` — validate and set the active session for this directory. */
