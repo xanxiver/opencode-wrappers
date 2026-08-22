@@ -62,6 +62,12 @@ export class AgentSwitchError extends Data.TaggedError("AgentSwitchError")<{
 /** Default max run time; set TELEGRAM_RUN_TIMEOUT=none to disable it. */
 export const RUN_TIMEOUT = Duration.minutes(10)
 
+/**
+ * Max wait for a busy session before dispatch gives up. This bound never
+ * interrupts the session: the job does not own the OpenCode run yet.
+ */
+export const PRE_DISPATCH_WAIT = Duration.seconds(60)
+
 /** Reconnect schedule for the event stream (max 5 retries, 30s cap). */
 const reconnectSchedule = Schedule.exponential("500 millis", 2).pipe(
   Schedule.upTo({ times: 5, duration: "30 seconds" }),
@@ -967,9 +973,6 @@ export const runPrompt = (input: RunInput) =>
     )
 
     const run = Effect.gen(function* () {
-      const terminal = yield* Ref.make<Option.Option<RunOutcome>>(Option.none())
-      const terminalHandled = yield* Deferred.make<void>()
-      const eventReady = yield* Deferred.make<void>()
       const waitUntilIdle = (failureMessage: string): Effect.Effect<boolean> =>
         Effect.gen(function* () {
           while (true) {
@@ -1004,34 +1007,98 @@ export const runPrompt = (input: RunInput) =>
             yield* Effect.sleep("1 second")
           }
         })
+      // ---- Phase 1: preparation (bounded, never interrupts the session) ----
+      let dispatchable = false
       if (input.reconnect === true) {
         yield* registry.setSessionRoute(input.sessionID, { chatId: input.chatId, threadId: input.threadId })
         yield* questionRegistry.setSessionRoute(input.sessionID, { chatId: input.chatId, threadId: input.threadId })
-      }
-      if (input.reconnect !== true) {
-        const idle = yield* waitUntilIdle("wait before prompt failed")
-        if (!idle) return "error" as const
-        yield* registry.setSessionRoute(input.sessionID, { chatId: input.chatId, threadId: input.threadId })
-        yield* questionRegistry.setSessionRoute(input.sessionID, { chatId: input.chatId, threadId: input.threadId })
-        // Re-apply the last chosen model for this directory, so a fresh
-        // session (/new or compaction) does not fall back to default.
-        if (input.model !== undefined) {
-          yield* opencode.switchModel({
-            sessionID: input.sessionID,
-            model: input.model,
-          }).pipe(Effect.catchCause(logOpenCodeFailure("re-apply model failed")))
+        dispatchable = true
+      } else {
+        const prepared = yield* Effect.timeoutOption(
+          Effect.gen(function* () {
+            const idle = yield* waitUntilIdle("wait before prompt failed")
+            if (!idle) return false as const
+            yield* registry.setSessionRoute(input.sessionID, { chatId: input.chatId, threadId: input.threadId })
+            yield* questionRegistry.setSessionRoute(input.sessionID, { chatId: input.chatId, threadId: input.threadId })
+            // Re-apply the last chosen model for this directory, so a fresh
+            // session (/new or compaction) does not fall back to default.
+            if (input.model !== undefined) {
+              yield* opencode.switchModel({
+                sessionID: input.sessionID,
+                model: input.model,
+              }).pipe(Effect.catchCause(logOpenCodeFailure("re-apply model failed")))
+            }
+            if (input.agent !== undefined) {
+              yield* opencode.switchAgent({
+                sessionID: input.sessionID,
+                agent: input.agent,
+              }).pipe(Effect.catchCause((cause) =>
+                logOpenCodeFailure("apply agent failed")(cause).pipe(
+                  Effect.andThen(Effect.fail(new AgentSwitchError({ agent: input.agent ?? "", cause }))),
+                ),
+              ))
+            }
+            return true as const
+          }),
+          PRE_DISPATCH_WAIT,
+        )
+        if (Option.isNone(prepared)) {
+          yield* Ref.update(state, (current) => ({
+            ...current,
+            text: "The session stayed busy, so this prompt was not started.",
+            dirty: true,
+          }))
+        } else if (!prepared.value) {
+          yield* Ref.update(state, (current) => ({
+            ...current,
+            text: "OpenCode could not be reached to start this prompt.",
+            dirty: true,
+          }))
+        } else {
+          dispatchable = true
         }
-        if (input.agent !== undefined) {
-          yield* opencode.switchAgent({
-            sessionID: input.sessionID,
-            agent: input.agent,
-          }).pipe(Effect.catchCause((cause) =>
-            logOpenCodeFailure("apply agent failed")(cause).pipe(
-              Effect.andThen(Effect.fail(new AgentSwitchError({ agent: input.agent ?? "", cause }))),
-            ),
-          ))
-        }
       }
+
+      let outcome: RunOutcome = "error"
+      if (dispatchable) {
+        // Only this dispatched phase may time out into an interrupt: the
+        // session is now running work this job owns.
+        const configuredTimeout = config.telegramRunTimeout.trim().toLowerCase()
+        const drive = configuredTimeout === "none"
+          ? driveDispatchedRun(waitUntilIdle)
+          : Option.match(parseRunTimeout(configuredTimeout), {
+            onNone: () => driveDispatchedRun(waitUntilIdle).pipe(Effect.timeout(RUN_TIMEOUT)),
+            onSome: (duration) => driveDispatchedRun(waitUntilIdle).pipe(Effect.timeout(duration)),
+          })
+        outcome = yield* drive.pipe(
+          Effect.catchCause((cause) => {
+            if (Cause.hasInterrupts(cause)) return Effect.failCause(cause)
+            const timedOut = Option.match(Cause.findErrorOption(cause), {
+              onNone: () => false,
+              onSome: (error) => error instanceof Cause.TimeoutError,
+            })
+            return timedOut
+              ? Effect.andThen(
+                opencode.interrupt(input.sessionID).pipe(
+                  Effect.catchCause((cause) => logOpenCodeFailure("interrupt on timeout")(cause)),
+                ),
+                Effect.succeed<RunOutcome>("timeout"),
+              )
+              : logBoundary("telegram/run", "opencode-client", "open code run failed")(cause).pipe(
+                  Effect.andThen(Effect.failCause(cause)),
+                )
+          }),
+        )
+      }
+      return outcome
+    })
+    const driveDispatchedRun = (
+      waitUntilIdle: (failureMessage: string) => Effect.Effect<boolean>,
+    ) =>
+      Effect.gen(function* () {
+      const terminal = yield* Ref.make<Option.Option<RunOutcome>>(Option.none())
+      const terminalHandled = yield* Deferred.make<void>()
+      const eventReady = yield* Deferred.make<void>()
       const eventStream = opencode.events().pipe(
         Stream.tap((event) =>
           event.type === "server.connected"
@@ -1108,32 +1175,7 @@ export const runPrompt = (input: RunInput) =>
         Option.getOrElse((): RunOutcome => (waitCompleted ? "done" : "error")),
       )
     })
-    const configuredTimeout = config.telegramRunTimeout.trim().toLowerCase()
-    const timedRun = configuredTimeout === "none"
-      ? run
-      : Option.match(parseRunTimeout(configuredTimeout), {
-        onNone: () => run.pipe(Effect.timeout(RUN_TIMEOUT)),
-        onSome: (duration) => run.pipe(Effect.timeout(duration)),
-      })
-    const outcome = yield* timedRun.pipe(
-      Effect.catchCause((cause) => {
-        if (Cause.hasInterrupts(cause)) return Effect.failCause(cause)
-        const timedOut = Option.match(Cause.findErrorOption(cause), {
-          onNone: () => false,
-          onSome: (error) => error instanceof Cause.TimeoutError,
-        })
-        return timedOut
-          ? Effect.andThen(
-            opencode.interrupt(input.sessionID).pipe(
-              Effect.catchCause((cause) => logOpenCodeFailure("interrupt on timeout")(cause)),
-            ),
-            Effect.succeed<RunOutcome>("timeout"),
-          )
-          : logBoundary("telegram/run", "opencode-client", "open code run failed")(cause).pipe(
-              Effect.andThen(Effect.failCause(cause)),
-            )
-      }),
-    )
+    const outcome = yield* run
 
     yield* Fiber.interrupt(flusher)
     const finalState = yield* Ref.get(state)

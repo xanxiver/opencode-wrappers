@@ -1,7 +1,10 @@
-import { Cause, Effect, Exit, Ref } from "effect"
+import { Cause, Data, Effect, Exit, Ref } from "effect"
+import { FetchHttpClient } from "effect/unstable/http"
 import { expect, test } from "bun:test"
-import { isPollingConflict, processUpdate } from "../src/telegram/bot.js"
+import { dropUpdateBacklog, isPollingConflict, processUpdate } from "../src/telegram/bot.js"
 import { ApiError } from "../src/telegram/api.js"
+
+class TestFailure extends Data.TaggedError("TestFailure")<{}> {}
 
 const update = { update_id: 41 }
 
@@ -58,4 +61,44 @@ test("retries a transient update failure before advancing the offset", async () 
 
   expect(attempts).toBe(3)
   expect(await Effect.runPromise(Ref.get(offset))).toBe(42)
+})
+
+test("never moves the confirmed offset backwards for a slow older update", async () => {
+  const offset = await Effect.runPromise(Ref.make(43))
+
+  await Effect.runPromiseExit(processUpdate(
+    { update_id: 41 },
+    offset,
+    Effect.fail(new TestFailure()),
+  ))
+
+  expect(await Effect.runPromise(Ref.get(offset))).toBe(43)
+})
+
+test("drops the update backlog by starting after the newest update", async () => {
+  const api = {
+    getUpdates: (offset: number, timeoutSeconds: number) => {
+      expect(offset).toBe(-1)
+      expect(timeoutSeconds).toBe(0)
+      return Effect.succeed([{ update_id: 7 }, { update_id: 41 }]).pipe(
+        Effect.provide(FetchHttpClient.layer),
+      )
+    },
+  }
+
+  expect(await Effect.runPromise(
+    Effect.provide(dropUpdateBacklog(api), FetchHttpClient.layer),
+  )).toBe(42)
+})
+
+test("starts from the oldest update when the backlog cannot be read", async () => {
+  const api = {
+    getUpdates: () => Effect.fail(new ApiError({ operation: "getUpdates", transient: true })).pipe(
+      Effect.provide(FetchHttpClient.layer),
+    ),
+  }
+
+  expect(await Effect.runPromise(
+    Effect.provide(dropUpdateBacklog(api), FetchHttpClient.layer),
+  )).toBe(0)
 })

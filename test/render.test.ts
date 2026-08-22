@@ -173,6 +173,18 @@ describe("truncate", () => {
     expect(result.length).toBeLessThanOrEqual(10)
     expect(result).toContain("…")
   })
+
+  test("truncates without splitting surrogate pairs", () => {
+    // Each emoji is two UTF-16 code units; a unit-level cut would produce a
+    // lone surrogate that Telegram rejects.
+    const text = "a".repeat(60) + "😀".repeat(40)
+    const result = truncate(text, 80)
+    expect(result.length).toBeLessThanOrEqual(80)
+    for (const chunk of result.split("\n… [truncated] …\n")) {
+      expect(chunk).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/)
+      expect(chunk).not.toMatch(/(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/)
+    }
+  })
 })
 
 describe("renderProgress", () => {
