@@ -1,4 +1,4 @@
-import { Cause, Context, Effect, FiberMap, FileSystem, Layer, Option, Path, Schedule, Schema } from "effect"
+import { Cause, Clock, Context, Effect, FiberMap, FileSystem, Layer, Option, Path, Random, Schedule, Schema } from "effect"
 import type { HttpClient } from "effect/unstable/http"
 import { Buffer } from "node:buffer"
 import { AppConfigTag, type AppConfig } from "../config.js"
@@ -149,7 +149,24 @@ export const runQueueItems = (jobs: readonly DurableJob[]): Effect.Effect<readon
   )
 
 /** Max consecutive auto-continue prompts before giving up. */
-export const AUTO_CONTINUE_MAX = 3
+export const AUTO_CONTINUE_MAX = 5
+
+/** Base for the auto-continue backoff; round N waits 2^(N-1) × base (jittered). */
+export const AUTO_CONTINUE_BASE_DELAY_MS = 30_000
+
+/** Hard ceiling for a single auto-continue delay. */
+export const AUTO_CONTINUE_MAX_DELAY_MS = 10 * 60 * 1000
+
+/**
+ * Full-jitter exponential backoff for auto-continue round N (1-based):
+ * a random value in [base·2^(N-1)/2, base·2^(N-1)], capped at the ceiling.
+ * `rand` is a number in [0, 1).
+ */
+export const autoContinueDelayMs = (round: number, rand: number): number => {
+  const step = Math.max(0, Math.min(round - 1, 4))
+  const half = (AUTO_CONTINUE_BASE_DELAY_MS * 2 ** step) / 2
+  return Math.min(AUTO_CONTINUE_MAX_DELAY_MS, Math.floor(half + rand * half))
+}
 
 /** Outcomes that qualify for an automatic continue prompt. */
 const AUTO_CONTINUE_OUTCOMES: readonly string[] = ["failed", "error", "timeout"]
@@ -444,12 +461,16 @@ export const TelegramDurableExecutorLive: Layer.Layer<
       if (payload.model !== undefined) Object.assign(nextPayload, { model: payload.model })
       if (payload.agent !== undefined) Object.assign(nextPayload, { agent: payload.agent })
       if (payload.threadId !== undefined) Object.assign(nextPayload, { threadId: payload.threadId })
+      const now = yield* Clock.currentTimeMillis
+      const rand = (yield* Random.nextIntBetween(0, 999)) / 1000
+      const availableAt = now + autoContinueDelayMs(decision.round, rand)
       yield* jobs.submit({
         sourceKey: `telegram:${conversation}:continue:${decision.round}:${lease.job.id}`,
         channel: "telegram",
         owner: ownerFor(payload.sessionID),
         sessionID: payload.sessionID,
         payload: JSON.stringify(nextPayload),
+        availableAt,
       })
       yield* interaction.set(autoContinueKey(payload.sessionID), decision.round)
       yield* notify(`Auto-continue ${decision.round}/${AUTO_CONTINUE_MAX}…`)

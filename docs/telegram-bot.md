@@ -45,10 +45,10 @@ The bot lives in `src/` and `test/` at the repository root. The core
 - `/loose on|off`: when on, a plain message starts a run without `/prompt`.
   Slash commands still run first. The setting is stored per conversation.
 - `/continue on|off`: when on, a failed, errored, or timed-out run sends a
-  `continue` prompt into the same session automatically. Max 3 consecutive
-  continues; any success resets the count. After giving up at the cap the
-  count clears, so a later failure starts a fresh cycle. Stored per
-  conversation.
+  `continue` prompt into the same session automatically. Max 5 consecutive
+  continues with jittered exponential backoff (30s up to 8m); any success
+  resets the count. After giving up at the cap the count clears, so a later
+  failure starts a fresh cycle. Stored per conversation.
 - Commands: `/start`, `/help`, `/prompt`, `/new`, `/stop`, `/reconnect`, `/forceReconnect`,
   `/compact`, `/review`, `/model`, `/agents`, `/pwa <agent> <prompt>`, `/status`, `/whoami`, `/projects`, `/project <path>`,
   `/sessions`, `/queue`, `/move <from> <to>`, `/queue_delete <pos>`, `/queue_clear`,
