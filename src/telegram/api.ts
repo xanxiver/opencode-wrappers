@@ -1,4 +1,4 @@
-import { Cause, Clock, Context, Data, Effect, Layer, Option, Ref, Schedule, Schema, Semaphore } from "effect"
+import { Cause, Clock, Context, Data, Effect, Layer, Option, PartitionedSemaphore, Ref, Schedule, Schema } from "effect"
 import { HttpBody, HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
 import { Stream } from "effect"
 import { AppConfigTag, ConfigError } from "../config.js"
@@ -333,11 +333,13 @@ export const Live: Layer.Layer<TelegramApi, ConfigError, AppConfig> = Layer.effe
           mediaRequest(base, operation, field, input),
         )
       })
-    // Serialize the request phase of all message edits behind one lock. The
-    // per-chat rate slot is reserved BEFORE taking the lock, so waiting out
-    // the throttle never blocks other chats; FIFO acquisition keeps a slow
-    // progress edit from landing after a newer final edit.
-    const editLock = yield* Semaphore.make(1)
+    // Serialize edits per target message: the partition key is chat + message
+    // id, so a streaming run only ever queues behind itself, while every
+    // other chat, topic, and run edits in parallel. The shared permit pool
+    // bounds total concurrent edit requests; FIFO within one partition keeps
+    // a progress edit from landing after that message's newer final edit.
+    // The per-chat rate slot is reserved before entering the partition.
+    const editPartitions = yield* PartitionedSemaphore.make<string>({ permits: 16 })
     return {
       getUpdates: (offset, timeoutSeconds) =>
         call("getUpdates", Schema.Array(UpdateSchema))(
@@ -371,7 +373,7 @@ export const Live: Layer.Layer<TelegramApi, ConfigError, AppConfig> = Layer.effe
       editMessageText: (input) =>
         waitForEditSlot(input.chatId).pipe(
           Effect.andThen(
-            editLock.withPermit(
+            editPartitions.withPermit(`${input.chatId}:${input.messageId}`)(
               Effect.gen(function* () {
                 const body = yield* jsonBody("editMessageText", {
                   chat_id: input.chatId,
