@@ -1,4 +1,4 @@
-import { Cause, Clock, Context, Data, Effect, Layer, Option, PartitionedSemaphore, Ref, Schedule, Schema } from "effect"
+import { Cause, Clock, Context, Data, Duration, Effect, Layer, Option, PartitionedSemaphore, Ref, Schema } from "effect"
 import { HttpBody, HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
 import { Stream } from "effect"
 import { AppConfigTag, ConfigError } from "../config.js"
@@ -9,6 +9,8 @@ export class ApiError extends Data.TaggedError("ApiError")<{
   readonly code?: number
   readonly description?: string
   readonly cause?: unknown
+  /** Telegram asked us to wait this many milliseconds before repeating (429). */
+  readonly retryAfterMs?: number
   /** True when the failure is transient (network, 429, 5xx) and worth retrying. */
   readonly transient: boolean
 }> {}
@@ -32,14 +34,48 @@ export const recordDefinitiveSendFailure = <A, E, R, R2>(
 /** Minimum interval between message edits for the same chat (ms). */
 export const EDIT_MIN_INTERVAL_MS = 1000
 
-/** Milliseconds to wait before the next edit, given the last edit time. */
-export const editDelay = (lastEditAt: number, now: number): number =>
-  lastEditAt === 0 ? 0 : Math.max(0, EDIT_MIN_INTERVAL_MS - (now - lastEditAt))
+/**
+ * Telegram caps group traffic near 20 messages per minute. Streaming runs
+ * editing once a second blow that budget on their own, so group chats pace
+ * their edits at 3s and rely on retry_after when other senders compete.
+ */
+export const EDIT_MIN_INTERVAL_GROUP_MS = 3000
 
-/** Exponential backoff, max 5 retries, hard cap at 30 seconds total. */
-const retrySchedule = Schedule.exponential("500 millis", 2).pipe(
-  Schedule.upTo({ times: 5, duration: "30 seconds" }),
-)
+export const editIntervalFor = (chatId: number): number =>
+  chatId < 0 ? EDIT_MIN_INTERVAL_GROUP_MS : EDIT_MIN_INTERVAL_MS
+
+/** Milliseconds to wait before the next edit, given the last edit time. */
+export const editDelay = (chatId: number, lastEditAt: number, now: number): number =>
+  lastEditAt === 0 ? 0 : Math.max(0, editIntervalFor(chatId) - (now - lastEditAt))
+
+const RETRY_MAX_ATTEMPTS = 5
+const RETRY_CAP_MS = 30_000
+const backoffDelay = (attempt: number): number =>
+  Math.min(RETRY_CAP_MS, Math.min(RETRY_CAP_MS, 500 * 2 ** Math.min(attempt, 6)))
+
+/**
+ * Retry failures matching shouldRetry, honoring Telegram's retry_after hint
+ * when the error carries one (429 responses include it in seconds). Without
+ * this the fixed exponential schedule hammers Telegram during a flood window
+ * and the request fails after burning all attempts.
+ */
+const retryErrors = <A, R>(
+  attempt: number,
+  run: Effect.Effect<A, ApiError, R>,
+  shouldRetry: (error: ApiError) => boolean,
+): Effect.Effect<A, ApiError, R> =>
+  run.pipe(
+    Effect.catchTag("ApiError", (error) => {
+      if (!shouldRetry(error) || attempt >= RETRY_MAX_ATTEMPTS) return Effect.fail(error)
+      const wait = Math.min(RETRY_CAP_MS, error.retryAfterMs ?? backoffDelay(attempt))
+      return Effect.sleep(Duration.millis(wait)).pipe(
+        Effect.andThen(retryErrors(attempt + 1, run, shouldRetry)),
+      )
+    }),
+  )
+
+const retryTransient = <A, R>(attempt: number, run: Effect.Effect<A, ApiError, R>): Effect.Effect<A, ApiError, R> =>
+  retryErrors(attempt, run, (error) => error.transient)
 
 export interface KeyboardButton {
   readonly text: string
@@ -126,6 +162,9 @@ const envelope = Schema.Struct({
   result: Schema.optional(Schema.Unknown),
   description: Schema.optional(Schema.String),
   error_code: Schema.optional(Schema.Number),
+  parameters: Schema.optional(Schema.Struct({
+    retry_after: Schema.optional(Schema.Number),
+  })),
 })
 type JsonValue = ReturnType<typeof JSON.parse>
 
@@ -216,13 +255,17 @@ export const decodeTelegramErrorResponse = (
   }))
   const decoded = Schema.decodeUnknownOption(envelope)(parsed)
   const code = Option.isSome(decoded) ? (decoded.value.error_code ?? status) : status
-  const details: { readonly description?: string } = Option.isSome(decoded) && decoded.value.description !== undefined
-    ? { description: decoded.value.description }
-    : {}
+  const retryAfterRaw = Option.isSome(decoded) ? decoded.value.parameters?.retry_after : undefined
+  const retryAfterMs = retryAfterRaw === undefined ? undefined : retryAfterRaw * 1000
+  const details: { readonly description?: string } =
+    Option.isSome(decoded) && decoded.value.description !== undefined
+      ? { description: decoded.value.description }
+      : {}
   return new ApiError({
     operation,
     code,
     ...details,
+    retryAfterMs,
     transient: isTransientStatus(code),
   })
 }
@@ -252,7 +295,7 @@ const call = <A>(
       )
       return yield* options?.retryTransient === false
         ? requestEffect
-        : requestEffect.pipe(Effect.retry({ schedule: retrySchedule, while: (error) => error.transient }))
+        : retryTransient(0, requestEffect)
     }).pipe(
       Effect.catchCause((cause) =>
         Option.match(Cause.findErrorOption(cause), {
@@ -260,7 +303,20 @@ const call = <A>(
             logRedactedBoundary(operation)(cause).pipe(
               Effect.andThen(Effect.fail(new ApiError({ operation, transient: false }))),
             ),
-          onSome: (error) => Effect.fail(error),
+          onSome: (error) => {
+            const meta = {
+              component: "telegram/api",
+              boundary: "telegram-bot-api",
+              operation,
+              code: error.code,
+              description: error.description,
+              transient: error.transient,
+              retryAfterMs: error.retryAfterMs,
+            }
+            return Effect.annotateLogs(meta)(
+              Effect.logWarning(`telegram ${operation} failed`),
+            ).pipe(Effect.andThen(Effect.fail(error)))
+          },
         }),
       ),
     )
@@ -317,7 +373,7 @@ export const Live: Layer.Layer<TelegramApi, ConfigError, AppConfig> = Layer.effe
     const waitForEditSlot = (chatId: number): Effect.Effect<void, never> => Clock.currentTimeMillis.pipe(
       Effect.flatMap((now) => Ref.modify(lastEdits, (map) => {
         const last = map.get(chatId) ?? 0
-        const delay = editDelay(last, now)
+        const delay = editDelay(chatId, last, now)
         const next = new Map(map).set(chatId, now + delay)
         return [delay, next]
       })),
@@ -361,10 +417,15 @@ export const Live: Layer.Layer<TelegramApi, ConfigError, AppConfig> = Layer.effe
           // A 429 proves Telegram did not create the message, so a bounded
           // retry cannot duplicate it. Transport retries stay disabled
           // because an ambiguous network failure may have been delivered.
-          return yield* call("sendMessage", MessageSchema, { retryTransient: false })(
-            HttpClientRequest.post(`${base}/sendMessage`).pipe(HttpClientRequest.setBody(body)),
-          ).pipe(
-            Effect.retry({ schedule: retrySchedule, while: (error) => error.code === 429 }),
+          // A 429 proves Telegram did not create the message, so a bounded
+          // retry cannot duplicate it. Transport retries stay disabled
+          // because an ambiguous network failure may have been delivered.
+          return yield* retryErrors(
+            0,
+            call("sendMessage", MessageSchema, { retryTransient: false })(
+              HttpClientRequest.post(`${base}/sendMessage`).pipe(HttpClientRequest.setBody(body)),
+            ),
+            (error) => error.code === 429,
           )
         }),
       sendPhoto: (input) => sendMedia("sendPhoto", "photo", input),
@@ -416,7 +477,7 @@ export const Live: Layer.Layer<TelegramApi, ConfigError, AppConfig> = Layer.effe
                 ? Effect.succeed(result)
                 : Effect.fail(new ApiError({ operation: "downloadFile", code: status, transient: isTransientStatus(status) }))
             }),
-            Effect.retry({ schedule: retrySchedule, while: (error) => error.transient }),
+            (effect) => retryTransient(0, effect),
           )
           const chunks = yield* HttpClientResponse.stream(Effect.succeed(response)).pipe(
             Stream.runCollect,

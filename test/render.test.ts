@@ -3,7 +3,7 @@ import { unlink } from "node:fs/promises"
 import { Effect, Option } from "effect"
 import { BunFileSystem, BunPath } from "@effect/platform-bun"
 import type { ChangesSummary } from "../src/core/git-changes.js"
-import { EDIT_MIN_INTERVAL_MS, editDelay } from "../src/telegram/api.js"
+import { EDIT_MIN_INTERVAL_GROUP_MS, EDIT_MIN_INTERVAL_MS, editDelay, editIntervalFor } from "../src/telegram/api.js"
 import { MAX_RECOVERY_MESSAGE_PAGES, assistantResponseForInput, detectSupportedMediaMime, matchesSessionRoute, mediaFromResponseText, nextProgressEdit, recoveredResponseForInput, recoveredResponseFromPages } from "../src/telegram/run.js"
 import {
   MAX_MESSAGE_LENGTH,
@@ -475,18 +475,27 @@ describe("renderQuestionWithSelection", () => {
 })
 
 describe("editDelay", () => {
+  const DM_CHAT = 100
+  const GROUP_CHAT = -100
+
   test("allows an immediate first edit", () => {
-    expect(editDelay(0, Date.now())).toBe(0)
+    expect(editDelay(DM_CHAT, 0, Date.now())).toBe(0)
   })
 
   test("waits for the remaining interval", () => {
     const now = Date.now()
-    expect(editDelay(now - 400, now)).toBe(EDIT_MIN_INTERVAL_MS - 400)
+    expect(editDelay(DM_CHAT, now - 400, now)).toBe(EDIT_MIN_INTERVAL_MS - 400)
+  })
+
+  test("paces group chats with the wider interval", () => {
+    const now = Date.now()
+    expect(editDelay(GROUP_CHAT, now - 400, now)).toBe(EDIT_MIN_INTERVAL_GROUP_MS - 400)
+    expect(editIntervalFor(GROUP_CHAT)).toBeGreaterThan(editIntervalFor(DM_CHAT))
   })
 
   test("allows edits after the interval has passed", () => {
     const now = Date.now()
-    expect(editDelay(now - EDIT_MIN_INTERVAL_MS - 100, now)).toBe(0)
+    expect(editDelay(DM_CHAT, now - EDIT_MIN_INTERVAL_MS - 100, now)).toBe(0)
   })
 })
 
