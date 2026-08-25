@@ -84,7 +84,11 @@ export const recordQuestionAnswer = (
     })
   })
 
-/** Answer a pending question by replying to its message with text. */
+/**
+ * Answer a pending question by replying to its message with text.
+ * Returns true when the message matched and was consumed, even if other
+ * questions in the same request remain unanswered.
+ */
 export const answerRepliedQuestion = (
   chatId: number,
   messageId: number,
@@ -104,6 +108,10 @@ export const answerRepliedQuestion = (
           return sendText(chatId, "That question needs an option answer.", threadId).pipe(Effect.as(true))
         }
         return recordQuestionAnswer(current.token, questionIndex, [text]).pipe(
+          // `recordQuestionAnswer` reports whether the whole request was
+          // submitted. This reply is consumed even when later questions are
+          // still unanswered, so loose mode must not submit it as a prompt.
+          Effect.as(true),
           Effect.catchCause((cause) =>
             logBoundary("telegram/handlers", "opencode-client", "question reply failed")(cause).pipe(
               Effect.andThen(sendText(chatId, "The answer could not be sent. Please try again.", threadId)),
