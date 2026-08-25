@@ -43,6 +43,7 @@ describe("Telegram picker callbacks", () => {
       const registry = yield* ModelRegistry
       const answers = yield* Ref.make<string[]>([])
       const edits = yield* Ref.make<string[]>([])
+      const order = yield* Ref.make<string[]>([])
       const token = yield* registry.registerProviders({
         sessionID: "ses_current",
         directory: "/project",
@@ -60,10 +61,14 @@ describe("Telegram picker callbacks", () => {
         sendPhoto: () => Effect.never,
         sendVideo: () => Effect.never,
         sendDocument: () => Effect.never,
-        editMessageText: ({ text }) => Ref.update(edits, (values) => [...values, text]).pipe(
+        editMessageText: ({ text }) => Ref.update(order, (values) => [...values, "edited"]).pipe(
+          Effect.andThen(Ref.update(edits, (values) => [...values, text])),
           Effect.as({ message_id: 10, chat: { id: 7 } }),
         ),
-        answerCallbackQuery: ({ text }) => Ref.update(answers, (values) => [...values, text ?? ""]).pipe(Effect.as(true)),
+        answerCallbackQuery: ({ text }) => Ref.update(order, (values) => [...values, "acknowledged"]).pipe(
+          Effect.andThen(Ref.update(answers, (values) => [...values, text ?? ""])),
+          Effect.as(true),
+        ),
         getFile: () => Effect.never,
         downloadFile: () => Effect.never,
       }
@@ -79,11 +84,16 @@ describe("Telegram picker callbacks", () => {
         Effect.provide(Layer.succeed(TelegramApi, telegram)),
         Effect.provide(FetchHttpClient.layer),
       )
-      return { answers: yield* Ref.get(answers), edits: yield* Ref.get(edits) }
+      return {
+        answers: yield* Ref.get(answers),
+        edits: yield* Ref.get(edits),
+        order: yield* Ref.get(order),
+      }
     }).pipe(Effect.provide(ModelRegistryLive)))
 
-    expect(result.answers).toEqual(["Choose a model."])
+    expect(result.answers).toEqual(["Opening models."])
     expect(result.edits).toEqual(["Provider provider — select a model:"])
+    expect(result.order).toEqual(["acknowledged", "edited"])
   })
 
   test("switches a current model picker selection", async () => {
@@ -93,6 +103,7 @@ describe("Telegram picker callbacks", () => {
       const remembered = yield* Ref.make<string | undefined>(undefined)
       const answers = yield* Ref.make<string[]>([])
       const edits = yield* Ref.make<string[]>([])
+      const order = yield* Ref.make<string[]>([])
       const token = yield* registry.registerPage({
         sessionID: "ses_current",
         directory: "/project",
@@ -109,10 +120,14 @@ describe("Telegram picker callbacks", () => {
         sendPhoto: () => Effect.never,
         sendVideo: () => Effect.never,
         sendDocument: () => Effect.never,
-        editMessageText: ({ text }) => Ref.update(edits, (values) => [...values, text]).pipe(
+        editMessageText: ({ text }) => Ref.update(order, (values) => [...values, "edited"]).pipe(
+          Effect.andThen(Ref.update(edits, (values) => [...values, text])),
           Effect.as({ message_id: 10, chat: { id: 7 } }),
         ),
-        answerCallbackQuery: ({ text }) => Ref.update(answers, (values) => [...values, text ?? ""]).pipe(Effect.as(true)),
+        answerCallbackQuery: ({ text }) => Ref.update(order, (values) => [...values, "acknowledged"]).pipe(
+          Effect.andThen(Ref.update(answers, (values) => [...values, text ?? ""])),
+          Effect.as(true),
+        ),
         getFile: () => Effect.never,
         downloadFile: () => Effect.never,
       }
@@ -137,7 +152,9 @@ describe("Telegram picker callbacks", () => {
         listModels: () => Effect.succeed([]),
         listAgents: () => Effect.succeed([]),
         switchAgent: () => Effect.void,
-        switchModel: ({ model }) => Ref.set(switched, model.id),
+        switchModel: ({ model }) => Ref.update(order, (values) => [...values, "switched"]).pipe(
+          Effect.andThen(Ref.set(switched, model.id)),
+        ),
         replyQuestion: () => Effect.void,
         events: () => Stream.never,
       }
@@ -162,13 +179,15 @@ describe("Telegram picker callbacks", () => {
         remembered: yield* Ref.get(remembered),
         answers: yield* Ref.get(answers),
         edits: yield* Ref.get(edits),
+        order: yield* Ref.get(order),
       }
     }).pipe(Effect.provide(ModelRegistryLive)))
 
     expect(result.switched).toBe("model")
     expect(result.remembered).toBe("model")
-    expect(result.answers).toEqual(["Switched."])
+    expect(result.answers).toEqual(["Applying model."])
     expect(result.edits).toEqual(["Model switched to model"])
+    expect(result.order).toEqual(["acknowledged", "switched", "edited"])
   })
 
   test("rejects a session selection after the conversation changes directory", async () => {
