@@ -4,7 +4,7 @@ import { normalizeCommand, parseAgentPromptCommand, parsePromptCommand, promptWi
 import { conversationId } from "../conversation.js"
 import type { Message } from "../api.js"
 import { HELP_TEXT, sendText } from "./shared.js"
-import { answerRepliedQuestion } from "./question.js"
+import { answerPendingQuestionText, answerRepliedQuestion } from "./question.js"
 import { runWithFiles } from "./run.js"
 import { selectExactModel, showModels } from "./model.js"
 import { showProjects, showSessions } from "./picker.js"
@@ -58,7 +58,7 @@ export const handleMessage = (message: Message) =>
     // A plain-text reply can answer an agent question. Check this before the
     // slash-command guard, otherwise the documented free-text answer path is
     // unreachable.
-    if (replied !== undefined && text !== undefined) {
+    if (replied !== undefined && text !== undefined && !text.startsWith("/")) {
       const consumed = yield* answerRepliedQuestion(chatId, replied.message_id, text, threadId)
       if (consumed) return
     }
@@ -68,6 +68,7 @@ export const handleMessage = (message: Message) =>
     if (text !== undefined && !text.startsWith("/")) {
       const prompt = text.trim()
       if (prompt.length === 0) return
+      if (replied === undefined && (yield* answerPendingQuestionText(chatId, prompt, threadId))) return
       const store = yield* Store
       const conversation = conversationId({ chatId, threadId })
       const loose = yield* store.getLoosePrompts(conversation)

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { Cause, Effect, Option } from "effect"
+import { Cause, Effect, Option, Ref, Semaphore } from "effect"
 import { TestClock } from "effect/testing"
 import { BunCrypto, BunFileSystem, BunPath } from "@effect/platform-bun"
 import { tmpdir } from "node:os"
@@ -16,7 +16,8 @@ import {
   type DurableExecutorRepository,
 } from "../src/core/durable-executor.js"
 import { GitChangesError, type ChangesSummaryResult, type GitChangesService } from "../src/core/git-changes.js"
-import { AUTO_CONTINUE_BASE_DELAY_MS, AUTO_CONTINUE_MAX_DELAY_MS, agentSwitchRetriesExhausted, decideAutoContinue, decodeAttachmentSnapshots, encodeAttachmentSnapshots, autoContinueDelayMs, finalEditDisposition, finishNotificationWord, redactedReviewEvidence, resolveOwnedDurableReview, runQueueItems, settleFinalEditError, withChangesSummaryUsing } from "../src/telegram/durable-executor.js"
+import type { SessionsError } from "../src/core/sessions.js"
+import { AUTO_CONTINUE_BASE_DELAY_MS, AUTO_CONTINUE_MAX_DELAY_MS, agentSwitchRetriesExhausted, decideAutoContinue, decodeAttachmentSnapshots, encodeAttachmentSnapshots, autoContinueDelayMs, finalEditDisposition, finishNotificationWord, hasRunPipeline, redactedReviewEvidence, resetConversationUsing, resolveOwnedDurableReview, runQueueItems, settleFinalEditError, submitForCurrentConversationUsing, withChangesSummaryUsing } from "../src/telegram/durable-executor.js"
 import { ApiError } from "../src/telegram/api.js"
 import { AgentSwitchError } from "../src/telegram/run.js"
 
@@ -29,7 +30,7 @@ const config = () => new AppConfig({
   webPort: 3001,
 })
 
-const run = <A>(effect: Effect.Effect<A, ApiError | DurableExecutorError | DurableLeaseLost, DurableExecutorStore>) =>
+const run = <A>(effect: Effect.Effect<A, ApiError | DurableExecutorError | DurableLeaseLost | SessionsError, DurableExecutorStore>) =>
   Effect.runPromise(effect.pipe(
     Effect.provide(DurableExecutorStoreLive),
     Effect.provideService(AppConfigTag, config()),
@@ -57,6 +58,87 @@ const submit = (store: DurableExecutorRepository, sourceKey: string, owner = "1"
   })
 
 describe("DurableExecutorStore", () => {
+  test("detects every executable run-pipeline state", () => {
+    expect(hasRunPipeline([{ state: "pending" }])).toBe(true)
+    expect(hasRunPipeline([{ state: "dispatching" }])).toBe(true)
+    expect(hasRunPipeline([{ state: "running" }])).toBe(true)
+    expect(hasRunPipeline([{ state: "finalizing" }])).toBe(true)
+    expect(hasRunPipeline([{ state: "completed" }, { state: "failed" }, { state: "cancelled" }, { state: "needs_review" }])).toBe(false)
+  })
+
+  test("does not submit an old-session reconnect after /new wins the conversation lock", async () => {
+    const result = await run(Effect.gen(function* () {
+      const jobs = yield* DurableExecutorStore
+      const lock = yield* Semaphore.make(1)
+      const current = yield* Ref.make(Option.some("ses_old"))
+      const store = { getSessionIDForConversation: () => Ref.get(current) }
+      const sessions = { reset: () => Ref.set(current, Option.none()) }
+      const reset = yield* resetConversationUsing(lock, store, sessions, jobs, "tg:7:thread:42")
+      // A new prompt can create another session before the delayed reconnect
+      // reaches its submission boundary.
+      yield* Ref.set(current, Option.some("ses_new"))
+      const submitted = yield* submitForCurrentConversationUsing(
+        lock,
+        store,
+        jobs,
+        "tg:7:thread:42",
+        "ses_old",
+        {
+          sourceKey: "reconnect-after-reset",
+          channel: "telegram",
+          owner: "session:ses_old",
+          payload: "{}",
+          sessionID: "ses_old",
+        },
+      )
+      return {
+        reset,
+        submitted,
+        oldJobs: yield* jobs.listOwner("telegram", "session:ses_old"),
+      }
+    }))
+
+    expect(result.reset).toBe("reset")
+    expect(result.submitted).toBe(false)
+    expect(result.oldJobs).toEqual([])
+  })
+
+  test("blocks /new when auto-continue wins the conversation lock", async () => {
+    const result = await run(Effect.gen(function* () {
+      const jobs = yield* DurableExecutorStore
+      const lock = yield* Semaphore.make(1)
+      const current = yield* Ref.make(Option.some("ses_old"))
+      const store = { getSessionIDForConversation: () => Ref.get(current) }
+      const sessions = { reset: () => Ref.set(current, Option.none()) }
+      const submitted = yield* submitForCurrentConversationUsing(
+        lock,
+        store,
+        jobs,
+        "tg:7:thread:42",
+        "ses_old",
+        {
+          sourceKey: "continue-before-reset",
+          channel: "telegram",
+          owner: "session:ses_old",
+          payload: "{}",
+          sessionID: "ses_old",
+        },
+      )
+      const reset = yield* resetConversationUsing(lock, store, sessions, jobs, "tg:7:thread:42")
+      return {
+        submitted,
+        reset,
+        current: yield* Ref.get(current),
+        oldJobs: yield* jobs.listOwner("telegram", "session:ses_old"),
+      }
+    }))
+
+    expect(result.submitted).toBe(true)
+    expect(result.reset).toBe("blocked")
+    expect(result.current).toEqual(Option.some("ses_old"))
+    expect(result.oldJobs.map((job) => job.state)).toEqual(["pending"])
+  })
+
   test("classifies permanent final edits so they cannot block the owner queue", () => {
     expect(finalEditDisposition({ transient: false, description: "Bad Request: message to edit not found" })).toBe("fail")
     expect(finalEditDisposition({ transient: true })).toBe("retry")

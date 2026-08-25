@@ -23,7 +23,7 @@ describe("Telegram API response decoding", () => {
       telegramRunTimeout: "10 minutes",
       webPort: 3001,
     }))
-    await Effect.runPromiseExit(Effect.gen(function* () {
+    const exit = await Effect.runPromiseExit(Effect.gen(function* () {
       const api = yield* TelegramApi
       return yield* api.sendMessage({ chatId: 7, text: "hello" })
     }).pipe(
@@ -31,6 +31,12 @@ describe("Telegram API response decoding", () => {
       Effect.provide(Layer.succeed(HttpClient.HttpClient, client)),
     ))
     expect(attempts).toBe(1)
+    expect(Exit.isFailure(exit)).toBe(true)
+    if (Exit.isFailure(exit)) {
+      const rendered = Cause.pretty(exit.cause)
+      expect(rendered).not.toContain("test-token")
+      expect(rendered).toContain("***")
+    }
   })
   test("reports malformed JSON as ApiError instead of a defect", async () => {
     const exit = await Effect.runPromiseExit(decodeTelegramResponse("getUpdates", Schema.Array(Schema.Unknown), "{not-json"))
