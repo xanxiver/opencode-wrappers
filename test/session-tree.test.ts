@@ -104,6 +104,17 @@ describe("sessionRequestMatchesRoute", () => {
     expect(result).toBe(true)
   })
 
+  test("uses the root topic when a child has a stale chat-level route", async () => {
+    const result = await Effect.runPromise(sessionRequestMatchesRoute(
+      routes({ ses_root: knownRoute, ses_child: { chatId: 7 } }),
+      opencode([{ id: "ses_root" }, { id: "ses_child", parentID: "ses_root" }]),
+      "ses_child",
+      7,
+      Option.some(42),
+    ))
+    expect(result).toBe(true)
+  })
+
   test("accepts a nested child climbing to a matching root route", async () => {
     const result = await Effect.runPromise(sessionRequestMatchesRoute(
       routes({ ses_root: knownRoute }),

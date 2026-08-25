@@ -378,11 +378,14 @@ export const Live: Layer.Layer<PermissionRegistry, InteractionStoreError, Intera
         entries.delete(token)
         return [true, { ...state, entries }]
       }),
-      retryUncertainDelivery: (token, chatId, sessionID) => modify((state) => {
-        const entry = state.entries.get(token)
-        if (entry === undefined || entry.chatId !== chatId || (sessionID !== undefined && entry.sessionID !== sessionID) || (entry.messageId !== DELIVERY_UNCERTAIN_MESSAGE_ID && entry.messageId !== DELIVERY_REJECTED_MESSAGE_ID)) return [false, state]
-        return [true, { ...state, entries: new Map(state.entries).set(token, { ...entry, messageId: 0, deliveryGeneration: undefined, deliveryClaimedAt: undefined }) }]
-      }),
+      retryUncertainDelivery: (token, chatId, sessionID) => Clock.currentTimeMillis.pipe(
+        Effect.flatMap((now) => modify((state) => {
+          const clean = cleanState(state, now)
+          const entry = clean.entries.get(token)
+          if (entry === undefined || entry.chatId !== chatId || (sessionID !== undefined && entry.sessionID !== sessionID) || (entry.messageId !== DELIVERY_UNCERTAIN_MESSAGE_ID && entry.messageId !== DELIVERY_REJECTED_MESSAGE_ID)) return [false, clean]
+          return [true, { ...clean, entries: new Map(clean.entries).set(token, { ...entry, messageId: 0, deliveryGeneration: undefined, deliveryClaimedAt: undefined }) }]
+        })),
+      ),
       listUncertainDeliveries: (chatId, sessionID) => Clock.currentTimeMillis.pipe(Effect.flatMap((now) => modify((state) => {
         const clean = cleanState(state, now)
         const deliveries: Array<{ readonly token: number; readonly entry: PendingPermission; readonly failure: PromptDeliveryFailure }> = []

@@ -43,20 +43,23 @@ export const setProjectDirectory = (chatId: number, directory: string, threadId?
 
 export const resetSession = (chatId: number, threadId?: number) =>
   Effect.gen(function* () {
-    const sessions = yield* Sessions
-    const reset = yield* sessions.reset(conversationId({ chatId, threadId })).pipe(
-      Effect.as(true),
+    const executor = yield* TelegramDurableExecutor
+    const result = yield* executor.resetConversation(chatId, threadId).pipe(
+      Effect.map((status) => Option.some(status)),
       Effect.catchCause((cause) =>
-        logBoundary("telegram/handlers", "sessions", "reset failed")(cause).pipe(
-          Effect.andThen(Effect.succeed(false)),
+        logBoundary("telegram/handlers", "durable-executor", "reset failed")(cause).pipe(
+          Effect.andThen(Effect.succeed(Option.none<"reset" | "blocked">())),
         )
       ),
     )
     yield* sendText(
       chatId,
-      reset
-        ? "New session started. Your next message starts fresh."
-        : "The session could not be reset.",
+      Option.match(result, {
+        onNone: () => "The session could not be reset.",
+        onSome: (status) => status === "reset"
+          ? "New session started. Your next message starts fresh."
+          : "The current session still has running or queued tasks. Use /queue, /stop, and /queue_clear before /new.",
+      }),
       threadId,
     )
   })

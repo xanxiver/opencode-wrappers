@@ -17,7 +17,7 @@ import { InteractionStoreMemory } from "../src/telegram/interaction-store.js"
 import { Live as ModelRegistryLive } from "../src/telegram/models.js"
 import { Live as PermissionRegistryLive } from "../src/telegram/permissions.js"
 import { Live as PickersLive } from "../src/telegram/pickers.js"
-import { Live as QuestionRegistryLive } from "../src/telegram/questions.js"
+import { Live as QuestionRegistryLive, QuestionRegistry } from "../src/telegram/questions.js"
 
 const openCode: OpenCodeService = {
   createSession: () => Effect.never,
@@ -96,6 +96,7 @@ describe("loose prompt mode", () => {
     }
     const executor: TelegramDurableExecutorService = {
       submit: (_chatId, _message, text) => Ref.set(submitted, text),
+      resetConversation: () => Effect.succeed("reset"),
       reconnect: () => Effect.void,
       listReviews: () => Effect.void,
       resolveReview: () => Effect.void,
@@ -142,5 +143,84 @@ describe("loose prompt mode", () => {
     await run("/nope")
     expect(await Effect.runPromise(Ref.get(submitted))).toBe("hello world")
     expect(await Effect.runPromise(Ref.get(sent))).toContain("Use /prompt to run a task.")
+  })
+
+  test("routes unambiguous topic text to a pending question instead of a new task", async () => {
+    const submitted = await Effect.runPromise(Ref.make<string | undefined>(undefined))
+    const sent = await Effect.runPromise(Ref.make<readonly string[]>([]))
+    const questionCalls = await Effect.runPromise(Ref.make(0))
+    const store: StoreService = {
+      getSessionIDForConversation: () => Effect.succeed(Option.some("ses_1")),
+      setSessionIDForConversation: () => Effect.void,
+      removeSessionIDForConversation: () => Effect.void,
+      getSessionIDForDirectory: () => Effect.succeed(Option.none()),
+      setSessionIDForDirectory: () => Effect.void,
+      removeSessionIDForDirectory: () => Effect.void,
+      getDirectory: () => Effect.succeed(Option.none()),
+      setDirectory: () => Effect.void,
+      switchConversationDirectory: () => Effect.void,
+      getModel: () => Effect.succeed(Option.none()),
+      setModel: () => Effect.void,
+      getLoosePrompts: () => Effect.succeed(true),
+      setLoosePrompts: () => Effect.void,
+      getAutoContinue: () => Effect.succeed(false),
+      setAutoContinue: () => Effect.void,
+      listClients: () => Effect.succeed([]),
+      listDirectories: () => Effect.succeed([]),
+    }
+    const executor: TelegramDurableExecutorService = {
+      submit: (_chatId, _message, text) => Ref.set(submitted, text),
+      resetConversation: () => Effect.succeed("reset"),
+      reconnect: () => Effect.void,
+      listReviews: () => Effect.void,
+      resolveReview: () => Effect.void,
+      listQueue: () => Effect.void,
+      moveQueue: () => Effect.void,
+      clearQueue: () => Effect.void,
+      deleteQueue: () => Effect.void,
+    }
+    const client: OpenCodeService = {
+      ...openCode,
+      replyQuestion: () => Ref.update(questionCalls, (count) => count + 1),
+    }
+    const result = await Effect.runPromise(Effect.gen(function* () {
+      const registry = yield* QuestionRegistry
+      yield* registry.setSessionRoute("ses_1", { chatId: 7, threadId: 42 })
+      const token = yield* registry.register({
+        sessionID: "ses_1",
+        requestID: "que_topic",
+        chatId: 7,
+        questions: ["Explain?", "Continue?"],
+        options: [[], ["Yes", "No"]],
+        customs: [true, false],
+        multiples: [false, false],
+      })
+      yield* registry.attachMessageId(token, 0, 10)
+      yield* registry.attachMessageId(token, 1, 11)
+
+      yield* handleMessage({ message_id: 5, chat: { id: 7 }, message_thread_id: 42, text: "question answer" })
+      return yield* registry.get(token)
+    }).pipe(
+      Effect.provide(Layer.succeed(TelegramDurableExecutor, executor)),
+      Effect.provide(Layer.succeed(TelegramApi, telegram(sent))),
+      Effect.provide(Layer.succeed(OpenCode, client)),
+      Effect.provide(Layer.succeed(Sessions, sessions)),
+      Effect.provide(Layer.succeed(Store, store)),
+      Effect.provide(Layer.succeed(GitChanges, gitChangesStub)),
+      Effect.provide(ModelRegistryLive),
+      Effect.provide(PickersLive),
+      Effect.provide(AgentRegistryLive),
+      Effect.provide(PermissionRegistryLive),
+      Effect.provide(QuestionRegistryLive),
+      Effect.provide(InteractionStoreMemory),
+      Effect.provide(FetchHttpClient.layer),
+    ))
+
+    expect(await Effect.runPromise(Ref.get(submitted))).toBeUndefined()
+    expect(await Effect.runPromise(Ref.get(questionCalls))).toBe(0)
+    expect(Option.map(result, (entry) => entry.answers)).toEqual(Option.some([
+      ["question answer"],
+      undefined,
+    ]))
   })
 })

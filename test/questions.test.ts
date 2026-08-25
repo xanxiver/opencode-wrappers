@@ -79,6 +79,18 @@ describe("QuestionRegistry", () => {
     expect(result).toEqual(Option.some({ chatId: 17 }))
   })
 
+  test("does not synthesize a chat-only route for current persisted state", async () => {
+    const store = persistentStore()
+    const result = await Effect.runPromise(Effect.gen(function* () {
+      const first = yield* Effect.gen(function* () { return yield* QuestionRegistry }).pipe(Effect.provide(Live))
+      yield* first.register({ ...base, sessionID: "ses_child" })
+      const second = yield* Effect.gen(function* () { return yield* QuestionRegistry }).pipe(Effect.provide(Live))
+      return yield* second.getSessionRoute("ses_child")
+    }).pipe(Effect.provide(store)))
+
+    expect(Option.isNone(result)).toBe(true)
+  })
+
   test("register creates an unanswered request", async () => {
     const result = await run(
       Effect.gen(function* () {
@@ -368,6 +380,19 @@ describe("QuestionRegistry", () => {
     expect(result?.afterExpiry[0]?.failure).toBe("uncertain")
   })
 
+  test("operator retry cleans an expired in-flight question without listing reviews first", async () => {
+    const result = await Effect.runPromise(Effect.gen(function* () {
+      const registry = yield* QuestionRegistry
+      const token = yield* registry.registerOrResume({ ...base, sessionID: "ses_direct_retry", requestID: "req_direct_retry" })
+      if (Option.isNone(token)) return false
+      yield* registry.claimDelivery(token.value, 0, 7)
+      yield* TestClock.adjust("121 seconds")
+      return yield* registry.retryUncertainDelivery(token.value, 0, 7, "ses_direct_retry")
+    }).pipe(Effect.provide(Live), Effect.provide(InteractionStoreMemory), Effect.provide(TestClock.layer())))
+
+    expect(result).toBe(true)
+  })
+
   test("fences a stale process after another registry takes over an expired claim", async () => {
     const store = persistentStore()
     const result = await Effect.runPromise(Effect.gen(function* () {
@@ -525,6 +550,25 @@ describe("QuestionRegistry", () => {
       }).pipe(Effect.provide(Live)),
     )
     expect(Option.isSome(result)).toBe(true)
+  })
+
+  test("finds only delivered custom-answer targets in the exact forum topic", async () => {
+    const result = await run(Effect.gen(function* () {
+      const registry = yield* QuestionRegistry
+      yield* registry.setSessionRoute("ses_1", { chatId: 7, threadId: 42 })
+      const token = yield* registry.register(base)
+      yield* registry.attachMessageId(token, 0, 10)
+      yield* registry.attachMessageId(token, 1, 11)
+      return {
+        currentTopic: yield* registry.findTextAnswerTargets(7, 42),
+        otherTopic: yield* registry.findTextAnswerTargets(7, 43),
+        rootChat: yield* registry.findTextAnswerTargets(7),
+      }
+    }).pipe(Effect.provide(Live)))
+
+    expect(result.currentTopic).toEqual([{ token: 1, questionIndex: 1 }])
+    expect(result.otherTopic).toEqual([])
+    expect(result.rootChat).toEqual([])
   })
 
   test("getForMessage rejects a stale callback", async () => {

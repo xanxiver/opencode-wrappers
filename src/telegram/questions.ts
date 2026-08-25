@@ -36,6 +36,11 @@ export interface QuestionReplyClaim {
   readonly generation: number
 }
 
+export interface PendingQuestionTextTarget {
+  readonly token: number
+  readonly questionIndex: number
+}
+
 export const hasExpired = (timeCreated: number, now: number, ttlMs: number = QUESTION_TTL_MS): boolean =>
   now - timeCreated > ttlMs
 
@@ -90,6 +95,9 @@ export interface QuestionRegistryService {
   /** Find a pending request by its question message (does not remove it). */
   readonly findByMessage: (chatId: number, messageId: number) =>
     Effect.Effect<Option.Option<PendingQuestion>, InteractionStoreError>
+  /** Find delivered custom-answer questions in exactly one chat or forum topic. */
+  readonly findTextAnswerTargets: (chatId: number, threadId?: number) =>
+    Effect.Effect<readonly PendingQuestionTextTarget[], InteractionStoreError>
   /** Find a pending request by its OpenCode identity. */
   readonly findByRequest: (chatId: number, sessionID: string, requestID: string) =>
     Effect.Effect<Option.Option<PendingQuestion>, InteractionStoreError>
@@ -176,11 +184,13 @@ const stateFromStored = (stored: Option.Option<unknown>): RegistryState => Optio
       deliveryGenerations: entry.deliveryGenerations?.map((value) => value ?? undefined) ?? entry.messageIds.map(() => undefined),
     }]))
     const routes = new Map((decoded.value.routes ?? []).map(({ sessionID, route }) => [sessionID, route]))
-    // Older persisted question state has no route table. Recover a safe
-    // chat-level route from the entry so pending questions remain visible
-    // after restart; the topic cannot be recovered from the old format.
-    for (const entry of entries.values()) {
-      if (!routes.has(entry.sessionID)) routes.set(entry.sessionID, { chatId: entry.chatId })
+    // Only the legacy format lacked the routes field. Do not synthesize a
+    // chat-level route for a new child-session question, because its root
+    // session owns the exact forum-topic destination.
+    if (decoded.value.routes === undefined) {
+      for (const entry of entries.values()) {
+        if (!routes.has(entry.sessionID)) routes.set(entry.sessionID, { chatId: entry.chatId })
+      }
     }
     return {
       next: decoded.value.next,
@@ -415,6 +425,30 @@ export const Live: Layer.Layer<QuestionRegistry, InteractionStoreError, Interact
             return [Option.none(), clean]
           })),
       ),
+      findTextAnswerTargets: (chatId, threadId) => Clock.currentTimeMillis.pipe(
+        Effect.flatMap((now) => modify((state) => {
+          const clean = cleanState(state, now)
+          const targets: PendingQuestionTextTarget[] = []
+          for (const entry of clean.entries.values()) {
+            if (entry.replyingSince !== undefined || entry.chatId !== chatId) continue
+            const route = clean.routes.get(entry.sessionID)
+            const routeMatches = route === undefined
+              ? threadId === undefined
+              : route.chatId === chatId && route.threadId === threadId
+            if (!routeMatches) continue
+            for (const [questionIndex, messageId] of entry.messageIds.entries()) {
+              if (
+                messageId > 0 &&
+                entry.answers[questionIndex] === undefined &&
+                entry.customs[questionIndex] === true
+              ) {
+                targets.push({ token: entry.token, questionIndex })
+              }
+            }
+          }
+          return [targets, clean]
+        })),
+      ),
       findByRequest: (chatId, sessionID, requestID) => Clock.currentTimeMillis.pipe(
         Effect.flatMap((now) => modify((state) => {
             const clean = cleanState(state, now)
@@ -519,18 +553,21 @@ export const Live: Layer.Layer<QuestionRegistry, InteractionStoreError, Interact
         entries.delete(token)
         return [true, { ...state, entries }]
       }),
-      retryUncertainDelivery: (token, questionIndex, chatId, sessionID) => modify((state) => {
-        const entry = state.entries.get(token)
-        const messageId = entry?.messageIds[questionIndex]
-        if (entry === undefined || entry.chatId !== chatId || (sessionID !== undefined && entry.sessionID !== sessionID) || (messageId !== DELIVERY_UNCERTAIN_MESSAGE_ID && messageId !== DELIVERY_REJECTED_MESSAGE_ID)) return [false, state]
-        const messageIds = [...entry.messageIds]
-        messageIds[questionIndex] = 0
-        const deliveryClaimedAt = [...entry.deliveryClaimedAt]
-        deliveryClaimedAt[questionIndex] = undefined
-        const deliveryGenerations = [...entry.deliveryGenerations]
-        deliveryGenerations[questionIndex] = undefined
-        return [true, { ...state, entries: new Map(state.entries).set(token, { ...entry, messageIds, deliveryClaimedAt, deliveryGenerations }) }]
-      }),
+      retryUncertainDelivery: (token, questionIndex, chatId, sessionID) => Clock.currentTimeMillis.pipe(
+        Effect.flatMap((now) => modify((state) => {
+          const clean = cleanState(state, now)
+          const entry = clean.entries.get(token)
+          const messageId = entry?.messageIds[questionIndex]
+          if (entry === undefined || entry.chatId !== chatId || (sessionID !== undefined && entry.sessionID !== sessionID) || (messageId !== DELIVERY_UNCERTAIN_MESSAGE_ID && messageId !== DELIVERY_REJECTED_MESSAGE_ID)) return [false, clean]
+          const messageIds = [...entry.messageIds]
+          messageIds[questionIndex] = 0
+          const deliveryClaimedAt = [...entry.deliveryClaimedAt]
+          deliveryClaimedAt[questionIndex] = undefined
+          const deliveryGenerations = [...entry.deliveryGenerations]
+          deliveryGenerations[questionIndex] = undefined
+          return [true, { ...clean, entries: new Map(clean.entries).set(token, { ...entry, messageIds, deliveryClaimedAt, deliveryGenerations }) }]
+        })),
+      ),
       listUncertainDeliveries: (chatId, sessionID) => Clock.currentTimeMillis.pipe(Effect.flatMap((now) => modify((state) => {
         const clean = cleanState(state, now)
         const deliveries: Array<{ readonly token: number; readonly questionIndex: number; readonly entry: PendingQuestion; readonly failure: PromptDeliveryFailure }> = []

@@ -84,6 +84,24 @@ export const recordQuestionAnswer = (
     })
   })
 
+const recordConsumedTextAnswer = (
+  chatId: number,
+  token: number,
+  questionIndex: number,
+  text: string,
+  threadId?: number,
+) => recordQuestionAnswer(token, questionIndex, [text]).pipe(
+  // `recordQuestionAnswer` reports whether the whole request was submitted.
+  // A matched message is consumed even while later questions remain.
+  Effect.as(true),
+  Effect.catchCause((cause) =>
+    logBoundary("telegram/handlers", "opencode-client", "question reply failed")(cause).pipe(
+      Effect.andThen(sendText(chatId, "The answer could not be sent. Please try again.", threadId)),
+      Effect.as(true),
+    ),
+  ),
+)
+
 /**
  * Answer a pending question by replying to its message with text.
  * Returns true when the message matched and was consumed, even if other
@@ -107,21 +125,36 @@ export const answerRepliedQuestion = (
         if (!custom && hasOptions) {
           return sendText(chatId, "That question needs an option answer.", threadId).pipe(Effect.as(true))
         }
-        return recordQuestionAnswer(current.token, questionIndex, [text]).pipe(
-          // `recordQuestionAnswer` reports whether the whole request was
-          // submitted. This reply is consumed even when later questions are
-          // still unanswered, so loose mode must not submit it as a prompt.
-          Effect.as(true),
-          Effect.catchCause((cause) =>
-            logBoundary("telegram/handlers", "opencode-client", "question reply failed")(cause).pipe(
-              Effect.andThen(sendText(chatId, "The answer could not be sent. Please try again.", threadId)),
-              Effect.as(true),
-            ),
-          ),
-        )
+        return recordConsumedTextAnswer(chatId, current.token, questionIndex, text, threadId)
       },
     })
   })
+
+/**
+ * Route ordinary topic text to a pending custom-answer question when the
+ * target is unambiguous. `/prompt` remains the explicit way to start another
+ * task while a question is waiting.
+ */
+export const answerPendingQuestionText = (
+  chatId: number,
+  text: string,
+  threadId?: number,
+) => Effect.gen(function* () {
+  const registry = yield* QuestionRegistry
+  const targets = yield* registry.findTextAnswerTargets(chatId, threadId)
+  if (targets.length === 0) return false
+  if (targets.length > 1) {
+    yield* sendText(
+      chatId,
+      "More than one question is waiting. Reply to the specific question message.",
+      threadId,
+    )
+    return true
+  }
+  const target = targets[0]
+  if (target === undefined) return false
+  return yield* recordConsumedTextAnswer(chatId, target.token, target.questionIndex, text, threadId)
+})
 
 const questionIndexForEntry = (entry: { readonly messageIds: readonly number[] }, messageId: number): number => {
   const index = entry.messageIds.indexOf(messageId)
