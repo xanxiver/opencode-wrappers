@@ -58,8 +58,14 @@ The bot lives in `src/` and `test/` at the repository root. The core
 ## Reliability
 
 - Idempotent Telegram API operations retry with exponential backoff (max 5
-  retries, 30s cap). Message creation does not retry at the transport layer.
-- Message edits rate-limited to 1/sec per chat.
+  retries, 30s cap). The bot logs every retry, including the operation, status
+  code, retry number, and wait time. Message creation does not retry at the
+  transport layer.
+- Message edits pass through one cancellation-safe gate per chat. Direct
+  chats start at 1 second between edits. Group chats start at 6 seconds. A
+  Telegram 429 response can increase the interval to 20 seconds.
+- Model and question buttons are acknowledged before OpenCode requests,
+  SQLite writes, or rate-limited message edits.
 - Event stream reconnect with backoff.
 - Run timeout: 10 minutes, then interrupt the session.
 - Permission and question state is stored in SQLite. Tokens expire after 30

@@ -1,4 +1,4 @@
-import { Cause, Clock, Context, Data, Duration, Effect, Layer, Option, PartitionedSemaphore, Ref, Schema } from "effect"
+import { Cause, Clock, Context, Data, Duration, Effect, Layer, Option, Ref, Schema, Semaphore } from "effect"
 import { HttpBody, HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
 import { Stream } from "effect"
 import { AppConfigTag, ConfigError } from "../config.js"
@@ -72,10 +72,51 @@ export const editDelayFor = (lastEditAt: number, now: number, intervalMs: number
 export const editDelay = (chatId: number, lastEditAt: number, now: number): number =>
   editDelayFor(lastEditAt, now, editBaseInterval(chatId))
 
+export interface EditThrottleState {
+  readonly lastEditAt: number
+  /** Do not send another edit before this Telegram flood-limit boundary. */
+  readonly quietUntil: number
+  readonly intervalMs: number
+}
+
+/**
+ * Compute the remaining delay while a caller owns the chat's edit permit.
+ * The function does not reserve future state, so interruption cannot leave an
+ * unused slot that delays later edits.
+ */
+export const editThrottleDelay = (
+  current: EditThrottleState | undefined,
+  now: number,
+  baseMs: number,
+): number => {
+  const intervalMs = current?.intervalMs ?? baseMs
+  const lastEditAt = current?.lastEditAt ?? 0
+  const afterLastEdit = lastEditAt === 0 ? now : lastEditAt + intervalMs
+  return Math.max(0, Math.max(current?.quietUntil ?? 0, afterLastEdit) - now)
+}
+
 const RETRY_MAX_ATTEMPTS = 5
 const RETRY_CAP_MS = 30_000
 const backoffDelay = (attempt: number): number =>
   Math.min(RETRY_CAP_MS, Math.min(RETRY_CAP_MS, 500 * 2 ** Math.min(attempt, 6)))
+
+interface RetryDetails {
+  readonly attempt: number
+  readonly waitMs: number
+}
+
+type RetryObserver = (error: ApiError, details: RetryDetails) => Effect.Effect<void>
+
+const logRetry = (error: ApiError, details: RetryDetails): Effect.Effect<void> =>
+  Effect.annotateLogs({
+    component: "telegram/api",
+    boundary: "telegram-bot-api-retry",
+    operation: error.operation,
+    code: error.code,
+    retry: details.attempt,
+    waitMs: details.waitMs,
+    retryAfterMs: error.retryAfterMs,
+  })(Effect.logWarning("telegram request will retry"))
 
 /**
  * Retry failures matching shouldRetry, honoring Telegram's retry_after hint
@@ -87,19 +128,27 @@ const retryErrors = <A, R>(
   attempt: number,
   run: Effect.Effect<A, ApiError, R>,
   shouldRetry: (error: ApiError) => boolean,
+  onRetry: RetryObserver = () => Effect.void,
 ): Effect.Effect<A, ApiError, R> =>
   run.pipe(
     Effect.catchTag("ApiError", (error) => {
       if (!shouldRetry(error) || attempt >= RETRY_MAX_ATTEMPTS) return Effect.fail(error)
       const wait = Math.min(RETRY_CAP_MS, error.retryAfterMs ?? backoffDelay(attempt))
-      return Effect.sleep(Duration.millis(wait)).pipe(
-        Effect.andThen(retryErrors(attempt + 1, run, shouldRetry)),
+      const details = { attempt: attempt + 1, waitMs: wait }
+      return logRetry(error, details).pipe(
+        Effect.andThen(onRetry(error, details)),
+        Effect.andThen(Effect.sleep(Duration.millis(wait))),
+        Effect.andThen(retryErrors(attempt + 1, run, shouldRetry, onRetry)),
       )
     }),
   )
 
-const retryTransient = <A, R>(attempt: number, run: Effect.Effect<A, ApiError, R>): Effect.Effect<A, ApiError, R> =>
-  retryErrors(attempt, run, (error) => error.transient)
+const retryTransient = <A, R>(
+  attempt: number,
+  run: Effect.Effect<A, ApiError, R>,
+  onRetry?: RetryObserver,
+): Effect.Effect<A, ApiError, R> =>
+  retryErrors(attempt, run, (error) => error.transient, onRetry)
 
 export interface KeyboardButton {
   readonly text: string
@@ -301,7 +350,10 @@ export const decodeTelegramErrorResponse = (
 const call = <A>(
   operation: string,
   schema: Schema.ConstraintCodec<A>,
-  options?: { readonly retryTransient?: boolean },
+  options?: {
+    readonly retryTransient?: boolean
+    readonly onRetry?: RetryObserver
+  },
 ) =>
   (request: HttpClientRequest.HttpClientRequest): Effect.Effect<A, ApiError, HttpClient.HttpClient> =>
     Effect.gen(function* () {
@@ -319,7 +371,7 @@ const call = <A>(
       )
       return yield* options?.retryTransient === false
         ? requestEffect
-        : retryTransient(0, requestEffect)
+        : retryTransient(0, requestEffect, options?.onRetry)
     }).pipe(
       Effect.catchCause((cause) =>
         Option.match(Cause.findErrorOption(cause), {
@@ -392,39 +444,26 @@ export const Live: Layer.Layer<TelegramApi, ConfigError, AppConfig> = Layer.effe
     redactToken = (text: string): string => text.split(token).join("***")
     const base = `https://api.telegram.org/bot${token}`
     const fileBase = `https://api.telegram.org/file/bot${token}`
-    // Adaptive per-chat edit throttle. interval starts at the chat-type base
-    // (DM 1s, group 3s), doubles on every 429 (respecting Telegram's
-    // retry_after) and relaxes halfway after each clean edit. The per-chat
-    // slot is reserved BEFORE entering that message's edit partition.
-    type EditThrottle = { readonly lastEditAt: number; readonly nextAllowedAt: number; readonly intervalMs: number }
-    const editThrottle = yield* Ref.make<ReadonlyMap<number, EditThrottle>>(new Map())
+    // Adaptive per-chat edit throttle. The interval starts at the chat-type
+    // base (DM 1s, group 6s), doubles on every 429 (respecting Telegram's
+    // retry_after) and relaxes halfway after each operation with no 429.
+    const editThrottle = yield* Ref.make<ReadonlyMap<number, EditThrottleState>>(new Map())
     const waitForEditSlot = (chatId: number): Effect.Effect<void, never> => Clock.currentTimeMillis.pipe(
-      Effect.flatMap((now) => Ref.modify(editThrottle, (map) => {
-        const base = editBaseInterval(chatId)
-        const current = map.get(chatId)
-        const intervalMs = current?.intervalMs ?? base
-        const lastEditAt = current?.lastEditAt ?? 0
-        const nextAllowedAt = Math.max(current?.nextAllowedAt ?? 0, lastEditAt + intervalMs)
-        const delay = Math.max(0, nextAllowedAt - now)
-        const updated: EditThrottle = {
-          lastEditAt,
-          nextAllowedAt: now + delay + 1,
-          intervalMs,
-        }
-        return [delay, new Map(map).set(chatId, updated)]
-      })),
+      Effect.flatMap((now) => Ref.get(editThrottle).pipe(
+        Effect.map((map) => editThrottleDelay(map.get(chatId), now, editBaseInterval(chatId))),
+      )),
       Effect.flatMap((delay) => (delay > 0 ? Effect.sleep(delay) : Effect.void)),
     )
-    /** Record a clean edit so the interval relaxes toward its base. */
-    const noteCleanEdit = (chatId: number): Effect.Effect<void> => Clock.currentTimeMillis.pipe(
+    /** Record an accepted edit. Only a request with no 429 relaxes the interval. */
+    const noteSuccessfulEdit = (chatId: number, clean: boolean): Effect.Effect<void> => Clock.currentTimeMillis.pipe(
       Effect.flatMap((now) => Ref.update(editThrottle, (map) => {
         const base = editBaseInterval(chatId)
         const current = map.get(chatId)
         const previous = current?.intervalMs ?? base
         return new Map(map).set(chatId, {
           lastEditAt: now,
-          nextAllowedAt: current?.nextAllowedAt ?? 0,
-          intervalMs: relaxEditInterval(base, previous),
+          quietUntil: current?.quietUntil ?? 0,
+          intervalMs: clean ? relaxEditInterval(base, previous) : previous,
         })
       })),
     )
@@ -435,10 +474,11 @@ export const Live: Layer.Layer<TelegramApi, ConfigError, AppConfig> = Layer.effe
           const base = editBaseInterval(chatId)
           const current = map.get(chatId)
           const intervalMs = penalizeEditInterval(base, current?.intervalMs ?? base, retryAfterMs)
-          const quietUntil = retryAfterMs === undefined ? now : now + retryAfterMs
+          const requestedWait = Math.min(RETRY_CAP_MS, retryAfterMs ?? 0)
+          const quietUntil = now + Math.max(requestedWait, intervalMs)
           return new Map(map).set(chatId, {
             lastEditAt: current?.lastEditAt ?? 0,
-            nextAllowedAt: Math.max(current?.nextAllowedAt ?? 0, quietUntil),
+            quietUntil: Math.max(current?.quietUntil ?? 0, quietUntil),
             intervalMs,
           })
         })),
@@ -453,13 +493,18 @@ export const Live: Layer.Layer<TelegramApi, ConfigError, AppConfig> = Layer.effe
           mediaRequest(base, operation, field, input),
         )
       })
-    // Serialize edits per target message: the partition key is chat + message
-    // id, so a streaming run only ever queues behind itself, while every
-    // other chat, topic, and run edits in parallel. The shared permit pool
-    // bounds total concurrent edit requests; FIFO within one partition keeps
-    // a progress edit from landing after that message's newer final edit.
-    // The per-chat rate slot is reserved before entering the partition.
-    const editPartitions = yield* PartitionedSemaphore.make<string>({ permits: 16 })
+    // Serialize all edits in one chat through a cancellation-safe permit.
+    // A caller that is interrupted while queued consumes no future slot. A
+    // separate semaphore allows up to 16 different chats to send in parallel.
+    const editRequestPermits = yield* Semaphore.make(16)
+    const editLocks = yield* Ref.make<ReadonlyMap<number, Semaphore.Semaphore>>(new Map())
+    const editLockFor = (chatId: number): Effect.Effect<Semaphore.Semaphore> =>
+      Ref.modify(editLocks, (locks) => {
+        const existing = locks.get(chatId)
+        if (existing !== undefined) return [existing, locks]
+        const lock = Semaphore.makeUnsafe(1)
+        return [lock, new Map(locks).set(chatId, lock)]
+      })
     return {
       getUpdates: (offset, timeoutSeconds) =>
         call("getUpdates", Schema.Array(UpdateSchema))(
@@ -481,9 +526,6 @@ export const Live: Layer.Layer<TelegramApi, ConfigError, AppConfig> = Layer.effe
           // A 429 proves Telegram did not create the message, so a bounded
           // retry cannot duplicate it. Transport retries stay disabled
           // because an ambiguous network failure may have been delivered.
-          // A 429 proves Telegram did not create the message, so a bounded
-          // retry cannot duplicate it. Transport retries stay disabled
-          // because an ambiguous network failure may have been delivered.
           // Each 429 also widens this chat's edit throttle.
           const request = call("sendMessage", MessageSchema, { retryTransient: false })(
             HttpClientRequest.post(`${base}/sendMessage`).pipe(HttpClientRequest.setBody(body)),
@@ -501,30 +543,41 @@ export const Live: Layer.Layer<TelegramApi, ConfigError, AppConfig> = Layer.effe
       sendVideo: (input) => sendMedia("sendVideo", "video", input),
       sendDocument: (input) => sendMedia("sendDocument", "document", input),
       editMessageText: (input) =>
-        waitForEditSlot(input.chatId).pipe(
-          Effect.andThen(
-            editPartitions.withPermit(`${input.chatId}:${input.messageId}`)(
-              jsonBody("editMessageText", {
-                chat_id: input.chatId,
-                message_id: input.messageId,
-                text: input.text,
-                reply_markup: input.replyMarkup,
-              }).pipe(
-                Effect.flatMap((body) =>
-                  call("editMessageText", MessageSchema)(
-                    HttpClientRequest.post(`${base}/editMessageText`).pipe(HttpClientRequest.setBody(body)),
-                  )
-                ),
-                Effect.tap(() => noteCleanEdit(input.chatId)),
-                Effect.catchTag("ApiError", (error) =>
-                  error.code === 429
-                    ? penalizeFlood(input.chatId, error.retryAfterMs).pipe(
-                        Effect.andThen(Effect.fail(error)),
-                      )
-                    : Effect.fail(error)),
-              ),
+        editLockFor(input.chatId).pipe(
+          Effect.flatMap((editLock) => editLock.withPermit(
+            waitForEditSlot(input.chatId).pipe(
+              Effect.andThen(editRequestPermits.withPermit(Effect.gen(function* () {
+                const sawFlood = yield* Ref.make(false)
+                const result = yield* jsonBody("editMessageText", {
+                  chat_id: input.chatId,
+                  message_id: input.messageId,
+                  text: input.text,
+                  reply_markup: input.replyMarkup,
+                }).pipe(
+                  Effect.flatMap((body) =>
+                    call("editMessageText", MessageSchema, {
+                      onRetry: (error) => error.code === 429
+                        ? Ref.set(sawFlood, true).pipe(
+                            Effect.andThen(penalizeFlood(input.chatId, error.retryAfterMs)),
+                          )
+                        : Effect.void,
+                    })(
+                      HttpClientRequest.post(`${base}/editMessageText`).pipe(HttpClientRequest.setBody(body)),
+                    )
+                  ),
+                  Effect.catchTag("ApiError", (error) =>
+                    error.code === 429
+                      ? Ref.set(sawFlood, true).pipe(
+                          Effect.andThen(penalizeFlood(input.chatId, error.retryAfterMs)),
+                          Effect.andThen(Effect.fail(error)),
+                        )
+                      : Effect.fail(error)),
+                )
+                yield* noteSuccessfulEdit(input.chatId, !(yield* Ref.get(sawFlood)))
+                return result
+              }))),
             ),
-          ),
+          )),
         ),
       answerCallbackQuery: (input) =>
         Effect.gen(function* () {
