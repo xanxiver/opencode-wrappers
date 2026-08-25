@@ -3,7 +3,7 @@ import { unlink } from "node:fs/promises"
 import { Effect, Option } from "effect"
 import { BunFileSystem, BunPath } from "@effect/platform-bun"
 import type { ChangesSummary } from "../src/core/git-changes.js"
-import { EDIT_MAX_INTERVAL_MS, EDIT_MIN_INTERVAL_GROUP_MS, EDIT_MIN_INTERVAL_MS, editBaseInterval, editDelay, penalizeEditInterval, relaxEditInterval } from "../src/telegram/api.js"
+import { EDIT_MAX_INTERVAL_MS, EDIT_MIN_INTERVAL_GROUP_MS, EDIT_MIN_INTERVAL_MS, editBaseInterval, editDelay, editThrottleDelay, penalizeEditInterval, relaxEditInterval } from "../src/telegram/api.js"
 import { MAX_RECOVERY_MESSAGE_PAGES, assistantResponseForInput, detectSupportedMediaMime, matchesSessionRoute, mediaFromResponseText, nextProgressEdit, recoveredResponseForInput, recoveredResponseFromPages } from "../src/telegram/run.js"
 import {
   MAX_MESSAGE_LENGTH,
@@ -508,6 +508,21 @@ describe("editDelay", () => {
   test("allows edits after the interval has passed", () => {
     const now = Date.now()
     expect(editDelay(DM_CHAT, now - EDIT_MIN_INTERVAL_MS - 100, now)).toBe(0)
+  })
+
+  test("waits for both the edit interval and a flood quiet period", () => {
+    const now = 100_000
+    expect(editThrottleDelay(undefined, now, EDIT_MIN_INTERVAL_GROUP_MS)).toBe(0)
+    expect(editThrottleDelay({
+      lastEditAt: now - 1000,
+      quietUntil: 0,
+      intervalMs: EDIT_MIN_INTERVAL_GROUP_MS,
+    }, now, EDIT_MIN_INTERVAL_GROUP_MS)).toBe(EDIT_MIN_INTERVAL_GROUP_MS - 1000)
+    expect(editThrottleDelay({
+      lastEditAt: now - EDIT_MIN_INTERVAL_GROUP_MS,
+      quietUntil: now + 9000,
+      intervalMs: EDIT_MIN_INTERVAL_GROUP_MS,
+    }, now, EDIT_MIN_INTERVAL_GROUP_MS)).toBe(9000)
   })
 
   test("widens the interval on flood and caps it", () => {

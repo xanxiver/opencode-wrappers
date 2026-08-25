@@ -57,6 +57,29 @@ const modelPickerIsCurrent = (entry: ModelEntry) =>
     return Option.exists(currentSession, (sessionID) => sessionID === entry.sessionID)
   })
 
+/** Stop Telegram's button spinner before OpenCode work or throttled edits. */
+const runAcknowledgedModelAction = <A, E, R>(
+  query: CallbackQuery,
+  acknowledgement: string,
+  action: Effect.Effect<A, E, R>,
+) => {
+  const message = query.message
+  if (message === undefined) return answer(query.id, "Invalid callback.")
+  return answer(query.id, acknowledgement).pipe(
+    Effect.andThen(action),
+    Effect.asVoid,
+    Effect.catchCause((cause) =>
+      logBoundary("telegram/handlers", "model-callback", "acknowledged model action failed")(cause).pipe(
+        Effect.andThen(sendText(
+          message.chat.id,
+          "The model action failed. Please try again.",
+          message.message_thread_id,
+        )),
+      ),
+    ),
+  )
+}
+
 export const handleModelCallback = (query: CallbackQuery, data: string) =>
   Option.match(parseModelCallback(data), {
     onNone: () => answer(query.id, "Invalid data."),
@@ -100,20 +123,24 @@ export const handleModelCallback = (query: CallbackQuery, data: string) =>
                             model: selected.id,
                             provider: selected.providerID,
                           }).pipe(
-                            Effect.andThen(opencode.switchModel({
-                              sessionID: value.sessionID,
-                              model: { id: selected.id, providerID: selected.providerID },
-                            })),
-                             Effect.andThen(rememberModel(value.directory, selected)),
-                            Effect.tap(() => logModelSelection("model-switched", {
-                              model: selected.id,
-                              provider: selected.providerID,
-                            })),
-                            Effect.andThen(apiEdit(value.chatId, value.messageId, `Model switched to ${selected.id}`)),
-                            Effect.andThen(answer(query.id, "Switched.")),
+                            Effect.andThen(runAcknowledgedModelAction(
+                              query,
+                              "Applying model.",
+                              opencode.switchModel({
+                                sessionID: value.sessionID,
+                                model: { id: selected.id, providerID: selected.providerID },
+                              }).pipe(
+                                Effect.andThen(rememberModel(value.directory, selected)),
+                                Effect.tap(() => logModelSelection("model-switched", {
+                                  model: selected.id,
+                                  provider: selected.providerID,
+                                })),
+                                Effect.andThen(apiEdit(value.chatId, value.messageId, `Model switched to ${selected.id}`)),
+                              ),
+                            )),
                           ),
                         onSome: (variants) =>
-                          Effect.gen(function* () {
+                          runAcknowledgedModelAction(query, "Opening variants.", Effect.gen(function* () {
                             yield* logModelSelection("variant-picker-opened", {
                               model: selected.id,
                               provider: selected.providerID,
@@ -143,8 +170,7 @@ export const handleModelCallback = (query: CallbackQuery, data: string) =>
                               `Select a variant for ${selected.id}:`,
                               { inline_keyboard: rows },
                             )
-                            yield* answer(query.id, "Choose a variant.")
-                          }),
+                          })),
                       }
                     ),
                 })
@@ -191,7 +217,7 @@ export const handleModelPageCallback = (query: CallbackQuery, data: string) =>
                 if (parsed.page < 0 || parsed.page * MODEL_PAGE_SIZE >= value.total) {
                   return yield* answer(query.id, "Invalid page.")
                 }
-                return yield* Effect.gen(function* () {
+                return yield* runAcknowledgedModelAction(query, "Changing page.", Effect.gen(function* () {
                   const nextToken = yield* registry.registerPage({
                     sessionID: value.sessionID,
                     models: value.models,
@@ -210,8 +236,7 @@ export const handleModelPageCallback = (query: CallbackQuery, data: string) =>
                     renderModelPageHeader(parsed.page, value.total),
                     modelPageKeyboard(nextToken, pageModels, parsed.page, value.total),
                   )
-                  yield* answer(query.id, "Page changed.")
-                }).pipe(Effect.catchCause(callbackFailure(query, "model page callback failed", "Failed.")))
+                }))
               }
             }
           }),
@@ -250,7 +275,7 @@ export const handleModelProviderCallback = (query: CallbackQuery, data: string) 
             const provider = Option.fromNullishOr(value.providers[parsed.index])
             return yield* Option.match(provider, {
               onNone: () => answer(query.id, "Invalid provider."),
-              onSome: (selected) => Effect.gen(function* () {
+              onSome: (selected) => runAcknowledgedModelAction(query, "Opening models.", Effect.gen(function* () {
                 yield* logModelSelection("provider-selected", {
                   provider: selected.id,
                   models: selected.models.length,
@@ -271,8 +296,7 @@ export const handleModelProviderCallback = (query: CallbackQuery, data: string) 
                   `Provider ${selected.id} — select a model:`,
                   modelPageKeyboard(token, selected.models.slice(0, MODEL_PAGE_SIZE), 0, selected.models.length),
                 )
-                yield* answer(query.id, "Choose a model.")
-              }),
+              })),
             })
           }),
         })
@@ -318,30 +342,34 @@ export const handleModelVariantCallback = (query: CallbackQuery, data: string) =
                       provider: value.providerID,
                       variant,
                     }).pipe(
-                      Effect.andThen(opencode.switchModel({
-                        sessionID: value.sessionID,
-                        model: {
-                          id: value.modelID,
-                          providerID: value.providerID,
-                          variant,
-                        },
-                      })),
-                      Effect.andThen(
-                        rememberModel(value.directory, {
-                          id: value.modelID,
-                          providerID: value.providerID,
-                          variant,
-                        }),
-                      ),
-                      Effect.tap(() => logModelSelection("model-variant-switched", {
-                        model: value.modelID,
-                        provider: value.providerID,
-                        variant,
-                      })),
-                      Effect.andThen(
-                        apiEdit(value.chatId, value.messageId, `Model switched to ${value.modelID} (${variant})`),
-                      ),
-                      Effect.andThen(answer(query.id, "Switched.")),
+                      Effect.andThen(runAcknowledgedModelAction(
+                        query,
+                        "Applying model.",
+                        opencode.switchModel({
+                          sessionID: value.sessionID,
+                          model: {
+                            id: value.modelID,
+                            providerID: value.providerID,
+                            variant,
+                          },
+                        }).pipe(
+                          Effect.andThen(
+                            rememberModel(value.directory, {
+                              id: value.modelID,
+                              providerID: value.providerID,
+                              variant,
+                            }),
+                          ),
+                          Effect.tap(() => logModelSelection("model-variant-switched", {
+                            model: value.modelID,
+                            provider: value.providerID,
+                            variant,
+                          })),
+                          Effect.andThen(
+                            apiEdit(value.chatId, value.messageId, `Model switched to ${value.modelID} (${variant})`),
+                          ),
+                        ),
+                      )),
                     ),
                 })
             }
@@ -369,8 +397,10 @@ export const handleModelCancelCallback = (query: CallbackQuery, data: string) =>
         yield* Option.match(entry, {
           onNone: () => answer(query.id, "Expired."),
           onSome: (value) =>
-            apiEdit(value.chatId, value.messageId, "Model selection cancelled.").pipe(
-              Effect.andThen(answer(query.id, "Cancelled.")),
+            runAcknowledgedModelAction(
+              query,
+              "Cancelling.",
+              apiEdit(value.chatId, value.messageId, "Model selection cancelled."),
             ),
         })
       }).pipe(Effect.catchCause(callbackFailure(query, "model cancel callback failed", "Failed."))),

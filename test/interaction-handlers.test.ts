@@ -130,7 +130,7 @@ describe("interaction callback claim fencing", () => {
     expect(update?.replyMarkup?.inline_keyboard.flat().some((button) => button.text === "Confirm")).toBe(true)
   })
 
-  test("acknowledges a completed multi-question callback before submitting it to OpenCode", async () => {
+  test("acknowledges a question before persistence lookup and OpenCode submission", async () => {
     await Effect.runPromise(Effect.gen(function* () {
       const registry = yield* QuestionRegistry
       const order = yield* Ref.make<readonly string[]>([])
@@ -164,12 +164,20 @@ describe("interaction callback claim fencing", () => {
           Effect.andThen(Deferred.await(releaseReply)),
         ),
       }
+      const observedRegistry = Layer.succeed(QuestionRegistry, {
+        ...registry,
+        getForMessage: (entryToken, questionIndex, chatId, messageId) =>
+          Ref.update(order, (events) => [...events, "looked-up"]).pipe(
+            Effect.andThen(registry.getForMessage(entryToken, questionIndex, chatId, messageId)),
+          ),
+      })
       const query: CallbackQuery = {
         id: "callback-multi-complete",
         from: { id: 7 },
         message: { message_id: 11, chat: { id: 7 } },
       }
       const fiber = yield* handleQuestionCallback(query, `q:${token}:1:confirm`).pipe(
+        Effect.provide(observedRegistry),
         Effect.provide(Layer.succeed(TelegramApi, api)),
         Effect.provide(Layer.succeed(OpenCode, client)),
         Effect.provide(FetchHttpClient.layer),
@@ -177,7 +185,7 @@ describe("interaction callback claim fencing", () => {
       )
 
       yield* Deferred.await(replyStarted)
-      expect(yield* Ref.get(order)).toEqual(["acknowledged", "submitted"])
+      expect(yield* Ref.get(order)).toEqual(["acknowledged", "looked-up", "submitted"])
       yield* Deferred.succeed(releaseReply, undefined)
       yield* Fiber.join(fiber)
     }).pipe(

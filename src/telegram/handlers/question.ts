@@ -8,7 +8,7 @@ import {
 } from "../render.js"
 import type { CallbackQuery } from "../api.js"
 import { questionKeyboard } from "../run.js"
-import { answer, apiEdit, callbackFailure, sendText } from "./shared.js"
+import { answer, apiEdit, sendText } from "./shared.js"
 import { isComplete } from "../questions.js"
 import { withClaimLease } from "./claim-lease.js"
 
@@ -120,59 +120,77 @@ const questionIndexForEntry = (entry: { readonly messageIds: readonly number[] }
   return index === -1 ? 0 : index
 }
 
+const questionAcknowledgement = (kind: "skip" | "confirm" | "option"): string => {
+  switch (kind) {
+    case "skip":
+      return "Skipped."
+    case "confirm":
+      return "Answer recorded."
+    case "option":
+      return "Selection received."
+  }
+}
+
 export const handleQuestionCallback = (query: CallbackQuery, data: string) =>
   Option.match(parseQuestionCallback(data), {
     onNone: () => answer(query.id, "Invalid data."),
-    onSome: (parsed) =>
-      Effect.gen(function* () {
-        const registry = yield* QuestionRegistry
-        const message = query.message
-        if (message === undefined) {
-          yield* answer(query.id, "Invalid callback.")
-          return
-        }
-        const entry = yield* registry.getForMessage(
-          parsed.token,
-          parsed.questionIndex,
-          message.chat.id,
-          message.message_id,
-        )
-        yield* Option.match(entry, {
-          onNone: () => answer(query.id, "Expired."),
-          onSome: (current) => {
-            const options = Option.fromNullishOr(current.options[parsed.questionIndex])
-            return Option.match(options, {
-              onNone: () => answer(query.id, "Invalid question."),
-              onSome: (questionOptions) => {
-                switch (parsed.choice.kind) {
-                  case "skip":
-                    return runAcknowledgedQuestionAction(
-                      query,
-                      "Skipped.",
-                      recordQuestionAnswer(parsed.token, parsed.questionIndex, []),
-                    )
-                  case "confirm": {
-                    if (!(current.multiples[parsed.questionIndex] ?? false)) {
-                      return answer(query.id, "Invalid action.")
+    onSome: (parsed) => {
+      const message = query.message
+      if (message === undefined) return answer(query.id, "Invalid callback.")
+      return runAcknowledgedQuestionAction(
+        query,
+        questionAcknowledgement(parsed.choice.kind),
+        Effect.gen(function* () {
+          const registry = yield* QuestionRegistry
+          const entry = yield* registry.getForMessage(
+            parsed.token,
+            parsed.questionIndex,
+            message.chat.id,
+            message.message_id,
+          )
+          yield* Option.match(entry, {
+            onNone: () => sendText(
+              message.chat.id,
+              "This question has expired.",
+              message.message_thread_id,
+            ),
+            onSome: (current) => {
+              const options = Option.fromNullishOr(current.options[parsed.questionIndex])
+              return Option.match(options, {
+                onNone: () => sendText(
+                  message.chat.id,
+                  "This question is no longer valid.",
+                  message.message_thread_id,
+                ),
+                onSome: (questionOptions) => {
+                  switch (parsed.choice.kind) {
+                    case "skip":
+                      return recordQuestionAnswer(parsed.token, parsed.questionIndex, [])
+                    case "confirm": {
+                      if (!(current.multiples[parsed.questionIndex] ?? false)) {
+                        return sendText(
+                          message.chat.id,
+                          "This question does not accept confirmation.",
+                          message.message_thread_id,
+                        )
+                      }
+                      const value = current.selections[parsed.questionIndex] ?? []
+                      return recordQuestionAnswer(parsed.token, parsed.questionIndex, value)
                     }
-                    const value = current.selections[parsed.questionIndex] ?? []
-                    return runAcknowledgedQuestionAction(
-                      query,
-                      "Answer recorded.",
-                      recordQuestionAnswer(parsed.token, parsed.questionIndex, value),
-                    )
-                  }
-                  case "option": {
-                    const label = Option.getOrElse(
-                      Option.fromNullishOr(questionOptions[parsed.choice.index]),
-                      () => "",
-                    )
-                    if (label === "") return answer(query.id, "Invalid option.")
-                    if (current.multiples[parsed.questionIndex] ?? false) {
-                      return runAcknowledgedQuestionAction(
-                        query,
-                        "Selection updated.",
-                        Effect.gen(function* () {
+                    case "option": {
+                      const label = Option.getOrElse(
+                        Option.fromNullishOr(questionOptions[parsed.choice.index]),
+                        () => "",
+                      )
+                      if (label === "") {
+                        return sendText(
+                          message.chat.id,
+                          "This option is no longer valid.",
+                          message.message_thread_id,
+                        )
+                      }
+                      if (current.multiples[parsed.questionIndex] ?? false) {
+                        return Effect.gen(function* () {
                           const updated = yield* registry.toggleSelection(
                             parsed.token,
                             parsed.questionIndex,
@@ -198,21 +216,16 @@ export const handleQuestionCallback = (query: CallbackQuery, data: string) =>
                               ), "question selection edit failed")
                             },
                           })
-                        }),
-                      )
+                        })
+                      }
+                      return recordQuestionAnswer(parsed.token, parsed.questionIndex, [label])
                     }
-                    return runAcknowledgedQuestionAction(
-                      query,
-                      "Answer recorded.",
-                      recordQuestionAnswer(parsed.token, parsed.questionIndex, [label]),
-                    )
                   }
-                }
-              },
-            })
-          },
-        })
-      }).pipe(
-        Effect.catchCause(callbackFailure(query, "question callback failed", "Failed.")),
-      ),
+                },
+              })
+            },
+          })
+        }),
+      )
+    },
   })
