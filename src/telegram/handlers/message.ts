@@ -59,8 +59,8 @@ export const handleMessage = (message: Message) =>
     // slash-command guard, otherwise the documented free-text answer path is
     // unreachable.
     if (replied !== undefined && text !== undefined) {
-      const answered = yield* answerRepliedQuestion(chatId, replied.message_id, text, threadId)
-      if (answered) return
+      const consumed = yield* answerRepliedQuestion(chatId, replied.message_id, text, threadId)
+      if (consumed) return
     }
 
     // Plain text starts a run only when loose prompts are enabled for this

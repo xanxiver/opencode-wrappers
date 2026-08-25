@@ -4,7 +4,7 @@ import { FetchHttpClient } from "effect/unstable/http"
 import { OpenCode, type OpenCodeService } from "../src/core/opencode.js"
 import { TelegramApi, type CallbackQuery, type TelegramApiClient } from "../src/telegram/api.js"
 import { handlePermissionCallback } from "../src/telegram/handlers/permission.js"
-import { handleQuestionCallback, recordQuestionAnswer } from "../src/telegram/handlers/question.js"
+import { answerRepliedQuestion, handleQuestionCallback, recordQuestionAnswer } from "../src/telegram/handlers/question.js"
 import { InteractionStoreMemory } from "../src/telegram/interaction-store.js"
 import { Live as PermissionRegistryLive, PermissionRegistry } from "../src/telegram/permissions.js"
 import { Live as QuestionRegistryLive, QuestionRegistry } from "../src/telegram/questions.js"
@@ -45,6 +45,48 @@ const openCode = (permissionCalls: Ref.Ref<number>, questionCalls: Ref.Ref<numbe
   switchModel: () => Effect.void,
   replyQuestion: () => Ref.update(questionCalls, (count) => count + 1),
   events: () => Stream.never,
+})
+
+describe("question text replies", () => {
+  test("consumes a non-final text reply to a multi-question request", async () => {
+    const result = await Effect.runPromise(Effect.gen(function* () {
+      const registry = yield* QuestionRegistry
+      const permissionCalls = yield* Ref.make(0)
+      const questionCalls = yield* Ref.make(0)
+      const token = yield* registry.register({
+        sessionID: "ses_1",
+        requestID: "que_text_multi",
+        chatId: 7,
+        questions: ["First?", "Second?"],
+        options: [[], []],
+        customs: [true, true],
+        multiples: [false, false],
+      })
+      yield* registry.attachMessageId(token, 0, 10)
+      yield* registry.attachMessageId(token, 1, 11)
+
+      const consumed = yield* answerRepliedQuestion(7, 10, "First answer").pipe(
+        Effect.provide(Layer.succeed(OpenCode, openCode(permissionCalls, questionCalls))),
+        Effect.provide(Layer.succeed(TelegramApi, telegramApi)),
+        Effect.provide(FetchHttpClient.layer),
+      )
+      return {
+        consumed,
+        current: yield* registry.get(token),
+        questionCalls: yield* Ref.get(questionCalls),
+      }
+    }).pipe(
+      Effect.provide(QuestionRegistryLive),
+      Effect.provide(InteractionStoreMemory),
+    ))
+
+    expect(result.consumed).toBe(true)
+    expect(result.questionCalls).toBe(0)
+    expect(Option.map(result.current, (entry) => entry.answers)).toEqual(Option.some([
+      ["First answer"],
+      undefined,
+    ]))
+  })
 })
 
 describe("interaction callback claim fencing", () => {
