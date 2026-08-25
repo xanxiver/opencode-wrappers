@@ -43,7 +43,11 @@ The bot lives in `src/` and `test/` at the repository root. The core
 - `/queue_delete <pos>`: remove one queued task by its `/queue` position.
 - `/queue_clear`: remove every queued task for the current session.
 - `/loose on|off`: when on, a plain message starts a run without `/prompt`.
+  When exactly one custom-answer question is waiting in the same topic, plain
+  text answers that question instead. Use `/prompt` to start a separate task.
   Slash commands still run first. The setting is stored per conversation.
+- `/new` starts a fresh session only after the current session has no running
+  or queued durable tasks. This keeps executable work visible to `/queue`.
 - `/continue on|off`: when on, a failed, errored, or timed-out run sends a
   `continue` prompt into the same session automatically. Max 5 consecutive
   continues with jittered exponential backoff (30s up to 8m); any success

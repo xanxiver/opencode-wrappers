@@ -340,6 +340,19 @@ describe("PermissionRegistry", () => {
     expect(result?.afterExpiry[0]?.failure).toBe("uncertain")
   })
 
+  test("operator retry cleans an expired in-flight delivery without listing reviews first", async () => {
+    const result = await Effect.runPromise(Effect.gen(function* () {
+      const registry = yield* PermissionRegistry
+      const token = yield* registry.registerOrResume({ sessionID: "ses_direct_retry", requestID: "req_direct_retry", chatId: 7 })
+      if (Option.isNone(token)) return false
+      yield* registry.claimDelivery(token.value, 7)
+      yield* TestClock.adjust("121 seconds")
+      return yield* registry.retryUncertainDelivery(token.value, 7, "ses_direct_retry")
+    }).pipe(Effect.provide(Live), Effect.provide(InteractionStoreMemory), Effect.provide(TestClock.layer())))
+
+    expect(result).toBe(true)
+  })
+
   test("fences a stale process after another registry takes over an expired claim", async () => {
     const store = persistentStore()
     const result = await Effect.runPromise(Effect.gen(function* () {

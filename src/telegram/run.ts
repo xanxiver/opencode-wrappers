@@ -633,8 +633,14 @@ export const sessionRequestMatchesRoute = (
 ): Effect.Effect<boolean, never> =>
   registry.getSessionRoute(sessionID).pipe(
     Effect.flatMap(Option.match({
-      onSome: (route) =>
-        Effect.succeed(matchesSessionRoute(route, chatId, Option.getOrUndefined(threadId))),
+      onSome: (route) => matchesSessionRoute(route, chatId, Option.getOrUndefined(threadId))
+        ? Effect.succeed(true)
+        : rootSessionID(opencode, sessionID).pipe(
+            Effect.flatMap((root) => registry.getSessionRoute(root)),
+            Effect.map(Option.exists((rootRoute) =>
+              matchesSessionRoute(rootRoute, chatId, Option.getOrUndefined(threadId)),
+            )),
+          ),
       onNone: () =>
         rootSessionID(opencode, sessionID).pipe(
           Effect.flatMap((root) => registry.getSessionRoute(root)),
@@ -674,6 +680,48 @@ export const questionKeyboard = (
   return { inline_keyboard: chunk(buttons, 2) }
 }
 
+/** Deliver one event-stream permission at its effective root run destination. */
+export const surfacePermission = (
+  request: {
+    readonly id: string
+    readonly sessionID: string
+    readonly action: string
+    readonly resources: readonly string[]
+  },
+  chatId: number,
+  threadId: Option.Option<number>,
+  registry: PermissionRegistryService,
+): Effect.Effect<void, never, TelegramApi | HttpClient.HttpClient> =>
+  Effect.gen(function* () {
+    const route = { chatId, threadId: Option.getOrUndefined(threadId) }
+    // Preserve the child session for the OpenCode reply and persist the exact
+    // topic before the periodic resurface loop sees this delivered prompt.
+    yield* registry.rerouteSession(request.sessionID, route)
+    const tokenOption = yield* registry.registerOrResume({
+      sessionID: request.sessionID,
+      requestID: request.id,
+      chatId,
+    })
+    if (Option.isNone(tokenOption)) return
+    const token = tokenOption.value
+    const api = yield* TelegramApi
+    const claimed = yield* registry.claimDeliveryWithGeneration(token, chatId)
+    if (Option.isNone(claimed)) return
+    const message = yield* recordDefinitiveSendFailure(api.sendMessage({
+      chatId,
+      text: renderPermission(request.action, request.resources),
+      messageThreadId: route.threadId,
+      replyMarkup: {
+        inline_keyboard: [[
+          { text: "Once", callback_data: `perm:${token}:once` },
+          { text: "Always", callback_data: `perm:${token}:always` },
+          { text: "Reject", callback_data: `perm:${token}:reject` },
+        ]],
+      },
+    }), registry.rejectDeliveryWithGeneration(token, chatId, claimed.value))
+    yield* registry.attachMessageId(token, message.message_id, claimed.value)
+  }).pipe(Effect.catchCause(logTelegramFailure("permission prompt failed")))
+
 const surfaceQuestion = (
   request: PendingQuestionRequest,
   chatId: number,
@@ -682,6 +730,10 @@ const surfaceQuestion = (
 ): Effect.Effect<void, never, TelegramApi | HttpClient.HttpClient> =>
   Effect.gen(function* () {
     const api = yield* TelegramApi
+    const route = { chatId, threadId: Option.getOrUndefined(threadId) }
+    // Preserve the child session for the OpenCode reply, but record the root
+    // run's exact Telegram destination for topic-scoped text answers.
+    yield* questionRegistry.rerouteSession(request.sessionID, route)
     // Event streams can reconnect and replay the same request. Register
     // atomically so a replay does not create a second Telegram prompt.
     const tokenOption = yield* questionRegistry.registerOrResume({
@@ -702,7 +754,7 @@ const surfaceQuestion = (
         const message = yield* recordDefinitiveSendFailure(api.sendMessage({
           chatId,
           text: renderQuestion(question),
-          messageThreadId: Option.getOrUndefined(threadId),
+          messageThreadId: route.threadId,
           replyMarkup: question.options.length === 0 ? undefined : questionKeyboard(token, index, question),
         }), questionRegistry.rejectDeliveryWithGeneration(token, index, chatId, claimed.value))
         yield* questionRegistry.attachMessageId(token, index, message.message_id, claimed.value)
@@ -842,30 +894,8 @@ const handleEvent = (
       return Effect.gen(function* () {
         const opencode = yield* OpenCode
         if (!(yield* sessionRequestMatchesRoute(registry, opencode, event.data.sessionID, chatId, threadId))) return
-        const tokenOption = yield* registry.registerOrResume({
-          sessionID: event.data.sessionID,
-          requestID: event.data.id,
-          chatId,
-        })
-        if (Option.isNone(tokenOption)) return
-        const token = tokenOption.value
-        const api = yield* TelegramApi
-        const claimed = yield* registry.claimDeliveryWithGeneration(token, chatId)
-        if (Option.isNone(claimed)) return
-        const message = yield* recordDefinitiveSendFailure(api.sendMessage({
-          chatId,
-          text: renderPermission(event.data.action, event.data.resources),
-          messageThreadId: Option.getOrUndefined(threadId),
-          replyMarkup: {
-            inline_keyboard: [[
-              { text: "Once", callback_data: `perm:${token}:once` },
-              { text: "Always", callback_data: `perm:${token}:always` },
-              { text: "Reject", callback_data: `perm:${token}:reject` },
-            ]],
-          },
-        }), registry.rejectDeliveryWithGeneration(token, chatId, claimed.value))
-        yield* registry.attachMessageId(token, message.message_id, claimed.value)
-      }).pipe(Effect.catchCause(logTelegramFailure("permission prompt failed")))
+        yield* surfacePermission(event.data, chatId, threadId, registry)
+      }).pipe(Effect.catchCause(logTelegramFailure("read permission session route failed")))
     }
     case "form.created": {
       const request = questionRequestFromEvent(event)

@@ -108,6 +108,7 @@ describe("Telegram agent handlers", () => {
     const submitted = await Effect.runPromise(Ref.make<{ readonly text: string; readonly agent?: string } | undefined>(undefined))
     const executor: TelegramDurableExecutorService = {
       submit: (_chatId, _message, text, selectedAgent) => Ref.set(submitted, { text, agent: selectedAgent }),
+      resetConversation: () => Effect.succeed("reset"),
       reconnect: () => Effect.void,
       listReviews: () => Effect.void,
       resolveReview: () => Effect.void,

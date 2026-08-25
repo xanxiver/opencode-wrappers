@@ -274,16 +274,22 @@ export class TelegramApi extends Context.Service<TelegramApi, TelegramApiClient>
   "opencode2-uis/TelegramApi",
 ) {}
 
-/**
- * The bot token is part of every Telegram API URL, so transport failures can
- * carry it inside their cause text. The Live layer replaces this identity
- * function with a redactor that scrubs the configured token before logging.
- */
-let redactToken = (text: string): string => text
+type SensitiveRedactor = (text: string) => string
 
-const logRedactedBoundary = (operation: string) => (cause: Cause.Cause<unknown>): Effect.Effect<void> =>
+/** Remove transport details that can carry the bot token before an ApiError leaves this module. */
+const sanitizedApiError = (redact: SensitiveRedactor, error: ApiError): ApiError => new ApiError({
+  operation: error.operation,
+  code: error.code,
+  description: error.description === undefined ? undefined : redact(error.description),
+  cause: error.cause === undefined ? undefined : redact(Cause.pretty(Cause.fail(error.cause))),
+  retryAfterMs: error.retryAfterMs,
+  transient: error.transient,
+})
+
+const logRedactedBoundary = (redact: SensitiveRedactor, operation: string) =>
+  (cause: Cause.Cause<unknown>): Effect.Effect<void> =>
   Effect.annotateLogs({ component: "telegram/api", boundary: "telegram-bot-api" })(
-    Effect.logError(`telegram ${operation} failed`, redactToken(Cause.pretty(cause))),
+    Effect.logError(`telegram ${operation} failed`, redact(Cause.pretty(cause))),
   )
 
 export const decodeTelegramResponse = <A>(
@@ -350,6 +356,7 @@ export const decodeTelegramErrorResponse = (
 const call = <A>(
   operation: string,
   schema: Schema.ConstraintCodec<A>,
+  redact: SensitiveRedactor,
   options?: {
     readonly retryTransient?: boolean
     readonly onRetry?: RetryObserver
@@ -376,22 +383,23 @@ const call = <A>(
       Effect.catchCause((cause) =>
         Option.match(Cause.findErrorOption(cause), {
           onNone: () =>
-            logRedactedBoundary(operation)(cause).pipe(
+            logRedactedBoundary(redact, operation)(cause).pipe(
               Effect.andThen(Effect.fail(new ApiError({ operation, transient: false }))),
             ),
           onSome: (error) => {
+            const safeError = sanitizedApiError(redact, error)
             const meta = {
               component: "telegram/api",
               boundary: "telegram-bot-api",
               operation,
-              code: error.code,
-              description: error.description,
-              transient: error.transient,
-              retryAfterMs: error.retryAfterMs,
+              code: safeError.code,
+              description: safeError.description,
+              transient: safeError.transient,
+              retryAfterMs: safeError.retryAfterMs,
             }
             return Effect.annotateLogs(meta)(
               Effect.logWarning(`telegram ${operation} failed`),
-            ).pipe(Effect.andThen(Effect.fail(error)))
+            ).pipe(Effect.andThen(Effect.fail(safeError)))
           },
         }),
       ),
@@ -441,7 +449,9 @@ export const Live: Layer.Layer<TelegramApi, ConfigError, AppConfig> = Layer.effe
     const token = config.telegramBotToken
     if (token === undefined) return yield* new ConfigError({ message: "TELEGRAM_BOT_TOKEN is required by the Telegram API" })
     // Transport failures can echo the request URL, which contains the token.
-    redactToken = (text: string): string => text.split(token).join("***")
+    // Keep the redactor local to this client so concurrent layers cannot swap
+    // credentials or sanitize each other's failures with the wrong token.
+    const redact = (text: string): string => text.split(token).join("***")
     const base = `https://api.telegram.org/bot${token}`
     const fileBase = `https://api.telegram.org/file/bot${token}`
     // Adaptive per-chat edit throttle. The interval starts at the chat-type
@@ -489,7 +499,7 @@ export const Live: Layer.Layer<TelegramApi, ConfigError, AppConfig> = Layer.effe
       input: TelegramMediaInput,
     ): Effect.Effect<Message, ApiError, HttpClient.HttpClient> =>
       Effect.gen(function* () {
-        return yield* call(operation, MessageSchema, { retryTransient: input.retryTransient })(
+        return yield* call(operation, MessageSchema, redact, { retryTransient: input.retryTransient })(
           mediaRequest(base, operation, field, input),
         )
       })
@@ -507,7 +517,7 @@ export const Live: Layer.Layer<TelegramApi, ConfigError, AppConfig> = Layer.effe
       })
     return {
       getUpdates: (offset, timeoutSeconds) =>
-        call("getUpdates", Schema.Array(UpdateSchema))(
+        call("getUpdates", Schema.Array(UpdateSchema), redact)(
           HttpClientRequest.get(`${base}/getUpdates`).pipe(
             HttpClientRequest.setUrlParams({ offset, timeout: timeoutSeconds }),
           ),
@@ -527,7 +537,7 @@ export const Live: Layer.Layer<TelegramApi, ConfigError, AppConfig> = Layer.effe
           // retry cannot duplicate it. Transport retries stay disabled
           // because an ambiguous network failure may have been delivered.
           // Each 429 also widens this chat's edit throttle.
-          const request = call("sendMessage", MessageSchema, { retryTransient: false })(
+          const request = call("sendMessage", MessageSchema, redact, { retryTransient: false })(
             HttpClientRequest.post(`${base}/sendMessage`).pipe(HttpClientRequest.setBody(body)),
           ).pipe(
             Effect.catchTag("ApiError", (error) =>
@@ -555,7 +565,7 @@ export const Live: Layer.Layer<TelegramApi, ConfigError, AppConfig> = Layer.effe
                   reply_markup: input.replyMarkup,
                 }).pipe(
                   Effect.flatMap((body) =>
-                    call("editMessageText", MessageSchema, {
+                    call("editMessageText", MessageSchema, redact, {
                       onRetry: (error) => error.code === 429
                         ? Ref.set(sawFlood, true).pipe(
                             Effect.andThen(penalizeFlood(input.chatId, error.retryAfterMs)),
@@ -585,12 +595,12 @@ export const Live: Layer.Layer<TelegramApi, ConfigError, AppConfig> = Layer.effe
             callback_query_id: input.queryId,
             text: input.text,
           })
-          return yield* call("answerCallbackQuery", Schema.Boolean)(
+          return yield* call("answerCallbackQuery", Schema.Boolean, redact)(
             HttpClientRequest.post(`${base}/answerCallbackQuery`).pipe(HttpClientRequest.setBody(body)),
           )
         }),
       getFile: (fileId) =>
-        call("getFile", FileInfoSchema)(
+        call("getFile", FileInfoSchema, redact)(
           HttpClientRequest.get(`${base}/getFile`).pipe(
             HttpClientRequest.setUrlParams({ file_id: fileId }),
           ),
@@ -618,10 +628,10 @@ export const Live: Layer.Layer<TelegramApi, ConfigError, AppConfig> = Layer.effe
           Effect.catchCause((cause) =>
             Option.match(Cause.findErrorOption(cause), {
               onNone: () =>
-                logRedactedBoundary("downloadFile")(cause).pipe(
+                logRedactedBoundary(redact, "downloadFile")(cause).pipe(
                   Effect.andThen(Effect.fail(new ApiError({ operation: "downloadFile", transient: false }))),
                 ),
-              onSome: (error) => Effect.fail(error),
+              onSome: (error) => Effect.fail(sanitizedApiError(redact, error)),
             }),
           ),
         ),

@@ -4,7 +4,7 @@ import { FetchHttpClient } from "effect/unstable/http"
 import { OpenCode, type OpenCodeService } from "../src/core/opencode.js"
 import { TelegramApi, type CallbackQuery, type TelegramApiClient } from "../src/telegram/api.js"
 import { handlePermissionCallback } from "../src/telegram/handlers/permission.js"
-import { answerRepliedQuestion, handleQuestionCallback, recordQuestionAnswer } from "../src/telegram/handlers/question.js"
+import { answerPendingQuestionText, answerRepliedQuestion, handleQuestionCallback, recordQuestionAnswer } from "../src/telegram/handlers/question.js"
 import { InteractionStoreMemory } from "../src/telegram/interaction-store.js"
 import { Live as PermissionRegistryLive, PermissionRegistry } from "../src/telegram/permissions.js"
 import { Live as QuestionRegistryLive, QuestionRegistry } from "../src/telegram/questions.js"
@@ -48,6 +48,88 @@ const openCode = (permissionCalls: Ref.Ref<number>, questionCalls: Ref.Ref<numbe
 })
 
 describe("question text replies", () => {
+  test("asks for an explicit reply when topic text could answer multiple questions", async () => {
+    const result = await Effect.runPromise(Effect.gen(function* () {
+      const registry = yield* QuestionRegistry
+      const sent = yield* Ref.make<readonly string[]>([])
+      const permissionCalls = yield* Ref.make(0)
+      const questionCalls = yield* Ref.make(0)
+      const api: TelegramApiClient = {
+        ...telegramApi,
+        sendMessage: ({ chatId, text }) => Ref.update(sent, (messages) => [...messages, text]).pipe(
+          Effect.as({ message_id: 20, chat: { id: chatId } }),
+        ),
+      }
+      for (const [index, sessionID] of ["ses_one", "ses_two"].entries()) {
+        yield* registry.setSessionRoute(sessionID, { chatId: 7, threadId: 42 })
+        const token = yield* registry.register({
+          sessionID,
+          requestID: `que_${index}`,
+          chatId: 7,
+          questions: ["Explain?"],
+          options: [[]],
+          customs: [true],
+          multiples: [false],
+        })
+        yield* registry.attachMessageId(token, 0, 10 + index)
+      }
+
+      const consumed = yield* answerPendingQuestionText(7, "Ambiguous answer", 42).pipe(
+        Effect.provide(Layer.succeed(OpenCode, openCode(permissionCalls, questionCalls))),
+        Effect.provide(Layer.succeed(TelegramApi, api)),
+        Effect.provide(FetchHttpClient.layer),
+      )
+      return { consumed, sent: yield* Ref.get(sent) }
+    }).pipe(
+      Effect.provide(QuestionRegistryLive),
+      Effect.provide(InteractionStoreMemory),
+    ))
+
+    expect(result.consumed).toBe(true)
+    expect(result.sent).toEqual(["More than one question is waiting. Reply to the specific question message."])
+  })
+
+  test("consumes unambiguous topic text before loose-mode routing", async () => {
+    const result = await Effect.runPromise(Effect.gen(function* () {
+      const registry = yield* QuestionRegistry
+      const permissionCalls = yield* Ref.make(0)
+      const questionCalls = yield* Ref.make(0)
+      yield* registry.setSessionRoute("ses_topic", { chatId: 7, threadId: 42 })
+      const token = yield* registry.register({
+        sessionID: "ses_topic",
+        requestID: "que_topic_text",
+        chatId: 7,
+        questions: ["Explain?", "Continue?"],
+        options: [[], ["Yes", "No"]],
+        customs: [true, false],
+        multiples: [false, false],
+      })
+      yield* registry.attachMessageId(token, 0, 10)
+      yield* registry.attachMessageId(token, 1, 11)
+
+      const consumed = yield* answerPendingQuestionText(7, "Topic answer", 42).pipe(
+        Effect.provide(Layer.succeed(OpenCode, openCode(permissionCalls, questionCalls))),
+        Effect.provide(Layer.succeed(TelegramApi, telegramApi)),
+        Effect.provide(FetchHttpClient.layer),
+      )
+      return {
+        consumed,
+        current: yield* registry.get(token),
+        questionCalls: yield* Ref.get(questionCalls),
+      }
+    }).pipe(
+      Effect.provide(QuestionRegistryLive),
+      Effect.provide(InteractionStoreMemory),
+    ))
+
+    expect(result.consumed).toBe(true)
+    expect(result.questionCalls).toBe(0)
+    expect(Option.map(result.current, (entry) => entry.answers)).toEqual(Option.some([
+      ["Topic answer"],
+      undefined,
+    ]))
+  })
+
   test("consumes a non-final text reply to a multi-question request", async () => {
     const result = await Effect.runPromise(Effect.gen(function* () {
       const registry = yield* QuestionRegistry

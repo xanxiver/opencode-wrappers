@@ -8,6 +8,7 @@ import { InteractionStoreMemory } from "../src/telegram/interaction-store.js"
 import { Live as PermissionRegistryLive, PermissionRegistry } from "../src/telegram/permissions.js"
 import { Live as QuestionRegistryLive, QuestionRegistry } from "../src/telegram/questions.js"
 import { reconcilePendingSession } from "../src/telegram/resurface.js"
+import { surfacePermission } from "../src/telegram/run.js"
 
 const openCode: OpenCodeService = {
   createSession: () => Effect.never,
@@ -215,6 +216,42 @@ describe("child session reconciliation", () => {
     expect(Option.isSome(result.entry) && result.entry.value.sessionID).toBe("ses_child")
   })
 
+  test("does not resend an event-delivered child permission during reconciliation", async () => {
+    const sent = await Effect.runPromise(Ref.make(0))
+    const childPermission = {
+      id: "perm_child_event",
+      sessionID: "ses_child",
+      action: "tool.shell",
+      resources: ["bash: echo hi"],
+    }
+    const result = await Effect.runPromise(Effect.gen(function* () {
+      const permissions = yield* PermissionRegistry
+      yield* permissions.setSessionRoute("ses_root", { chatId: 7, threadId: 42 })
+      yield* surfacePermission(childPermission, 7, Option.some(42), permissions)
+      yield* reconcilePendingSession("/work", "ses_root", { chatId: 7, threadId: 42 })
+      return {
+        sent: yield* Ref.get(sent),
+        childRoute: yield* permissions.getSessionRoute("ses_child"),
+        entry: yield* permissions.findByRequest(7, "ses_child", "perm_child_event"),
+      }
+    }).pipe(
+      Effect.provide(PermissionRegistryLive),
+      Effect.provide(QuestionRegistryLive),
+      Effect.provide(InteractionStoreMemory),
+      Effect.provide(Layer.succeed(OpenCode, treeOpenCode(
+        { ses_root: undefined, ses_child: "ses_root" },
+        [childPermission],
+        [],
+      ))),
+      Effect.provide(Layer.succeed(TelegramApi, countingApi(sent))),
+      Effect.provide(FetchHttpClient.layer),
+    ))
+
+    expect(result.sent).toBe(1)
+    expect(result.childRoute).toEqual(Option.some({ chatId: 7, threadId: 42 }))
+    expect(Option.isSome(result.entry) && result.entry.value.messageId).toBe(1)
+  })
+
   test("surfaces a nested subagent question through the root route", async () => {
     const sent = await Effect.runPromise(Ref.make(0))
     const result = await Effect.runPromise(Effect.gen(function* () {
@@ -223,6 +260,9 @@ describe("child session reconciliation", () => {
       return {
         sent: yield* Ref.get(sent),
         entry: yield* questions.findByRequest(7, "ses_grandchild", "frm_grandchild"),
+        topicTargets: yield* questions.findTextAnswerTargets(7, 42),
+        rootTargets: yield* questions.findTextAnswerTargets(7),
+        childRoute: yield* questions.getSessionRoute("ses_grandchild"),
       }
     }).pipe(
       Effect.provide(PermissionRegistryLive),
@@ -234,7 +274,7 @@ describe("child session reconciliation", () => {
         [{
           id: "frm_grandchild",
           sessionID: "ses_grandchild",
-          questions: [{ header: "Approval", question: "Approve?", options: [], custom: false, multiple: false }],
+          questions: [{ header: "Approval", question: "Approve?", options: [], custom: true, multiple: false }],
         }],
       ))),
       Effect.provide(Layer.succeed(TelegramApi, countingApi(sent))),
@@ -243,6 +283,10 @@ describe("child session reconciliation", () => {
 
     expect(result.sent).toBe(1)
     expect(Option.isSome(result.entry) && result.entry.value.sessionID).toBe("ses_grandchild")
+    expect(result.topicTargets).toHaveLength(1)
+    expect(result.topicTargets[0]?.questionIndex).toBe(0)
+    expect(result.rootTargets).toEqual([])
+    expect(result.childRoute).toEqual(Option.some({ chatId: 7, threadId: 42 }))
   })
 
   test("does not surface a permission from an unrelated session tree", async () => {

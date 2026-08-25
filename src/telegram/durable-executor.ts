@@ -1,4 +1,4 @@
-import { Cause, Clock, Context, Effect, FiberMap, FileSystem, Layer, Option, Path, Random, Schedule, Schema } from "effect"
+import { Cause, Clock, Context, Effect, FiberMap, FileSystem, Layer, Option, Path, Random, Ref, Schedule, Schema, Semaphore } from "effect"
 import type { HttpClient } from "effect/unstable/http"
 import { Buffer } from "node:buffer"
 import { AppConfigTag, type AppConfig } from "../config.js"
@@ -16,8 +16,8 @@ import {
 import { logBoundary } from "../core/logging.js"
 import { GitChanges, type GitChangesService } from "../core/git-changes.js"
 import { OpenCode, type OpenCodeError } from "../core/opencode.js"
-import { Sessions, type SessionsError } from "../core/sessions.js"
-import { Store, type StoreError } from "../core/store.js"
+import { Sessions, type SessionsError, type SessionsService } from "../core/sessions.js"
+import { Store, type StoreError, type StoreService } from "../core/store.js"
 import { AttachmentDownloadError, collectAttachments, FileValidationError } from "./files.js"
 import { sendText } from "./handlers/shared.js"
 import { conversationId } from "./conversation.js"
@@ -100,6 +100,9 @@ const decodeFinalization = (value: string): Effect.Effect<PersistedFinalization,
 
 export interface TelegramDurableExecutorService {
   readonly submit: (chatId: number, message: Message, text: string, agent?: string) => Effect.Effect<void, DurableExecutorError | SessionsError | StoreError | AttachmentDownloadError>
+  /** Reset only when the conversation's current durable run pipeline is empty. */
+  readonly resetConversation: (chatId: number, threadId?: number) =>
+    Effect.Effect<"reset" | "blocked", DurableExecutorError | SessionsError>
   readonly reconnect: (chatId: number, message: Message, force: boolean) => Effect.Effect<void, DurableExecutorError | InteractionStoreError | OpenCodeError | SessionsError | StoreError>
   readonly listReviews: (chatId: number, threadId?: number) => Effect.Effect<void, DurableExecutorError | SessionsError | InteractionStoreError>
   readonly resolveReview: (chatId: number, reviewID: string, threadId?: number) => Effect.Effect<void, DurableExecutorError | SessionsError | InteractionStoreError>
@@ -122,6 +125,47 @@ const ownerFor = (sessionID: string): string => `session:${sessionID}`
 
 /** Job states that occupy the run pipeline and are not yet terminal. */
 export const RUN_PIPELINE_STATES: readonly DurableJobState[] = ["pending", "dispatching", "running", "finalizing"]
+
+export const hasRunPipeline = (jobs: readonly Pick<DurableJob, "state">[]): boolean =>
+  jobs.some((job) => RUN_PIPELINE_STATES.includes(job.state))
+
+type DurableSubmission = Parameters<DurableExecutorRepository["submit"]>[0]
+
+/** Atomically reject a reset while the current session still owns executable work. */
+export const resetConversationUsing = (
+  lock: Semaphore.Semaphore,
+  store: Pick<StoreService, "getSessionIDForConversation">,
+  sessions: Pick<SessionsService, "reset">,
+  jobs: Pick<DurableExecutorRepository, "listOwner">,
+  conversation: string,
+): Effect.Effect<"reset" | "blocked", DurableExecutorError | SessionsError> =>
+  lock.withPermit(Effect.gen(function* () {
+    const sessionID = yield* store.getSessionIDForConversation(conversation)
+    if (Option.isSome(sessionID)) {
+      const ownerJobs = yield* jobs.listOwner("telegram", ownerFor(sessionID.value))
+      if (hasRunPipeline(ownerJobs)) return "blocked"
+    }
+    yield* sessions.reset(conversation)
+    return "reset"
+  }))
+
+/** Atomically submit only while the conversation still owns the expected session. */
+export const submitForCurrentConversationUsing = (
+  lock: Semaphore.Semaphore,
+  store: Pick<StoreService, "getSessionIDForConversation">,
+  jobs: Pick<DurableExecutorRepository, "submit">,
+  conversation: string,
+  sessionID: string,
+  submission: DurableSubmission,
+): Effect.Effect<boolean, DurableExecutorError> =>
+  lock.withPermit(store.getSessionIDForConversation(conversation).pipe(
+    Effect.flatMap(Option.match({
+      onNone: () => Effect.succeed(false),
+      onSome: (current) => current !== sessionID
+        ? Effect.succeed(false)
+        : jobs.submit(submission).pipe(Effect.as(true)),
+    })),
+  ))
 
 export const agentSwitchRetriesExhausted = (cause: Cause.Cause<unknown>, attempt: number): boolean =>
   attempt >= 3 && Cause.findErrorOption(cause).pipe(
@@ -314,6 +358,28 @@ export const TelegramDurableExecutorLive: Layer.Layer<
     const interaction = yield* InteractionStore
     const context = yield* Effect.context<DurableExecutorStore | Sessions | Store | OpenCode | TelegramApi | AppConfig | FileSystem.FileSystem | Path.Path | HttpClient.HttpClient | PermissionRegistry | QuestionRegistry | GitChanges | InteractionStore>()
     const fibers = yield* FiberMap.make<string, void, never>()
+    const conversationLocks = yield* Ref.make<ReadonlyMap<string, Semaphore.Semaphore>>(new Map())
+    const conversationLockFor = (conversation: string): Effect.Effect<Semaphore.Semaphore> =>
+      Ref.modify(conversationLocks, (locks) => {
+        const existing = locks.get(conversation)
+        if (existing !== undefined) return [existing, locks]
+        const lock = Semaphore.makeUnsafe(1)
+        return [lock, new Map(locks).set(conversation, lock)]
+      })
+    const submitForCurrentConversation = (
+      conversation: string,
+      sessionID: string,
+      submission: DurableSubmission,
+    ): Effect.Effect<boolean, DurableExecutorError> => conversationLockFor(conversation).pipe(
+      Effect.flatMap((lock) => submitForCurrentConversationUsing(
+        lock,
+        store,
+        jobs,
+        conversation,
+        sessionID,
+        submission,
+      )),
+    )
     yield* Effect.addFinalizer(() => FiberMap.clear(fibers).pipe(
       Effect.andThen(jobs.releaseWorkerLeases),
       Effect.catchCause((cause) => logBoundary("telegram/executor", "durable-store", "release worker leases failed")(cause)),
@@ -464,7 +530,7 @@ export const TelegramDurableExecutorLive: Layer.Layer<
       const now = yield* Clock.currentTimeMillis
       const rand = (yield* Random.nextIntBetween(0, 999)) / 1000
       const availableAt = now + autoContinueDelayMs(decision.round, rand)
-      yield* jobs.submit({
+      const submitted = yield* submitForCurrentConversation(conversation, payload.sessionID, {
         sourceKey: `telegram:${conversation}:continue:${decision.round}:${lease.job.id}`,
         channel: "telegram",
         owner: ownerFor(payload.sessionID),
@@ -472,6 +538,12 @@ export const TelegramDurableExecutorLive: Layer.Layer<
         payload: JSON.stringify(nextPayload),
         availableAt,
       })
+      if (!submitted) {
+        yield* interaction.set(autoContinueKey(payload.sessionID), 0).pipe(
+          Effect.catchCause((cause) => logBoundary("telegram/executor", "auto-continue", "counter reset failed")(cause)),
+        )
+        return
+      }
       yield* interaction.set(autoContinueKey(payload.sessionID), decision.round)
       yield* notify(`Auto-continue ${decision.round}/${AUTO_CONTINUE_MAX}…`)
     })
@@ -700,6 +772,11 @@ export const TelegramDurableExecutorLive: Layer.Layer<
     ))
 
     return {
+      resetConversation: (chatId, threadId) => Effect.gen(function* () {
+        const conversation = conversationId({ chatId, threadId })
+        const lock = yield* conversationLockFor(conversation)
+        return yield* resetConversationUsing(lock, store, sessions, jobs, conversation)
+      }),
       submit: (chatId: number, message: Message, text: string, agent?: string) => Effect.gen(function* () {
         const attachments = yield* collectAttachments(message).pipe(
           Effect.map(Option.some),
@@ -715,36 +792,38 @@ export const TelegramDurableExecutorLive: Layer.Layer<
           }),
         )
         if (Option.isNone(attachments)) return
-         const conversation = conversationId({ chatId, threadId: message.message_thread_id })
-         const sessionID = yield* sessions.getOrCreate(conversation)
-         const directory = yield* sessions.directoryFor(conversation)
-        const model = yield* store.getModel(directory).pipe(Effect.map(Option.getOrUndefined))
-        const payload: TelegramJobPayload = {
-          chatId,
-          message,
-          text,
-          sessionID,
-          directory,
-          attachments: encodeAttachmentSnapshots(attachments.value),
-        }
-        if (message.message_thread_id !== undefined) Object.assign(payload, { threadId: message.message_thread_id })
-        if (model !== undefined) Object.assign(payload, { model })
-        if (agent !== undefined) Object.assign(payload, { agent })
-        const submitted = yield* jobs.submit({
-           sourceKey: `telegram:${conversation}:${message.message_id}`,
-          channel: "telegram",
-          owner: ownerFor(sessionID),
-          payload: JSON.stringify(payload),
-          sessionID,
-        })
-        if (!submitted.created) return
-        const ownerJobs = yield* jobs.listOwner("telegram", ownerFor(sessionID))
-        const waitingBehindAnother = ownerJobs.some((job) => job.id !== submitted.job.id && (
-          job.state === "dispatching" || job.state === "running" || job.state === "finalizing" || job.state === "pending"
-        ))
-        if (waitingBehindAnother) {
-          yield* sendText(chatId, "Queued. It runs when the current task finishes.", message.message_thread_id)
-        }
+        const conversation = conversationId({ chatId, threadId: message.message_thread_id })
+        const lock = yield* conversationLockFor(conversation)
+        yield* lock.withPermit(Effect.gen(function* () {
+          const sessionID = yield* sessions.getOrCreate(conversation)
+          const directory = yield* sessions.directoryFor(conversation)
+          const model = yield* store.getModel(directory).pipe(Effect.map(Option.getOrUndefined))
+          const payload: TelegramJobPayload = {
+            chatId,
+            message,
+            text,
+            sessionID,
+            directory,
+            attachments: encodeAttachmentSnapshots(attachments.value),
+          }
+          if (message.message_thread_id !== undefined) Object.assign(payload, { threadId: message.message_thread_id })
+          if (model !== undefined) Object.assign(payload, { model })
+          if (agent !== undefined) Object.assign(payload, { agent })
+          const submitted = yield* jobs.submit({
+            sourceKey: `telegram:${conversation}:${message.message_id}`,
+            channel: "telegram",
+            owner: ownerFor(sessionID),
+            payload: JSON.stringify(payload),
+            sessionID,
+          })
+          if (!submitted.created) return
+          const ownerJobs = yield* jobs.listOwner("telegram", ownerFor(sessionID))
+          const waitingBehindAnother = ownerJobs.some((job) =>
+            job.id !== submitted.job.id && RUN_PIPELINE_STATES.includes(job.state))
+          if (waitingBehindAnother) {
+            yield* sendText(chatId, "Queued. It runs when the current task finishes.", message.message_thread_id)
+          }
+        }))
       }).pipe(Effect.provide(context)),
       reconnect: (chatId: number, message: Message, force: boolean) => Effect.gen(function* () {
          const threadId = message.message_thread_id
@@ -765,18 +844,8 @@ export const TelegramDurableExecutorLive: Layer.Layer<
             yield* sendText(chatId, "The current session has no active run.", threadId)
             return
           }
-          const route = { chatId, threadId }
-          yield* permissionRegistry.rerouteSession(sessionID.value, route)
-          // Reroute each registry independently. A previous partial transfer
-          // can leave the permission route current while questions still use
-          // the old destination.
-          yield* questionRegistry.rerouteSession(sessionID.value, route)
-          yield* reconcilePendingSession(directory, sessionID.value, route).pipe(
-            Effect.catchCause((cause) =>
-              logBoundary("telegram/executor", "pending-interactions", "reconnect interaction reconciliation failed")(cause),
-            ),
-          )
-          const payload: TelegramJobPayload = {
+           const route = { chatId, threadId }
+           const payload: TelegramJobPayload = {
             chatId,
             threadId,
             message,
@@ -785,14 +854,28 @@ export const TelegramDurableExecutorLive: Layer.Layer<
             directory,
             reconnect: true,
           }
-          yield* jobs.submit({
-           sourceKey: `telegram:${conversation}:${message.message_id}`,
-            channel: "telegram",
+           const submitted = yield* submitForCurrentConversation(conversation, sessionID.value, {
+             sourceKey: `telegram:${conversation}:${message.message_id}`,
+             channel: "telegram",
             owner,
             payload: JSON.stringify(payload),
-            sessionID: sessionID.value,
-          })
-          return
+             sessionID: sessionID.value,
+           })
+           if (!submitted) {
+             yield* sendText(chatId, "The session changed before reconnect started.", threadId)
+             return
+           }
+           yield* permissionRegistry.rerouteSession(sessionID.value, route)
+           // Reroute each registry independently. A previous partial transfer
+           // can leave the permission route current while questions still use
+           // the old destination.
+           yield* questionRegistry.rerouteSession(sessionID.value, route)
+           yield* reconcilePendingSession(directory, sessionID.value, route).pipe(
+             Effect.catchCause((cause) =>
+               logBoundary("telegram/executor", "pending-interactions", "reconnect interaction reconciliation failed")(cause),
+             ),
+           )
+           return
         }
         if (!force) {
           const existingRoute = yield* permissionRegistry.getSessionRoute(sessionID.value)

@@ -28,7 +28,7 @@ export const HELP_TEXT = [
   "/help — show this help",
   "",
   "Run control",
-  "/new — start a new session",
+  "/new - start a new session when no task is running or queued",
   "/stop — stop the current run",
   "/reconnect — attach to the active run",
   "/forceReconnect — force attachment if the current worker stopped",
@@ -61,6 +61,8 @@ export const HELP_TEXT = [
   "",
   "When the agent asks a question, answer by tapping an option",
   "or by replying to the question message with your answer.",
+  "When exactly one custom-answer question is waiting in this topic,",
+  "plain text answers it. Use /prompt to start a separate task.",
 ].join("\n")
 
 export const logTelegramFailure = (message: string) => (cause: Cause.Cause<unknown>): Effect.Effect<void> =>

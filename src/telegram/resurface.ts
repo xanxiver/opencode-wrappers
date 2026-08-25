@@ -47,6 +47,7 @@ const surfacePermission = (
 ) => Effect.gen(function* () {
   const api = yield* TelegramApi
   const registry = yield* PermissionRegistry
+  yield* registry.rerouteSession(request.sessionID, route)
   const tokenOption = yield* registry.registerOrResume({
     sessionID: request.sessionID,
     requestID: request.id,
@@ -80,6 +81,7 @@ const surfaceQuestions = (
 ) => Effect.gen(function* () {
   const api = yield* TelegramApi
   const registry = yield* QuestionRegistry
+  yield* registry.rerouteSession(request.sessionID, route)
   const tokenOption = yield* registry.registerOrResume({
     sessionID: request.sessionID,
     requestID: request.id,
@@ -164,14 +166,9 @@ const destinationFor = (
   opencode: OpenCodeService,
   sessionID: string,
 ): Effect.Effect<Option.Option<SessionRoute>, InteractionStoreError> =>
-  getSessionRoute(sessionID).pipe(
-    Effect.flatMap(Option.match({
-      onSome: (route) => Effect.succeed(Option.some(route)),
-      onNone: () => rootSessionID(opencode, sessionID).pipe(
-        Effect.flatMap((root) => getSessionRoute(root)),
-        Effect.catchCause(() => Effect.succeed(Option.none<SessionRoute>())),
-      ),
-    })),
+  rootSessionID(opencode, sessionID).pipe(
+    Effect.flatMap((root) => getSessionRoute(root)),
+    Effect.catchCause(() => Effect.succeed(Option.none<SessionRoute>())),
   )
 
 /**
