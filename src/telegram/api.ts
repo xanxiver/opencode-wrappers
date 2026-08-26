@@ -616,11 +616,9 @@ export const Live: Layer.Layer<TelegramApi, ConfigError, AppConfig | HttpClient.
     ): Effect.Effect<void> => {
       const priority = request.input.priority ?? "interactive"
       const message = "telegram edit scheduler event"
-      const event = warning
-        ? Effect.logWarning(message)
-        : priority === "progress"
-          ? Effect.logDebug(message)
-          : Effect.logInfo(message)
+      let event = Effect.logInfo(message)
+      if (priority === "progress") event = Effect.logDebug(message)
+      if (warning) event = Effect.logWarning(message)
       return Effect.annotateLogs({
         component: "telegram/api",
         boundary: "telegram-edit-scheduler",
