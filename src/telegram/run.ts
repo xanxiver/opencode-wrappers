@@ -992,6 +992,7 @@ export const runPrompt = (input: RunInput) =>
               messageId: current.messageId,
               text: nextText.value,
               priority: "progress",
+              delivery: "background",
             }).pipe(
               Effect.as(true),
               Effect.catchCause((cause) => logTelegramFailure("progress edit failed")(cause).pipe(Effect.as(false))),

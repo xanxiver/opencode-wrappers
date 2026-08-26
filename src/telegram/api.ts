@@ -248,7 +248,7 @@ interface ScheduledEdit {
   readonly id: number
   readonly input: EditMessageTextInput
   readonly queuedAt: number
-  readonly completion?: Deferred.Deferred<Message, ApiError>
+  readonly completion?: Deferred.Deferred<Message | undefined, ApiError>
   readonly cancellation?: Deferred.Deferred<void>
 }
 
@@ -256,6 +256,7 @@ interface ScheduledEditState {
   readonly nextId: number
   readonly urgent: readonly ScheduledEdit[]
   readonly progress: readonly ScheduledEdit[]
+  readonly activeProgress: Option.Option<ScheduledEdit>
 }
 
 interface ChatEditScheduler {
@@ -267,6 +268,7 @@ const emptyScheduledEditState = (): ScheduledEditState => ({
   nextId: 1,
   urgent: [],
   progress: [],
+  activeProgress: Option.none(),
 })
 
 const scheduledEditCount = (state: ScheduledEditState): number => state.urgent.length + state.progress.length
@@ -274,15 +276,28 @@ const scheduledEditCount = (state: ScheduledEditState): number => state.urgent.l
 const appendScheduledEdit = (
   state: ScheduledEditState,
   request: ScheduledEdit,
-): ScheduledEditState => request.input.priority === "progress"
-  ? { ...state, nextId: request.id + 1, progress: [...state.progress, request] }
-  : { ...state, nextId: request.id + 1, urgent: [...state.urgent, request] }
+): readonly [readonly ScheduledEdit[], ScheduledEditState] => {
+  // Keep at most one queued progress update for each Telegram message. Any
+  // authoritative edit for that message also removes stale queued progress so
+  // it cannot overwrite the newer state after the urgent edit completes.
+  const superseded = state.progress.filter((queued) => queued.input.messageId === request.input.messageId)
+  const progress = state.progress.filter((queued) => queued.input.messageId !== request.input.messageId)
+  return request.input.priority === "progress"
+    ? [superseded, { ...state, nextId: request.id + 1, progress: [...progress, request] }]
+    : [superseded, { ...state, nextId: request.id + 1, urgent: [...state.urgent, request], progress }]
+}
 
 const takeScheduledEdit = (state: ScheduledEditState): readonly [Option.Option<ScheduledEdit>, ScheduledEditState] => {
   const urgent = state.urgent[0]
   if (urgent !== undefined) return [Option.some(urgent), { ...state, urgent: state.urgent.slice(1) }]
   const progress = state.progress[0]
-  if (progress !== undefined) return [Option.some(progress), { ...state, progress: state.progress.slice(1) }]
+  if (progress !== undefined) {
+    return [Option.some(progress), {
+      ...state,
+      progress: state.progress.slice(1),
+      activeProgress: Option.some(progress),
+    }]
+  }
   return [Option.none(), state]
 }
 
@@ -670,7 +685,17 @@ export const Live: Layer.Layer<TelegramApi, ConfigError, AppConfig | HttpClient.
               const exit = yield* Effect.exit(cancellable)
               const completedAt = yield* Clock.currentTimeMillis
               const cancelled = Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)
+              if (request.input.priority === "progress") {
+                yield* Ref.update(scheduler.pending, (state) =>
+                  Option.isSome(state.activeProgress) && state.activeProgress.value.id === request.id
+                    ? { ...state, activeProgress: Option.none() }
+                    : state)
+              }
               if (cancelled) {
+                // The interrupted HTTP request may already have reached
+                // Telegram. Record a conservative accepted-edit timestamp so
+                // preemption cannot weaken the chat-wide flood interval.
+                yield* noteSuccessfulEdit(request.input.chatId, false)
                 yield* logEditScheduler(request, "cancelled", {
                   durationMs: Math.max(0, completedAt - startedAt),
                 })
@@ -715,29 +740,57 @@ export const Live: Layer.Layer<TelegramApi, ConfigError, AppConfig | HttpClient.
         const queuedAt = yield* Clock.currentTimeMillis
         const completion = normalized.delivery === "background"
           ? undefined
-          : yield* Deferred.make<Message, ApiError>()
-        const cancellation = normalized.delivery === "background"
-          ? undefined
-          : yield* Deferred.make<void>()
-        const queued = yield* Ref.modify(scheduler.pending, (state) => {
-          const request: ScheduledEdit = completion === undefined || cancellation === undefined
-            ? { id: state.nextId, input: normalized, queuedAt }
-            : { id: state.nextId, input: normalized, queuedAt, completion, cancellation }
-          const next = appendScheduledEdit(state, request)
-          return [{ request, queueDepth: scheduledEditCount(next) }, next]
-        })
-        yield* logEditScheduler(queued.request, "queued", { queueDepth: queued.queueDepth })
-        yield* Queue.offer(scheduler.wake, undefined)
-        if (completion === undefined || cancellation === undefined) return undefined
-        return yield* Deferred.await(completion).pipe(
-          Effect.onInterrupt(() => Ref.modify(scheduler.pending, (state) => removeScheduledEdit(state, queued.request.id)).pipe(
-            Effect.flatMap((removed) => Deferred.succeed(cancellation, undefined).pipe(
-              Effect.andThen(logEditScheduler(queued.request, "cancellation-requested", {
-                location: removed ? "queued" : "selected",
-              })),
+          : yield* Deferred.make<Message | undefined, ApiError>()
+        const cancellation = normalized.delivery === "wait" || normalized.priority === "progress"
+          ? yield* Deferred.make<void>()
+          : undefined
+        return yield* Effect.uninterruptibleMask((restore) => Effect.gen(function* () {
+          const queued = yield* Ref.modify(scheduler.pending, (state) => {
+            const requestBase = {
+              id: state.nextId,
+              input: normalized,
+              queuedAt,
+            }
+            let request: ScheduledEdit = requestBase
+            if (completion !== undefined) request = { ...request, completion }
+            if (cancellation !== undefined) request = { ...request, cancellation }
+            const [superseded, next] = appendScheduledEdit(state, request)
+            const activeProgress = state.activeProgress
+            const shouldPreempt = Option.isSome(activeProgress)
+              && (normalized.priority !== "progress"
+                || activeProgress.value.input.messageId === normalized.messageId)
+            const preempt = shouldPreempt
+              ? activeProgress
+              : Option.none<ScheduledEdit>()
+            return [{ request, superseded, preempt, queueDepth: scheduledEditCount(next) }, next]
+          })
+          yield* Effect.forEach(queued.superseded, (superseded) =>
+            logEditScheduler(superseded, "superseded", { replacementId: queued.request.id }).pipe(
+              Effect.andThen(superseded.completion === undefined
+                ? Effect.void
+                : Deferred.succeed(superseded.completion, undefined)),
+            ), { discard: true })
+          if (Option.isSome(queued.preempt) && queued.preempt.value.cancellation !== undefined) {
+            const signalled = yield* Deferred.succeed(queued.preempt.value.cancellation, undefined)
+            if (signalled) {
+              yield* logEditScheduler(queued.preempt.value, "preemption-requested", {
+                replacementId: queued.request.id,
+              })
+            }
+          }
+          yield* logEditScheduler(queued.request, "queued", { queueDepth: queued.queueDepth })
+          yield* Queue.offer(scheduler.wake, undefined)
+          if (completion === undefined || cancellation === undefined) return undefined
+          return yield* restore(Deferred.await(completion)).pipe(
+            Effect.onInterrupt(() => Ref.modify(scheduler.pending, (state) => removeScheduledEdit(state, queued.request.id)).pipe(
+              Effect.flatMap((removed) => Deferred.succeed(cancellation, undefined).pipe(
+                Effect.andThen(logEditScheduler(queued.request, "cancellation-requested", {
+                  location: removed ? "queued" : "selected",
+                })),
+              )),
             )),
-          )),
-        )
+          )
+        }))
       })
     return {
       getUpdates: (offset, timeoutSeconds) =>
