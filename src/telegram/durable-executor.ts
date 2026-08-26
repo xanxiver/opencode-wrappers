@@ -421,6 +421,7 @@ export const TelegramDurableExecutorLive: Layer.Layer<
           chatId: payload.chatId,
           messageId: progressMessageID,
           text: result.text,
+          priority: "final",
         }).pipe(
           Effect.as(true),
           Effect.catchTag("ApiError", (error) => settleFinalEditError(jobs, lease, error)),

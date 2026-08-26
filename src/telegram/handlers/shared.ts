@@ -1,4 +1,4 @@
-import { Cause, Effect, Option } from "effect"
+import { Cause, Clock, Duration, Effect, Option } from "effect"
 import { logBoundary } from "../../core/logging.js"
 import { TelegramApi, type CallbackQuery, type KeyboardMarkup, type Message } from "../api.js"
 
@@ -70,6 +70,8 @@ export const logTelegramFailure = (message: string) => (cause: Cause.Cause<unkno
     Effect.logWarning(message, Cause.pretty(cause)),
   )
 
+export const CALLBACK_ACK_TIMEOUT_MS = 2_000
+
 /** Log a callback failure at the boundary and answer the user. */
 export const callbackFailure = (query: CallbackQuery, message: string, reply: string) =>
   (cause: Cause.Cause<unknown>) =>
@@ -113,9 +115,29 @@ export const sendMarkup = (chatId: number, text: string, replyMarkup: KeyboardMa
 export const answer = (queryId: string, text: string) =>
   Effect.gen(function* () {
     const api = yield* TelegramApi
-    yield* api.answerCallbackQuery({ queryId, text }).pipe(
-      Effect.catchCause(logTelegramFailure("answerCallbackQuery failed")),
+    const startedAt = yield* Clock.currentTimeMillis
+    const outcome = yield* api.answerCallbackQuery({ queryId, text }).pipe(
+      Effect.timeoutOption(Duration.millis(CALLBACK_ACK_TIMEOUT_MS)),
+      Effect.matchCauseEffect({
+        onFailure: (cause) => logTelegramFailure("answerCallbackQuery failed")(cause).pipe(
+          Effect.as<"failed">("failed"),
+        ),
+        onSuccess: Option.match({
+          onNone: () => Effect.succeed<"timed-out">("timed-out"),
+          onSome: () => Effect.succeed<"acknowledged">("acknowledged"),
+        }),
+      }),
     )
+    const completedAt = yield* Clock.currentTimeMillis
+    const log = outcome === "acknowledged"
+      ? Effect.logInfo("telegram callback acknowledgement event")
+      : Effect.logWarning("telegram callback acknowledgement event")
+    yield* Effect.annotateLogs({
+      component: "telegram/handlers",
+      boundary: "telegram-callback-acknowledgement",
+      outcome,
+      durationMs: Math.max(0, completedAt - startedAt),
+    })(log)
   })
 
 export const apiEdit = (
@@ -126,7 +148,14 @@ export const apiEdit = (
 ) =>
   Effect.gen(function* () {
     const api = yield* TelegramApi
-    yield* api.editMessageText({ chatId, messageId, text, replyMarkup }).pipe(
+    yield* api.editMessageText({
+      chatId,
+      messageId,
+      text,
+      replyMarkup,
+      priority: "interactive",
+      delivery: "background",
+    }).pipe(
       Effect.catchCause(logTelegramFailure("editMessageText failed")),
     )
   })

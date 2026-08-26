@@ -5,6 +5,7 @@ import { HttpClient, HttpClientError, HttpClientResponse } from "effect/unstable
 import { AppConfig, AppConfigTag } from "../src/config.js"
 import { ApiError, decodeTelegramErrorResponse, decodeTelegramResponse, EDIT_MIN_INTERVAL_GROUP_MS, Live, recordDefinitiveSendFailure, TelegramApi } from "../src/telegram/api.js"
 import { finalEditDisposition } from "../src/telegram/durable-executor.js"
+import { answer, CALLBACK_ACK_TIMEOUT_MS } from "../src/telegram/handlers/shared.js"
 
 describe("Telegram API response decoding", () => {
   test("does not transport-retry non-idempotent message creation", async () => {
@@ -37,6 +38,34 @@ describe("Telegram API response decoding", () => {
       expect(rendered).not.toContain("test-token")
       expect(rendered).toContain("***")
     }
+  })
+
+  test("does not retry an expiring callback acknowledgement", async () => {
+    let attempts = 0
+    const client = HttpClient.make((request) => {
+      attempts += 1
+      return Effect.succeed(HttpClientResponse.fromWeb(request, new Response(JSON.stringify({
+        ok: false,
+        error_code: 500,
+        description: "temporary failure",
+      }), { status: 500 })))
+    })
+    const config = Layer.succeed(AppConfigTag, new AppConfig({
+      telegramBotToken: "test-token",
+      projectDirectory: "/tmp",
+      stateFile: "/tmp/state.json",
+      webDatabaseFile: "/tmp/web.sqlite",
+      telegramRunTimeout: "10 minutes",
+      webPort: 3001,
+    }))
+    await Effect.runPromiseExit(Effect.gen(function* () {
+      const api = yield* TelegramApi
+      return yield* api.answerCallbackQuery({ queryId: "callback-1", text: "Received." })
+    }).pipe(
+      Effect.provide(Layer.provide(Live, config)),
+      Effect.provide(Layer.succeed(HttpClient.HttpClient, client)),
+    ))
+    expect(attempts).toBe(1)
   })
   test("reports malformed JSON as ApiError instead of a defect", async () => {
     const exit = await Effect.runPromiseExit(decodeTelegramResponse("getUpdates", Schema.Array(Schema.Unknown), "{not-json"))
@@ -144,6 +173,262 @@ describe("Telegram API response decoding", () => {
     expect(attempts).toBe(2)
   })
 
+  test("prioritizes interaction edits over progress waiting for the same chat slot", async () => {
+    const result = await Effect.runPromise(Effect.gen(function* () {
+      const calls = yield* Ref.make(0)
+      const client = HttpClient.make((request) => Ref.updateAndGet(calls, (count) => count + 1).pipe(
+        Effect.as(HttpClientResponse.fromWeb(request, new Response(JSON.stringify({
+          ok: true,
+          result: { message_id: 10, chat: { id: -7 } },
+        }), { status: 200 }))),
+      ))
+      const config = Layer.succeed(AppConfigTag, new AppConfig({
+        telegramBotToken: "test-token",
+        projectDirectory: "/tmp",
+        stateFile: "/tmp/state.json",
+        webDatabaseFile: "/tmp/web.sqlite",
+        telegramRunTimeout: "10 minutes",
+        webPort: 3001,
+      }))
+
+      return yield* Effect.gen(function* () {
+        yield* TestClock.adjust("1 minute")
+        const api = yield* TelegramApi
+        yield* api.editMessageText({ chatId: -7, messageId: 10, text: "initial", priority: "final" })
+        const progress = yield* Effect.forkChild(api.editMessageText({
+          chatId: -7,
+          messageId: 10,
+          text: "progress",
+          priority: "progress",
+        }))
+        yield* Effect.yieldNow
+        const interaction = yield* Effect.forkChild(api.editMessageText({
+          chatId: -7,
+          messageId: 11,
+          text: "interaction",
+          priority: "interactive",
+        }))
+        yield* Effect.yieldNow
+
+        yield* TestClock.adjust(EDIT_MIN_INTERVAL_GROUP_MS - 1)
+        expect(yield* Ref.get(calls)).toBe(1)
+        yield* TestClock.adjust(1)
+        yield* Fiber.join(interaction)
+        expect(yield* Ref.get(calls)).toBe(2)
+        expect(progress.pollUnsafe()).toBeUndefined()
+
+        yield* TestClock.adjust(EDIT_MIN_INTERVAL_GROUP_MS)
+        yield* Fiber.join(progress)
+        return yield* Ref.get(calls)
+      }).pipe(
+        Effect.provide(Layer.provide(Live, config)),
+        Effect.provideService(HttpClient.HttpClient, client),
+        Effect.provide(TestClock.layer()),
+      )
+    }))
+
+    expect(result).toBe(3)
+  })
+
+  test("rechecks chat priority after global edit capacity becomes available", async () => {
+    const interactionWon = await Effect.runPromise(Effect.gen(function* () {
+      const calls = yield* Ref.make(0)
+      const allBlockersStarted = yield* Deferred.make<void>()
+      const releaseBlockers = yield* Deferred.make<void>()
+      const client = HttpClient.make((request) => Ref.updateAndGet(calls, (count) => count + 1).pipe(
+        Effect.flatMap((count) => count <= 16
+          ? (count === 16 ? Deferred.succeed(allBlockersStarted, undefined) : Effect.void).pipe(
+              Effect.andThen(Deferred.await(releaseBlockers)),
+            )
+          : Effect.void),
+        Effect.as(HttpClientResponse.fromWeb(request, new Response(JSON.stringify({
+          ok: true,
+          result: { message_id: 10, chat: { id: -7 } },
+        }), { status: 200 }))),
+      ))
+      const config = Layer.succeed(AppConfigTag, new AppConfig({
+        telegramBotToken: "test-token",
+        projectDirectory: "/tmp",
+        stateFile: "/tmp/state.json",
+        webDatabaseFile: "/tmp/web.sqlite",
+        telegramRunTimeout: "10 minutes",
+        webPort: 3001,
+      }))
+
+      return yield* Effect.gen(function* () {
+        const api = yield* TelegramApi
+        const blockers = yield* Effect.forEach(Array.from({ length: 16 }), (_, index) =>
+          Effect.forkChild(api.editMessageText({
+            chatId: index + 1,
+            messageId: 10,
+            text: "blocker",
+            priority: "final",
+          })))
+        yield* Deferred.await(allBlockersStarted)
+
+        const progress = yield* Effect.forkChild(api.editMessageText({
+          chatId: -7,
+          messageId: 10,
+          text: "progress",
+          priority: "progress",
+        }))
+        yield* Effect.yieldNow
+        const interaction = yield* Effect.forkChild(api.editMessageText({
+          chatId: -7,
+          messageId: 11,
+          text: "interaction",
+          priority: "interactive",
+        }))
+        yield* Effect.yieldNow
+        yield* Deferred.succeed(releaseBlockers, undefined)
+
+        const winner = yield* Effect.raceFirst(
+          Fiber.join(interaction).pipe(Effect.as(true)),
+          Fiber.join(progress).pipe(Effect.as(false)),
+        )
+        yield* Fiber.joinAll(blockers)
+        return winner
+      }).pipe(
+        Effect.provide(Layer.provide(Live, config)),
+        Effect.provideService(HttpClient.HttpClient, client),
+      )
+    }))
+
+    expect(interactionWon).toBe(true)
+  })
+
+  test("interrupts selected progress when its waiting caller is cancelled", async () => {
+    const attempts = await Effect.runPromise(Effect.gen(function* () {
+      const calls = yield* Ref.make(0)
+      const progressStarted = yield* Deferred.make<void>()
+      const finalStarted = yield* Deferred.make<void>()
+      const client = HttpClient.make((request) => Ref.updateAndGet(calls, (count) => count + 1).pipe(
+        Effect.flatMap((count) => count === 1
+          ? Deferred.succeed(progressStarted, undefined).pipe(Effect.andThen(Effect.never))
+          : Deferred.succeed(finalStarted, undefined)),
+        Effect.as(HttpClientResponse.fromWeb(request, new Response(JSON.stringify({
+          ok: true,
+          result: { message_id: 10, chat: { id: -7 } },
+        }), { status: 200 }))),
+      ))
+      const config = Layer.succeed(AppConfigTag, new AppConfig({
+        telegramBotToken: "test-token",
+        projectDirectory: "/tmp",
+        stateFile: "/tmp/state.json",
+        webDatabaseFile: "/tmp/web.sqlite",
+        telegramRunTimeout: "10 minutes",
+        webPort: 3001,
+      }))
+
+      return yield* Effect.gen(function* () {
+        const api = yield* TelegramApi
+        const progress = yield* Effect.forkChild(api.editMessageText({
+          chatId: -7,
+          messageId: 10,
+          text: "progress",
+          priority: "progress",
+        }))
+        yield* Deferred.await(progressStarted)
+        yield* Fiber.interrupt(progress)
+
+        const final = yield* Effect.forkChild(api.editMessageText({
+          chatId: -7,
+          messageId: 11,
+          text: "final",
+          priority: "final",
+        }))
+        yield* Deferred.await(finalStarted).pipe(Effect.timeout("1 second"))
+        yield* Fiber.join(final)
+        return yield* Ref.get(calls)
+      }).pipe(
+        Effect.provide(Layer.provide(Live, config)),
+        Effect.provideService(HttpClient.HttpClient, client),
+      )
+    }))
+
+    expect(attempts).toBe(2)
+  })
+
+  test("does not retry progress edits", async () => {
+    let attempts = 0
+    const client = HttpClient.make((request) => {
+      attempts += 1
+      return Effect.succeed(HttpClientResponse.fromWeb(request, new Response(JSON.stringify({
+        ok: false,
+        error_code: 500,
+        description: "temporary failure",
+      }), { status: 500 })))
+    })
+    const config = Layer.succeed(AppConfigTag, new AppConfig({
+      telegramBotToken: "test-token",
+      projectDirectory: "/tmp",
+      stateFile: "/tmp/state.json",
+      webDatabaseFile: "/tmp/web.sqlite",
+      telegramRunTimeout: "10 minutes",
+      webPort: 3001,
+    }))
+    const exit = await Effect.runPromiseExit(Effect.gen(function* () {
+      const api = yield* TelegramApi
+      return yield* api.editMessageText({
+        chatId: -7,
+        messageId: 10,
+        text: "progress",
+        priority: "progress",
+      })
+    }).pipe(
+      Effect.provide(Layer.provide(Live, config)),
+      Effect.provide(Layer.succeed(HttpClient.HttpClient, client)),
+    ))
+
+    expect(attempts).toBe(1)
+    expect(Exit.isFailure(exit)).toBe(true)
+  })
+
+  test("returns after a background edit is safely queued", async () => {
+    const completed = await Effect.runPromise(Effect.gen(function* () {
+      const started = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      const finished = yield* Deferred.make<void>()
+      const client = HttpClient.make((request) => Deferred.succeed(started, undefined).pipe(
+        Effect.andThen(Deferred.await(release)),
+        Effect.andThen(Deferred.succeed(finished, undefined)),
+        Effect.as(HttpClientResponse.fromWeb(request, new Response(JSON.stringify({
+          ok: true,
+          result: { message_id: 10, chat: { id: -7 } },
+        }), { status: 200 }))),
+      ))
+      const config = Layer.succeed(AppConfigTag, new AppConfig({
+        telegramBotToken: "test-token",
+        projectDirectory: "/tmp",
+        stateFile: "/tmp/state.json",
+        webDatabaseFile: "/tmp/web.sqlite",
+        telegramRunTimeout: "10 minutes",
+        webPort: 3001,
+      }))
+
+      return yield* Effect.gen(function* () {
+        const api = yield* TelegramApi
+        const result = yield* api.editMessageText({
+          chatId: -7,
+          messageId: 10,
+          text: "queued",
+          priority: "interactive",
+          delivery: "background",
+        })
+        expect(result).toBeUndefined()
+        yield* Deferred.await(started)
+        yield* Deferred.succeed(release, undefined)
+        yield* Deferred.await(finished)
+        return true
+      }).pipe(
+        Effect.provide(Layer.provide(Live, config)),
+        Effect.provideService(HttpClient.HttpClient, client),
+      )
+    }))
+
+    expect(completed).toBe(true)
+  })
+
   test("keeps a recovered 429 penalty for the next edit", async () => {
     const attempts = await Effect.runPromise(Effect.gen(function* () {
       const calls = yield* Ref.make(0)
@@ -195,5 +480,36 @@ describe("Telegram API response decoding", () => {
     }))
 
     expect(attempts).toBe(3)
+  })
+
+  test("bounds callback acknowledgement before continuing", async () => {
+    const completed = await Effect.runPromise(Effect.gen(function* () {
+      const done = yield* Ref.make(false)
+      const api = {
+        getUpdates: () => Effect.never,
+        sendMessage: () => Effect.never,
+        sendPhoto: () => Effect.never,
+        sendVideo: () => Effect.never,
+        sendDocument: () => Effect.never,
+        editMessageText: () => Effect.never,
+        answerCallbackQuery: () => Effect.never,
+        getFile: () => Effect.never,
+        downloadFile: () => Effect.never,
+      }
+      const fiber = yield* answer("callback-2", "Received.").pipe(
+        Effect.andThen(Ref.set(done, true)),
+        Effect.provide(Layer.succeed(TelegramApi, api)),
+        Effect.provideService(HttpClient.HttpClient, HttpClient.make(() => Effect.never)),
+        Effect.forkChild,
+      )
+      yield* Effect.yieldNow
+      yield* TestClock.adjust(CALLBACK_ACK_TIMEOUT_MS - 1)
+      expect(yield* Ref.get(done)).toBe(false)
+      yield* TestClock.adjust(1)
+      yield* Fiber.join(fiber)
+      return yield* Ref.get(done)
+    }).pipe(Effect.provide(TestClock.layer())))
+
+    expect(completed).toBe(true)
   })
 })

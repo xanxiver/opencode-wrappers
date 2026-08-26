@@ -1,4 +1,4 @@
-import { Cause, Clock, Context, Data, Duration, Effect, Layer, Option, Ref, Schema, Semaphore } from "effect"
+import { Cause, Clock, Context, Data, Deferred, Duration, Effect, Exit, Layer, Option, Queue, Ref, Schema, Semaphore } from "effect"
 import { HttpBody, HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
 import { Stream } from "effect"
 import { AppConfigTag, ConfigError } from "../config.js"
@@ -230,6 +230,72 @@ export type Document = Schema.Schema.Type<typeof DocumentSchema>
 export type PhotoSize = Schema.Schema.Type<typeof PhotoSizeSchema>
 export type FileInfo = Schema.Schema.Type<typeof FileInfoSchema>
 
+export type TelegramEditPriority = "interactive" | "final" | "progress"
+export type TelegramEditDelivery = "wait" | "background"
+
+export interface EditMessageTextInput {
+  readonly chatId: number
+  readonly messageId: number
+  readonly text: string
+  readonly replyMarkup?: KeyboardMarkup
+  /** Interactive and final edits run before queued streaming progress edits. */
+  readonly priority?: TelegramEditPriority
+  /** Background delivery returns after durable in-memory enqueueing. */
+  readonly delivery?: TelegramEditDelivery
+}
+
+interface ScheduledEdit {
+  readonly id: number
+  readonly input: EditMessageTextInput
+  readonly queuedAt: number
+  readonly completion?: Deferred.Deferred<Message, ApiError>
+  readonly cancellation?: Deferred.Deferred<void>
+}
+
+interface ScheduledEditState {
+  readonly nextId: number
+  readonly urgent: readonly ScheduledEdit[]
+  readonly progress: readonly ScheduledEdit[]
+}
+
+interface ChatEditScheduler {
+  readonly pending: Ref.Ref<ScheduledEditState>
+  readonly wake: Queue.Queue<void>
+}
+
+const emptyScheduledEditState = (): ScheduledEditState => ({
+  nextId: 1,
+  urgent: [],
+  progress: [],
+})
+
+const scheduledEditCount = (state: ScheduledEditState): number => state.urgent.length + state.progress.length
+
+const appendScheduledEdit = (
+  state: ScheduledEditState,
+  request: ScheduledEdit,
+): ScheduledEditState => request.input.priority === "progress"
+  ? { ...state, nextId: request.id + 1, progress: [...state.progress, request] }
+  : { ...state, nextId: request.id + 1, urgent: [...state.urgent, request] }
+
+const takeScheduledEdit = (state: ScheduledEditState): readonly [Option.Option<ScheduledEdit>, ScheduledEditState] => {
+  const urgent = state.urgent[0]
+  if (urgent !== undefined) return [Option.some(urgent), { ...state, urgent: state.urgent.slice(1) }]
+  const progress = state.progress[0]
+  if (progress !== undefined) return [Option.some(progress), { ...state, progress: state.progress.slice(1) }]
+  return [Option.none(), state]
+}
+
+const removeScheduledEdit = (
+  state: ScheduledEditState,
+  id: number,
+): readonly [boolean, ScheduledEditState] => {
+  const urgent = state.urgent.filter((request) => request.id !== id)
+  const progress = state.progress.filter((request) => request.id !== id)
+  const removed = urgent.length !== state.urgent.length || progress.length !== state.progress.length
+  return [removed, removed ? { ...state, urgent, progress } : state]
+}
+
 const envelope = Schema.Struct({
   ok: Schema.Boolean,
   result: Schema.optional(Schema.Unknown),
@@ -256,12 +322,8 @@ export interface TelegramApiClient {
   readonly sendPhoto: (input: TelegramMediaInput) => Effect.Effect<Message, ApiError, HttpClient.HttpClient>
   readonly sendVideo: (input: TelegramMediaInput) => Effect.Effect<Message, ApiError, HttpClient.HttpClient>
   readonly sendDocument: (input: TelegramMediaInput) => Effect.Effect<Message, ApiError, HttpClient.HttpClient>
-  readonly editMessageText: (input: {
-    readonly chatId: number
-    readonly messageId: number
-    readonly text: string
-    readonly replyMarkup?: KeyboardMarkup
-  }) => Effect.Effect<Message, ApiError, HttpClient.HttpClient>
+  readonly editMessageText: (input: EditMessageTextInput) =>
+    Effect.Effect<Message | undefined, ApiError, HttpClient.HttpClient>
   readonly answerCallbackQuery: (input: {
     readonly queryId: string
     readonly text: string
@@ -381,27 +443,29 @@ const call = <A>(
         : retryTransient(0, requestEffect, options?.onRetry)
     }).pipe(
       Effect.catchCause((cause) =>
-        Option.match(Cause.findErrorOption(cause), {
-          onNone: () =>
-            logRedactedBoundary(redact, operation)(cause).pipe(
-              Effect.andThen(Effect.fail(new ApiError({ operation, transient: false }))),
-            ),
-          onSome: (error) => {
-            const safeError = sanitizedApiError(redact, error)
-            const meta = {
-              component: "telegram/api",
-              boundary: "telegram-bot-api",
-              operation,
-              code: safeError.code,
-              description: safeError.description,
-              transient: safeError.transient,
-              retryAfterMs: safeError.retryAfterMs,
-            }
-            return Effect.annotateLogs(meta)(
-              Effect.logWarning(`telegram ${operation} failed`),
-            ).pipe(Effect.andThen(Effect.fail(safeError)))
-          },
-        }),
+        Cause.hasInterrupts(cause)
+          ? Effect.failCause(cause)
+          : Option.match(Cause.findErrorOption(cause), {
+              onNone: () =>
+                logRedactedBoundary(redact, operation)(cause).pipe(
+                  Effect.andThen(Effect.fail(new ApiError({ operation, transient: false }))),
+                ),
+              onSome: (error) => {
+                const safeError = sanitizedApiError(redact, error)
+                const meta = {
+                  component: "telegram/api",
+                  boundary: "telegram-bot-api",
+                  operation,
+                  code: safeError.code,
+                  description: safeError.description,
+                  transient: safeError.transient,
+                  retryAfterMs: safeError.retryAfterMs,
+                }
+                return Effect.annotateLogs(meta)(
+                  Effect.logWarning(`telegram ${operation} failed`),
+                ).pipe(Effect.andThen(Effect.fail(safeError)))
+              },
+            }),
       ),
     )
 
@@ -442,10 +506,12 @@ const concatBytes = (chunks: readonly Uint8Array<ArrayBufferLike>[]): Uint8Array
   return out
 }
 
-export const Live: Layer.Layer<TelegramApi, ConfigError, AppConfig> = Layer.effect(
+export const Live: Layer.Layer<TelegramApi, ConfigError, AppConfig | HttpClient.HttpClient> = Layer.effect(
   TelegramApi,
   Effect.gen(function* () {
     const config = yield* AppConfigTag
+    const httpClient = yield* HttpClient.HttpClient
+    const schedulerScope = yield* Effect.scope
     const token = config.telegramBotToken
     if (token === undefined) return yield* new ConfigError({ message: "TELEGRAM_BOT_TOKEN is required by the Telegram API" })
     // Transport failures can echo the request URL, which contains the token.
@@ -458,11 +524,10 @@ export const Live: Layer.Layer<TelegramApi, ConfigError, AppConfig> = Layer.effe
     // base (DM 1s, group 6s), doubles on every 429 (respecting Telegram's
     // retry_after) and relaxes halfway after each operation with no 429.
     const editThrottle = yield* Ref.make<ReadonlyMap<number, EditThrottleState>>(new Map())
-    const waitForEditSlot = (chatId: number): Effect.Effect<void, never> => Clock.currentTimeMillis.pipe(
+    const editSlotDelay = (chatId: number): Effect.Effect<number, never> => Clock.currentTimeMillis.pipe(
       Effect.flatMap((now) => Ref.get(editThrottle).pipe(
         Effect.map((map) => editThrottleDelay(map.get(chatId), now, editBaseInterval(chatId))),
       )),
-      Effect.flatMap((delay) => (delay > 0 ? Effect.sleep(delay) : Effect.void)),
     )
     /** Record an accepted edit. Only a request with no 429 relaxes the interval. */
     const noteSuccessfulEdit = (chatId: number, clean: boolean): Effect.Effect<void> => Clock.currentTimeMillis.pipe(
@@ -503,17 +568,178 @@ export const Live: Layer.Layer<TelegramApi, ConfigError, AppConfig> = Layer.effe
           mediaRequest(base, operation, field, input),
         )
       })
-    // Serialize all edits in one chat through a cancellation-safe permit.
-    // A caller that is interrupted while queued consumes no future slot. A
-    // separate semaphore allows up to 16 different chats to send in parallel.
+    // One worker per chat preserves Telegram's chat-wide flood budget. Workers
+    // pick urgent interaction/final edits before progress only after the
+    // throttle wait, so a button pressed during that wait can move ahead.
+    // Different chats may still issue up to 16 edit requests in parallel.
     const editRequestPermits = yield* Semaphore.make(16)
-    const editLocks = yield* Ref.make<ReadonlyMap<number, Semaphore.Semaphore>>(new Map())
-    const editLockFor = (chatId: number): Effect.Effect<Semaphore.Semaphore> =>
-      Ref.modify(editLocks, (locks) => {
-        const existing = locks.get(chatId)
-        if (existing !== undefined) return [existing, locks]
-        const lock = Semaphore.makeUnsafe(1)
-        return [lock, new Map(locks).set(chatId, lock)]
+    const performEdit = (input: EditMessageTextInput): Effect.Effect<Message, ApiError, HttpClient.HttpClient> =>
+      Effect.gen(function* () {
+        const sawFlood = yield* Ref.make(false)
+        const result = yield* jsonBody("editMessageText", {
+          chat_id: input.chatId,
+          message_id: input.messageId,
+          text: input.text,
+          reply_markup: input.replyMarkup,
+        }).pipe(
+          Effect.flatMap((body) =>
+            call("editMessageText", MessageSchema, redact, {
+              // Streaming progress is lossy. A failed progress edit is
+              // superseded by the latest run state instead of blocking urgent
+              // feedback through a long transport or flood retry sequence.
+              retryTransient: input.priority !== "progress",
+              onRetry: (error) => error.code === 429
+                ? Ref.set(sawFlood, true).pipe(
+                    Effect.andThen(penalizeFlood(input.chatId, error.retryAfterMs)),
+                  )
+                : Effect.void,
+            })(
+              HttpClientRequest.post(`${base}/editMessageText`).pipe(HttpClientRequest.setBody(body)),
+            )
+          ),
+          Effect.catchTag("ApiError", (error) =>
+            error.code === 429
+              ? Ref.set(sawFlood, true).pipe(
+                  Effect.andThen(penalizeFlood(input.chatId, error.retryAfterMs)),
+                  Effect.andThen(Effect.fail(error)),
+                )
+              : Effect.fail(error)),
+        )
+        yield* noteSuccessfulEdit(input.chatId, !(yield* Ref.get(sawFlood)))
+        return result
+      })
+    const logEditScheduler = (
+      request: ScheduledEdit,
+      stage: string,
+      details: Readonly<Record<string, string | number | boolean | undefined>> = {},
+      warning = false,
+    ): Effect.Effect<void> => {
+      const priority = request.input.priority ?? "interactive"
+      const message = "telegram edit scheduler event"
+      const event = warning
+        ? Effect.logWarning(message)
+        : priority === "progress"
+          ? Effect.logDebug(message)
+          : Effect.logInfo(message)
+      return Effect.annotateLogs({
+        component: "telegram/api",
+        boundary: "telegram-edit-scheduler",
+        stage,
+        chatId: request.input.chatId,
+        messageId: request.input.messageId,
+        priority,
+        delivery: request.input.delivery ?? "wait",
+        ...details,
+      })(event)
+    }
+    const runEditWorker = (chatId: number, scheduler: ChatEditScheduler): Effect.Effect<void> =>
+      Effect.gen(function* () {
+        while (true) {
+          yield* Queue.take(scheduler.wake)
+          while (scheduledEditCount(yield* Ref.get(scheduler.pending)) > 0) {
+            let throttleWaitMs = 0
+            while (true) {
+              const delay = yield* editSlotDelay(chatId)
+              if (delay <= 0) break
+              throttleWaitMs += delay
+              yield* Effect.sleep(Duration.millis(delay))
+            }
+            const processed = yield* editRequestPermits.withPermit(Effect.gen(function* () {
+              // Select only after global capacity is available. An urgent edit
+              // that arrives while this chat waits for a permit can still
+              // overtake progress that was queued first.
+              const next = yield* Ref.modify(scheduler.pending, (state) => {
+                const [request, remaining] = takeScheduledEdit(state)
+                return [{ request, queueDepth: scheduledEditCount(remaining) }, remaining]
+              })
+              if (Option.isNone(next.request)) return false
+              const request = next.request.value
+              const startedAt = yield* Clock.currentTimeMillis
+              yield* logEditScheduler(request, "started", {
+                queueDepth: next.queueDepth,
+                queuedMs: Math.max(0, startedAt - request.queuedAt),
+                throttleWaitMs,
+              })
+              const edit = performEdit(request.input).pipe(
+                Effect.provideService(HttpClient.HttpClient, httpClient),
+              )
+              const cancellable = request.cancellation === undefined
+                ? edit
+                : Effect.raceFirst(
+                    edit,
+                    Deferred.await(request.cancellation).pipe(Effect.andThen(Effect.interrupt)),
+                  )
+              const exit = yield* Effect.exit(cancellable)
+              const completedAt = yield* Clock.currentTimeMillis
+              const cancelled = Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)
+              if (cancelled) {
+                yield* logEditScheduler(request, "cancelled", {
+                  durationMs: Math.max(0, completedAt - startedAt),
+                })
+              } else {
+                const error = Exit.isFailure(exit) ? Cause.findErrorOption(exit.cause) : Option.none<ApiError>()
+                yield* logEditScheduler(request, "completed", {
+                  durationMs: Math.max(0, completedAt - startedAt),
+                  success: Exit.isSuccess(exit),
+                  code: Option.isSome(error) ? error.value.code : undefined,
+                }, Exit.isFailure(exit))
+              }
+              if (request.completion !== undefined) yield* Deferred.done(request.completion, exit)
+              return true
+            }))
+            if (!processed) continue
+          }
+        }
+      })
+    const schedulerLock = yield* Semaphore.make(1)
+    const schedulers = yield* Ref.make<ReadonlyMap<number, ChatEditScheduler>>(new Map())
+    const schedulerFor = (chatId: number): Effect.Effect<ChatEditScheduler> => schedulerLock.withPermit(
+      Effect.gen(function* () {
+        const current = yield* Ref.get(schedulers)
+        const existing = current.get(chatId)
+        if (existing !== undefined) return existing
+        const pending = yield* Ref.make(emptyScheduledEditState())
+        const wake = yield* Queue.dropping<void>(1)
+        const scheduler: ChatEditScheduler = { pending, wake }
+        yield* Ref.update(schedulers, (values) => new Map(values).set(chatId, scheduler))
+        yield* Effect.forkIn(runEditWorker(chatId, scheduler), schedulerScope)
+        return scheduler
+      }),
+    )
+    const scheduleEdit = (input: EditMessageTextInput): Effect.Effect<Message | undefined, ApiError> =>
+      Effect.gen(function* () {
+        const normalized: EditMessageTextInput = {
+          ...input,
+          priority: input.priority ?? "interactive",
+          delivery: input.delivery ?? "wait",
+        }
+        const scheduler = yield* schedulerFor(normalized.chatId)
+        const queuedAt = yield* Clock.currentTimeMillis
+        const completion = normalized.delivery === "background"
+          ? undefined
+          : yield* Deferred.make<Message, ApiError>()
+        const cancellation = normalized.delivery === "background"
+          ? undefined
+          : yield* Deferred.make<void>()
+        const queued = yield* Ref.modify(scheduler.pending, (state) => {
+          const request: ScheduledEdit = completion === undefined || cancellation === undefined
+            ? { id: state.nextId, input: normalized, queuedAt }
+            : { id: state.nextId, input: normalized, queuedAt, completion, cancellation }
+          const next = appendScheduledEdit(state, request)
+          return [{ request, queueDepth: scheduledEditCount(next) }, next]
+        })
+        yield* logEditScheduler(queued.request, "queued", { queueDepth: queued.queueDepth })
+        yield* Queue.offer(scheduler.wake, undefined)
+        if (completion === undefined || cancellation === undefined) return undefined
+        return yield* Deferred.await(completion).pipe(
+          Effect.onInterrupt(() => Ref.modify(scheduler.pending, (state) => removeScheduledEdit(state, queued.request.id)).pipe(
+            Effect.flatMap((removed) => Deferred.succeed(cancellation, undefined).pipe(
+              Effect.andThen(logEditScheduler(queued.request, "cancellation-requested", {
+                location: removed ? "queued" : "selected",
+              })),
+            )),
+          )),
+        )
       })
     return {
       getUpdates: (offset, timeoutSeconds) =>
@@ -552,50 +778,14 @@ export const Live: Layer.Layer<TelegramApi, ConfigError, AppConfig> = Layer.effe
       sendPhoto: (input) => sendMedia("sendPhoto", "photo", input),
       sendVideo: (input) => sendMedia("sendVideo", "video", input),
       sendDocument: (input) => sendMedia("sendDocument", "document", input),
-      editMessageText: (input) =>
-        editLockFor(input.chatId).pipe(
-          Effect.flatMap((editLock) => editLock.withPermit(
-            waitForEditSlot(input.chatId).pipe(
-              Effect.andThen(editRequestPermits.withPermit(Effect.gen(function* () {
-                const sawFlood = yield* Ref.make(false)
-                const result = yield* jsonBody("editMessageText", {
-                  chat_id: input.chatId,
-                  message_id: input.messageId,
-                  text: input.text,
-                  reply_markup: input.replyMarkup,
-                }).pipe(
-                  Effect.flatMap((body) =>
-                    call("editMessageText", MessageSchema, redact, {
-                      onRetry: (error) => error.code === 429
-                        ? Ref.set(sawFlood, true).pipe(
-                            Effect.andThen(penalizeFlood(input.chatId, error.retryAfterMs)),
-                          )
-                        : Effect.void,
-                    })(
-                      HttpClientRequest.post(`${base}/editMessageText`).pipe(HttpClientRequest.setBody(body)),
-                    )
-                  ),
-                  Effect.catchTag("ApiError", (error) =>
-                    error.code === 429
-                      ? Ref.set(sawFlood, true).pipe(
-                          Effect.andThen(penalizeFlood(input.chatId, error.retryAfterMs)),
-                          Effect.andThen(Effect.fail(error)),
-                        )
-                      : Effect.fail(error)),
-                )
-                yield* noteSuccessfulEdit(input.chatId, !(yield* Ref.get(sawFlood)))
-                return result
-              }))),
-            ),
-          )),
-        ),
+      editMessageText: scheduleEdit,
       answerCallbackQuery: (input) =>
         Effect.gen(function* () {
           const body = yield* jsonBody("answerCallbackQuery", {
             callback_query_id: input.queryId,
             text: input.text,
           })
-          return yield* call("answerCallbackQuery", Schema.Boolean, redact)(
+          return yield* call("answerCallbackQuery", Schema.Boolean, redact, { retryTransient: false })(
             HttpClientRequest.post(`${base}/answerCallbackQuery`).pipe(HttpClientRequest.setBody(body)),
           )
         }),
