@@ -230,6 +230,182 @@ describe("Telegram API response decoding", () => {
     expect(result).toBe(3)
   })
 
+  test("coalesces queued progress to the newest edit for each message", async () => {
+    const bodies = await Effect.runPromise(Effect.gen(function* () {
+      const requestBodies = yield* Ref.make<readonly string[]>([])
+      const client = HttpClient.make((request) => {
+        const body = request.body
+        const encoded = body._tag === "Uint8Array" ? new TextDecoder().decode(body.body) : ""
+        return Ref.update(requestBodies, (values) => [...values, encoded]).pipe(
+          Effect.as(HttpClientResponse.fromWeb(request, new Response(JSON.stringify({
+            ok: true,
+            result: { message_id: 10, chat: { id: -7 } },
+          }), { status: 200 }))),
+        )
+      })
+      const config = Layer.succeed(AppConfigTag, new AppConfig({
+        telegramBotToken: "test-token",
+        projectDirectory: "/tmp",
+        stateFile: "/tmp/state.json",
+        webDatabaseFile: "/tmp/web.sqlite",
+        telegramRunTimeout: "10 minutes",
+        webPort: 3001,
+      }))
+
+      return yield* Effect.gen(function* () {
+        yield* TestClock.adjust("1 minute")
+        const api = yield* TelegramApi
+        yield* api.editMessageText({ chatId: -7, messageId: 10, text: "initial", priority: "final" })
+        const stale = yield* Effect.forkChild(api.editMessageText({
+          chatId: -7,
+          messageId: 10,
+          text: "stale progress",
+          priority: "progress",
+        }))
+        yield* Effect.yieldNow
+        const latest = yield* Effect.forkChild(api.editMessageText({
+          chatId: -7,
+          messageId: 10,
+          text: "latest progress",
+          priority: "progress",
+        }))
+        yield* Effect.yieldNow
+
+        expect(yield* Fiber.join(stale)).toBeUndefined()
+        yield* TestClock.adjust(EDIT_MIN_INTERVAL_GROUP_MS)
+        yield* Fiber.join(latest)
+        return yield* Ref.get(requestBodies)
+      }).pipe(
+        Effect.provide(Layer.provide(Live, config)),
+        Effect.provideService(HttpClient.HttpClient, client),
+        Effect.provide(TestClock.layer()),
+      )
+    }))
+
+    expect(bodies).toHaveLength(2)
+    expect(bodies[0]).toContain('"text":"initial"')
+    expect(bodies[1]).toContain('"text":"latest progress"')
+    expect(bodies.join("\n")).not.toContain("stale progress")
+  })
+
+  test("drops queued background progress when a final edit arrives", async () => {
+    const bodies = await Effect.runPromise(Effect.gen(function* () {
+      const requestBodies = yield* Ref.make<readonly string[]>([])
+      const client = HttpClient.make((request) => {
+        const body = request.body
+        const encoded = body._tag === "Uint8Array" ? new TextDecoder().decode(body.body) : ""
+        return Ref.update(requestBodies, (values) => [...values, encoded]).pipe(
+          Effect.as(HttpClientResponse.fromWeb(request, new Response(JSON.stringify({
+            ok: true,
+            result: { message_id: 10, chat: { id: -7 } },
+          }), { status: 200 }))),
+        )
+      })
+      const config = Layer.succeed(AppConfigTag, new AppConfig({
+        telegramBotToken: "test-token",
+        projectDirectory: "/tmp",
+        stateFile: "/tmp/state.json",
+        webDatabaseFile: "/tmp/web.sqlite",
+        telegramRunTimeout: "10 minutes",
+        webPort: 3001,
+      }))
+
+      return yield* Effect.gen(function* () {
+        yield* TestClock.adjust("1 minute")
+        const api = yield* TelegramApi
+        yield* api.editMessageText({ chatId: -7, messageId: 10, text: "initial", priority: "final" })
+        yield* api.editMessageText({
+          chatId: -7,
+          messageId: 10,
+          text: "stale background progress",
+          priority: "progress",
+          delivery: "background",
+        })
+        const final = yield* Effect.forkChild(api.editMessageText({
+          chatId: -7,
+          messageId: 10,
+          text: "final result",
+          priority: "final",
+        }))
+        yield* Effect.yieldNow
+
+        yield* TestClock.adjust(EDIT_MIN_INTERVAL_GROUP_MS)
+        yield* Fiber.join(final)
+        yield* TestClock.adjust(EDIT_MIN_INTERVAL_GROUP_MS)
+        return yield* Ref.get(requestBodies)
+      }).pipe(
+        Effect.provide(Layer.provide(Live, config)),
+        Effect.provideService(HttpClient.HttpClient, client),
+        Effect.provide(TestClock.layer()),
+      )
+    }))
+
+    expect(bodies).toHaveLength(2)
+    expect(bodies[0]).toContain('"text":"initial"')
+    expect(bodies[1]).toContain('"text":"final result"')
+    expect(bodies.join("\n")).not.toContain("stale background progress")
+  })
+
+  test("preempts selected background progress when an urgent edit arrives", async () => {
+    const attempts = await Effect.runPromise(Effect.gen(function* () {
+      const calls = yield* Ref.make(0)
+      const progressStarted = yield* Deferred.make<void>()
+      const finalStarted = yield* Deferred.make<void>()
+      const client = HttpClient.make((request) => Ref.updateAndGet(calls, (count) => count + 1).pipe(
+        Effect.flatMap((count) => count === 1
+          ? Deferred.succeed(progressStarted, undefined).pipe(Effect.andThen(Effect.never))
+          : Deferred.succeed(finalStarted, undefined)),
+        Effect.as(HttpClientResponse.fromWeb(request, new Response(JSON.stringify({
+          ok: true,
+          result: { message_id: 10, chat: { id: -7 } },
+        }), { status: 200 }))),
+      ))
+      const config = Layer.succeed(AppConfigTag, new AppConfig({
+        telegramBotToken: "test-token",
+        projectDirectory: "/tmp",
+        stateFile: "/tmp/state.json",
+        webDatabaseFile: "/tmp/web.sqlite",
+        telegramRunTimeout: "10 minutes",
+        webPort: 3001,
+      }))
+
+      return yield* Effect.gen(function* () {
+        yield* TestClock.adjust("1 minute")
+        const api = yield* TelegramApi
+        yield* api.editMessageText({
+          chatId: -7,
+          messageId: 10,
+          text: "selected progress",
+          priority: "progress",
+          delivery: "background",
+        })
+        yield* Deferred.await(progressStarted)
+
+        const final = yield* Effect.forkChild(api.editMessageText({
+          chatId: -7,
+          messageId: 10,
+          text: "final result",
+          priority: "final",
+        }))
+        yield* Effect.yieldNow
+        expect(yield* Ref.get(calls)).toBe(1)
+
+        yield* TestClock.adjust(EDIT_MIN_INTERVAL_GROUP_MS - 1)
+        expect(yield* Ref.get(calls)).toBe(1)
+        yield* TestClock.adjust(1)
+        yield* Deferred.await(finalStarted)
+        yield* Fiber.join(final)
+        return yield* Ref.get(calls)
+      }).pipe(
+        Effect.provide(Layer.provide(Live, config)),
+        Effect.provideService(HttpClient.HttpClient, client),
+        Effect.provide(TestClock.layer()),
+      )
+    }))
+
+    expect(attempts).toBe(2)
+  })
+
   test("rechecks chat priority after global edit capacity becomes available", async () => {
     const interactionWon = await Effect.runPromise(Effect.gen(function* () {
       const calls = yield* Ref.make(0)
@@ -321,6 +497,7 @@ describe("Telegram API response decoding", () => {
       }))
 
       return yield* Effect.gen(function* () {
+        yield* TestClock.adjust("1 minute")
         const api = yield* TelegramApi
         const progress = yield* Effect.forkChild(api.editMessageText({
           chatId: -7,
@@ -337,12 +514,14 @@ describe("Telegram API response decoding", () => {
           text: "final",
           priority: "final",
         }))
-        yield* Deferred.await(finalStarted).pipe(Effect.timeout("1 second"))
+        yield* TestClock.adjust(EDIT_MIN_INTERVAL_GROUP_MS)
+        yield* Deferred.await(finalStarted)
         yield* Fiber.join(final)
         return yield* Ref.get(calls)
       }).pipe(
         Effect.provide(Layer.provide(Live, config)),
         Effect.provideService(HttpClient.HttpClient, client),
+        Effect.provide(TestClock.layer()),
       )
     }))
 
