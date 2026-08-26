@@ -68,7 +68,8 @@ The bot lives in `src/` and `test/` at the repository root. The core
 - Message edits pass through one scheduler per chat. Direct chats start at 1
   second between edits. Group chats start at 6 seconds. A Telegram 429 response
   can increase the interval to 20 seconds. Interactive and final edits run
-  before queued live progress edits. Progress failures do not block urgent
+  before queued live progress edits. Queued progress collapses to the newest
+  update for each Telegram message. Progress failures do not block urgent
   feedback with retries.
 - Model and question buttons wait no more than 2 seconds for callback
   acknowledgement before the action continues. Their cosmetic message edits
