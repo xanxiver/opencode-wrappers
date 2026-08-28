@@ -8,6 +8,7 @@ import { Pickers } from "../pickers.js"
 import type { CallbackQuery } from "../api.js"
 import { answer, apiEdit, callbackFailure, chunk, sendMarkup, sendText } from "./shared.js"
 import { conversationId } from "../conversation.js"
+import { TelegramDeliveryStatus } from "../delivery-assignments.js"
 import { parseDirectoryPageCallback, parseSessionPageCallback } from "../render.js"
 import { setProjectDirectory } from "./run.js"
 
@@ -409,6 +410,7 @@ export const handleSessionCallback = (query: CallbackQuery, data: string) =>
         const pickers = yield* Pickers
         const sessions = yield* Sessions
         const store = yield* Store
+        const assignments = yield* TelegramDeliveryStatus
         const message = query.message
         if (message === undefined) {
           yield* answer(query.id, "Invalid callback.")
@@ -429,6 +431,13 @@ export const handleSessionCallback = (query: CallbackQuery, data: string) =>
               yield* store.setSessionIDForConversation(
                 conversation,
                 value.sessionID,
+              )
+              yield* assignments.clear(conversation).pipe(
+                Effect.catchCause((cause) => logBoundary(
+                  "telegram/handlers",
+                  "delivery-assignment",
+                  "clear assignment after session picker change failed",
+                )(cause)),
               )
               const label = Option.getOrElse(value.title, () => value.sessionID)
               // Replace the picker message, which removes the keyboard,

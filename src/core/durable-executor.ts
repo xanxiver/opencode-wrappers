@@ -86,6 +86,8 @@ export interface DurableExecutorRepository {
   readonly releaseWorkerLeases: Effect.Effect<void, DurableExecutorError>
   readonly get: (jobID: string) => Effect.Effect<Option.Option<DurableJob>, DurableExecutorError>
   readonly listOwner: (channel: string, owner: string) => Effect.Effect<readonly DurableJob[], DurableExecutorError>
+  /** Read only executable jobs for current load and ownership decisions. */
+  readonly listNonTerminal: (channel: string) => Effect.Effect<readonly DurableJob[], DurableExecutorError>
   /** Reorder unclaimed pending jobs for one owner using one-based positions. */
   readonly movePending: (
     channel: string,
@@ -462,6 +464,10 @@ export const DurableExecutorStoreLive: Layer.Layer<
       get: (jobID) => withDatabase("read durable job", () => Option.fromNullishOr(selectByID(jobID)).pipe(Option.map(fromRow))),
       listOwner: (channel, owner) => withDatabase("list owner durable jobs", () =>
         database.query<JobRow, [string, string]>("SELECT * FROM executor_jobs WHERE channel = ? AND owner = ? ORDER BY queue_order, rowid").all(channel, owner).map(fromRow)),
+      listNonTerminal: (channel) => withDatabase("list non-terminal durable jobs", () =>
+        database.query<JobRow, [string]>(`SELECT * FROM executor_jobs
+          WHERE channel = ? AND state IN ('pending', 'dispatching', 'running', 'finalizing')
+          ORDER BY queue_order, rowid`).all(channel).map(fromRow)),
       movePending: (channel, owner, from, to) => withDatabase("move pending durable job", () => transaction(() => {
         const rows = database.query<Pick<JobRow, "id" | "queue_order">, [string, string]>(`SELECT id, queue_order
           FROM executor_jobs

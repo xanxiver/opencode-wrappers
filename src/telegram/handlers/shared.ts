@@ -40,7 +40,7 @@ export const HELP_TEXT = [
   "/model <exact-model> — switch directly to an exact model",
   "/agents - list and select an agent for the current session",
   "/pwa <agent> <prompt> - run a prompt with a specific agent",
-  "/status - show the directory, session, model, git ref, and toggles",
+  "/status - show the directory, session, agent, model, git ref, and toggles",
   "/reviews — list ambiguous durable jobs for the current session",
   "/resolve_review <job-id> — resolve a durable review and remove retained data",
   "/queue - show the running and queued runs for this session",
@@ -49,6 +49,7 @@ export const HELP_TEXT = [
   "/queue_clear - remove every queued task",
   "/loose on|off - plain messages start runs when on",
   "/continue on|off - failed runs auto-send continue (max 5)",
+  "/verbosity quiet|normal|detailed - set live run content",
   "/sessions — list and switch sessions in this directory",
   "/session <id> — set the active session by ID",
   "",
@@ -80,12 +81,13 @@ export const callbackFailure = (query: CallbackQuery, message: string, reply: st
     )
 
 /** Send a text message into the originating forum thread when provided. */
-export const sendText = (chatId: number, text: string, threadId?: number) =>
+export const sendText = (chatId: number, text: string, threadId?: number, parseMode?: "HTML") =>
   Effect.gen(function* () {
     const api = yield* TelegramApi
     yield* api.sendMessage({
       chatId,
       text,
+      parseMode,
       messageThreadId: threadId,
     }).pipe(Effect.catchCause(logTelegramFailure("sendMessage failed")))
   })
