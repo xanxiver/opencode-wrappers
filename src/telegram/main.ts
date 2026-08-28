@@ -1,4 +1,4 @@
-import { Effect } from "effect"
+import { Effect, Layer } from "effect"
 import { FetchHttpClient } from "effect/unstable/http"
 import { BunChildProcessSpawner, BunCrypto, BunFileSystem, BunPath, BunRuntime } from "@effect/platform-bun"
 import { AppConfigTag, ConfigError, Live as ConfigLive } from "../config.js"
@@ -7,9 +7,13 @@ import { Live as OpenCodeLive } from "../core/opencode.js"
 import { Live as SessionsLive } from "../core/sessions.js"
 import { Live as StoreLive } from "../core/store.js"
 import { DurableExecutorStoreLive } from "../core/durable-executor.js"
-import { Live as TelegramApiLive } from "./api.js"
 import { AccessLive } from "./access.js"
+import { TelegramBotPoolLive } from "./bot-pool.js"
 import { run as runBot } from "./bot.js"
+import {
+  TelegramDeliveryAssignmentsLive,
+  TelegramDeliveryStatusLive,
+} from "./delivery-assignments.js"
 import { TelegramDurableExecutorLive } from "./durable-executor.js"
 import { InteractionStoreLive } from "./interaction-store.js"
 import { Live as ModelRegistryLive } from "./models.js"
@@ -17,7 +21,16 @@ import { Live as PermissionsLive } from "./permissions.js"
 import { Live as PickersLive } from "./pickers.js"
 import { Live as QuestionRegistryLive } from "./questions.js"
 import { Live as AgentRegistryLive } from "./agents.js"
+import { Live as SessionSelectionLive } from "./session-selection.js"
 import { resurfacePending } from "./resurface.js"
+
+const TelegramDeliveryBaseLive = TelegramDeliveryAssignmentsLive.pipe(
+  Layer.provideMerge(TelegramBotPoolLive),
+)
+
+const TelegramDeliveryLive = TelegramDeliveryStatusLive.pipe(
+  Layer.provideMerge(TelegramDeliveryBaseLive),
+)
 
 const program = Effect.gen(function* () {
   const config = yield* AppConfigTag
@@ -38,12 +51,12 @@ const app = program.pipe(
   Effect.provide(GitChangesLive),
   Effect.provide(BunChildProcessSpawner.layer),
   Effect.provide(SessionsLive),
-  Effect.provide(TelegramApiLive),
+  Effect.provide(TelegramDeliveryLive),
   Effect.provide(AccessLive),
   Effect.provide(ModelRegistryLive),
   Effect.provide(PermissionsLive),
   Effect.provide(QuestionRegistryLive),
-  Effect.provide(AgentRegistryLive),
+  Effect.provide(Layer.merge(AgentRegistryLive, SessionSelectionLive)),
   Effect.provide(PickersLive),
   Effect.provide(InteractionStoreLive),
   Effect.provide(DurableExecutorStoreLive),

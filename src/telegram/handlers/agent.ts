@@ -4,7 +4,9 @@ import { logBoundary } from "../../core/logging.js"
 import { OpenCode } from "../../core/opencode.js"
 import { Sessions } from "../../core/sessions.js"
 import { Store } from "../../core/store.js"
-import { AgentRegistry, type SelectableAgent } from "../agents.js"
+import { AgentRegistry, isSelectableAgent, type SelectableAgent } from "../agents.js"
+import { formatModelPreference, resolveEffectiveModel } from "../models.js"
+import { SessionSelection } from "../session-selection.js"
 import type { CallbackQuery, Message } from "../api.js"
 import { conversationId } from "../conversation.js"
 import {
@@ -17,10 +19,11 @@ import { answer, apiEdit, callbackFailure, sendMarkup, sendText } from "./shared
 import { runWithFiles } from "./run.js"
 
 export const selectableAgents = (agents: readonly AgentInfo[]): readonly SelectableAgent[] =>
-  agents.filter((agent) => !agent.hidden && agent.mode !== "subagent").map((agent) => ({
+  agents.filter(isSelectableAgent).map((agent) => ({
     id: agent.id,
     name: agent.name,
     description: agent.description,
+    model: agent.model,
   }))
 
 export const resolveAgent = (
@@ -94,7 +97,6 @@ export const handleAgentCallback = (query: CallbackQuery, data: string) =>
         return
       }
       const registry = yield* AgentRegistry
-      const opencode = yield* OpenCode
       const entry = yield* registry.take(parsed.token, message.chat.id, message.message_id)
       yield* Option.match(entry, {
         onNone: () => answer(query.id, "Expired."),
@@ -109,8 +111,50 @@ export const handleAgentCallback = (query: CallbackQuery, data: string) =>
             return
           }
           yield* answer(query.id, "Switching…")
-          yield* opencode.switchAgent({ sessionID: current.sessionID, agent: selected.id })
-          yield* apiEdit(current.chatId, current.messageId, `Agent switched to ${selected.name} (${selected.id}).`)
+          const selections = yield* SessionSelection
+          const text = yield* selections.withSession(current.sessionID, Effect.gen(function* () {
+            if (!(yield* pickerIsCurrent(current))) return Option.none<string>()
+            const opencode = yield* OpenCode
+            const store = yield* Store
+            const session = yield* opencode.getSession(current.sessionID)
+            const pairModel = yield* store.getSessionAgentModel(current.sessionID, selected.id)
+            const directoryFallback = yield* store.getDirectoryModelFallback(current.directory)
+            const effectiveModel = resolveEffectiveModel({
+              sessionAgent: Option.getOrUndefined(pairModel),
+              agentConfig: selected.model,
+              session: session.model,
+              directory: Option.getOrUndefined(directoryFallback),
+            })
+            yield* opencode.switchAgent({ sessionID: current.sessionID, agent: selected.id })
+            const modelApplied = yield* Option.match(effectiveModel, {
+              onNone: () => Effect.succeed(true),
+              onSome: ({ model }) => opencode.switchModel({
+                sessionID: current.sessionID,
+                model,
+              }).pipe(
+                Effect.as(true),
+                Effect.catchCause((cause) =>
+                  logBoundary("telegram/handlers", "agent-picker", "agent switched but model apply failed")(cause).pipe(
+                    Effect.as(false),
+                  ),
+                ),
+              ),
+            })
+            return Option.some(Option.match(effectiveModel, {
+              onNone: () => `Agent switched to ${selected.name} (${selected.id}).`,
+              onSome: ({ model }) => modelApplied
+                ? `Agent switched to ${selected.name} (${selected.id}). Model: ${formatModelPreference(model)}.`
+                : `Agent switched to ${selected.name} (${selected.id}), but model ${formatModelPreference(model)} could not be applied.`,
+            }))
+          }))
+          yield* Option.match(text, {
+            onNone: () => apiEdit(
+              current.chatId,
+              current.messageId,
+              "This agent picker is no longer current. Run /agents again.",
+            ),
+            onSome: (value) => apiEdit(current.chatId, current.messageId, value),
+          })
         }).pipe(Effect.catchCause((cause) =>
           logBoundary("telegram/handlers", "agent-picker", "agent switch failed")(cause).pipe(
             Effect.andThen(sendText(current.chatId, "The agent could not be switched.", current.threadId)),

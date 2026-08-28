@@ -150,6 +150,27 @@ describe("Store", () => {
     }
   })
 
+  test("lists every persisted conversation session for compatibility migration", async () => {
+    const stateFile = makeStateFile()
+    try {
+      const entries = await run(
+        Effect.gen(function* () {
+          const store = yield* Store
+          yield* store.setSessionIDForConversation("tg:-100:thread:1", "ses_group")
+          yield* store.setSessionIDForConversation("tg:7", "ses_private")
+          return yield* store.listConversationSessions()
+        }),
+        stateFile,
+      )
+      expect(new Set(entries.map(({ conversationId, sessionID }) => `${conversationId}:${sessionID}`))).toEqual(new Set([
+        "tg:-100:thread:1:ses_group",
+        "tg:7:ses_private",
+      ]))
+    } finally {
+      rmSync(stateFile, { force: true })
+    }
+  })
+
   test("lists retained session directories after a client switches projects", async () => {
     const stateFile = makeStateFile()
     try {
@@ -168,45 +189,84 @@ describe("Store", () => {
     }
   })
 
-  test("model memory round-trips per directory", async () => {
+  test("model preferences are independent by session and agent", async () => {
     const stateFile = makeStateFile()
     try {
       const value = await run(
         Effect.gen(function* () {
           const store = yield* Store
-          const before = yield* store.getModel("/a")
-          yield* store.setModel("/a", { id: "m1", providerID: "p1" })
-          yield* store.setModel("/a", { id: "m2", providerID: "p2", variant: "v" })
-          const after = yield* store.getModel("/a")
-          const other = yield* store.getModel("/b")
-          return { before, after, other }
+          const before = yield* store.getSessionAgentModel("ses_1", "build")
+          yield* store.setSessionAgentModel("ses_1", "build", { id: "m1", providerID: "p1" })
+          yield* store.setSessionAgentModel("ses_1", "plan", { id: "m2", providerID: "p2", variant: "v" })
+          yield* store.setSessionAgentModel("ses_2", "build", { id: "m3", providerID: "p3" })
+          return {
+            before,
+            sessionOneBuild: yield* store.getSessionAgentModel("ses_1", "build"),
+            sessionOnePlan: yield* store.getSessionAgentModel("ses_1", "plan"),
+            sessionTwoBuild: yield* store.getSessionAgentModel("ses_2", "build"),
+          }
         }),
         stateFile,
       )
       expect(value.before).toEqual(Option.none())
-      expect(value.after).toEqual(Option.some({ id: "m2", providerID: "p2", variant: "v" }))
-      expect(value.other).toEqual(Option.none())
+      expect(value.sessionOneBuild).toEqual(Option.some({ id: "m1", providerID: "p1" }))
+      expect(value.sessionOnePlan).toEqual(Option.some({ id: "m2", providerID: "p2", variant: "v" }))
+      expect(value.sessionTwoBuild).toEqual(Option.some({ id: "m3", providerID: "p3" }))
     } finally {
       rmSync(stateFile, { force: true })
     }
   })
 
-  test("a state file without the models field loads with no models", async () => {
+  test("a session-agent model preference survives a store reload", async () => {
     const stateFile = makeStateFile()
     try {
-      const { writeFileSync } = await import("node:fs")
-      writeFileSync(stateFile, JSON.stringify({ sessions: { "/a": "ses_1" }, directories: {} }))
+      await run(
+        Effect.gen(function* () {
+          const store = yield* Store
+          yield* store.setSessionAgentModel("ses_1", "build", {
+            id: "persisted",
+            providerID: "provider",
+            variant: "high",
+          })
+        }),
+        stateFile,
+      )
+      const model = await run(
+        Effect.gen(function* () {
+          const store = yield* Store
+          return yield* store.getSessionAgentModel("ses_1", "build")
+        }),
+        stateFile,
+      )
+      expect(model).toEqual(Option.some({ id: "persisted", providerID: "provider", variant: "high" }))
+    } finally {
+      rmSync(stateFile, { force: true })
+    }
+  })
+
+  test("old state loads its directory model as a fallback", async () => {
+    const stateFile = makeStateFile()
+    try {
+      writeFileSync(stateFile, JSON.stringify({
+        sessions: { "/a": "ses_1" },
+        directories: {},
+        models: { "/a": { id: "legacy", providerID: "provider" } },
+      }))
       const value = await run(
         Effect.gen(function* () {
           const store = yield* Store
           const session = yield* store.getSessionIDForDirectory("/a")
-          const model = yield* store.getModel("/a")
-          return { session, model }
+           const fallback = yield* store.getDirectoryModelFallback("/a")
+           const pair = yield* store.getSessionAgentModel("ses_1", "build")
+           const verbosity = yield* store.getStreamVerbosity("tg:1")
+           return { session, fallback, pair, verbosity }
         }),
         stateFile,
       )
       expect(value.session).toEqual(Option.some("ses_1"))
-      expect(value.model).toEqual(Option.none())
+       expect(value.fallback).toEqual(Option.some({ id: "legacy", providerID: "provider" }))
+       expect(value.pair).toEqual(Option.none())
+       expect(value.verbosity).toBe("normal")
     } finally {
       rmSync(stateFile, { force: true })
     }
@@ -268,6 +328,42 @@ describe("Store", () => {
         stateFile,
       )
       expect(value).toBe(true)
+    } finally {
+      rmSync(stateFile, { force: true })
+    }
+  })
+
+  test("stream verbosity is topic-scoped and survives a store reload", async () => {
+    const stateFile = makeStateFile()
+    try {
+      const initial = await run(
+        Effect.gen(function* () {
+          const store = yield* Store
+          const defaultLevel = yield* store.getStreamVerbosity("tg:9:thread:1")
+          yield* store.setStreamVerbosity("tg:9:thread:1", "quiet")
+          yield* store.setStreamVerbosity("tg:9:thread:2", "detailed")
+          return defaultLevel
+        }),
+        stateFile,
+      )
+      expect(initial).toBe("normal")
+
+      const levels = await run(
+        Effect.gen(function* () {
+          const store = yield* Store
+          return {
+            firstTopic: yield* store.getStreamVerbosity("tg:9:thread:1"),
+            secondTopic: yield* store.getStreamVerbosity("tg:9:thread:2"),
+            otherChat: yield* store.getStreamVerbosity("tg:10"),
+          }
+        }),
+        stateFile,
+      )
+      expect(levels).toEqual({
+        firstTopic: "quiet",
+        secondTopic: "detailed",
+        otherChat: "normal",
+      })
     } finally {
       rmSync(stateFile, { force: true })
     }

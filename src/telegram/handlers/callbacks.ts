@@ -9,6 +9,7 @@ import type { PermissionRegistry } from "../permissions.js"
 import type { Pickers } from "../pickers.js"
 import type { QuestionRegistry } from "../questions.js"
 import type { AgentRegistry } from "../agents.js"
+import type { SessionSelection } from "../session-selection.js"
 import { answer } from "./shared.js"
 import { handlePermissionCallback } from "./permission.js"
 import {
@@ -41,6 +42,7 @@ type CallbackEnv =
   | Pickers
   | QuestionRegistry
   | AgentRegistry
+  | SessionSelection
 
 export const handleCallback = (query: CallbackQuery): Effect.Effect<void, never, CallbackEnv> =>
   Option.match(Option.fromNullishOr(query.data), {

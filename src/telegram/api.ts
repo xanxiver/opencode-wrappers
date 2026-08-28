@@ -1,7 +1,7 @@
-import { Cause, Clock, Context, Data, Deferred, Duration, Effect, Exit, Layer, Option, Queue, Ref, Schema, Semaphore } from "effect"
+import { Cause, Clock, Context, Data, Deferred, Duration, Effect, Exit, Layer, Option, Queue, Ref, Schema, Scope, Semaphore } from "effect"
 import { HttpBody, HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
 import { Stream } from "effect"
-import { AppConfigTag, ConfigError } from "../config.js"
+import { AppConfigTag, ConfigError, TELEGRAM_CONTROLLER_BOT_KEY } from "../config.js"
 import type { AppConfig } from "../config.js"
 
 export class ApiError extends Data.TaggedError("ApiError")<{
@@ -223,12 +223,27 @@ const FileInfoSchema = Schema.Struct({
   file_path: Schema.optional(Schema.String),
 })
 
+const BotUserSchema = Schema.Struct({
+  id: Schema.Number,
+  is_bot: Schema.Boolean,
+  first_name: Schema.String,
+  username: Schema.optional(Schema.String),
+})
+
+const ChatMemberSchema = Schema.Struct({
+  status: Schema.String,
+  user: BotUserSchema,
+  can_send_messages: Schema.optional(Schema.Boolean),
+})
+
 export type Message = Schema.Schema.Type<typeof MessageSchema>
 export type Update = Schema.Schema.Type<typeof UpdateSchema>
 export type CallbackQuery = Schema.Schema.Type<typeof CallbackQuerySchema>
 export type Document = Schema.Schema.Type<typeof DocumentSchema>
 export type PhotoSize = Schema.Schema.Type<typeof PhotoSizeSchema>
 export type FileInfo = Schema.Schema.Type<typeof FileInfoSchema>
+export type BotUser = Schema.Schema.Type<typeof BotUserSchema>
+export type ChatMember = Schema.Schema.Type<typeof ChatMemberSchema>
 
 export type TelegramEditPriority = "interactive" | "final" | "progress"
 export type TelegramEditDelivery = "wait" | "background"
@@ -328,6 +343,8 @@ export interface TelegramApiClient {
   readonly sendMessage: (input: {
     readonly chatId: number
     readonly text: string
+    /** Telegram text parser. Status messages use HTML; other messages omit it. */
+    readonly parseMode?: "HTML"
     readonly replyMarkup?: KeyboardMarkup
     /** Forum topic thread id; replies into that thread when provided. */
     readonly messageThreadId?: number
@@ -345,6 +362,21 @@ export interface TelegramApiClient {
   }) => Effect.Effect<boolean, ApiError, HttpClient.HttpClient>
   readonly getFile: (fileId: string) => Effect.Effect<FileInfo, ApiError, HttpClient.HttpClient>
   readonly downloadFile: (filePath: string) => Effect.Effect<Uint8Array<ArrayBufferLike>, ApiError, HttpClient.HttpClient>
+}
+
+/** Outbound-only surface available to run delivery workers. */
+export type TelegramDeliveryClient = Pick<
+  TelegramApiClient,
+  "sendMessage" | "sendPhoto" | "sendVideo" | "sendDocument" | "editMessageText"
+>
+
+/** Pool-only probes. Existing controller test doubles can keep the smaller client contract. */
+export interface TelegramApiPoolClient extends TelegramApiClient {
+  readonly getMe: () => Effect.Effect<BotUser, ApiError, HttpClient.HttpClient>
+  readonly getChatMember: (
+    chatId: number,
+    userId: number,
+  ) => Effect.Effect<ChatMember, ApiError, HttpClient.HttpClient>
 }
 
 export class TelegramApi extends Context.Service<TelegramApi, TelegramApiClient>()(
@@ -521,14 +553,19 @@ const concatBytes = (chunks: readonly Uint8Array<ArrayBufferLike>[]): Uint8Array
   return out
 }
 
-export const Live: Layer.Layer<TelegramApi, ConfigError, AppConfig | HttpClient.HttpClient> = Layer.effect(
-  TelegramApi,
+export interface TelegramApiClientOptions {
+  readonly botKey?: string
+  readonly editRequestPermits?: Semaphore.Semaphore
+}
+
+/** Build one token-local client and scheduler. Callers can share the edit semaphore across clients. */
+export const makeTelegramApiClient = (
+  token: string,
+  options: TelegramApiClientOptions = {},
+): Effect.Effect<TelegramApiPoolClient, never, HttpClient.HttpClient | Scope.Scope> =>
   Effect.gen(function* () {
-    const config = yield* AppConfigTag
     const httpClient = yield* HttpClient.HttpClient
     const schedulerScope = yield* Effect.scope
-    const token = config.telegramBotToken
-    if (token === undefined) return yield* new ConfigError({ message: "TELEGRAM_BOT_TOKEN is required by the Telegram API" })
     // Transport failures can echo the request URL, which contains the token.
     // Keep the redactor local to this client so concurrent layers cannot swap
     // credentials or sanitize each other's failures with the wrong token.
@@ -587,7 +624,7 @@ export const Live: Layer.Layer<TelegramApi, ConfigError, AppConfig | HttpClient.
     // pick urgent interaction/final edits before progress only after the
     // throttle wait, so a button pressed during that wait can move ahead.
     // Different chats may still issue up to 16 edit requests in parallel.
-    const editRequestPermits = yield* Semaphore.make(16)
+    const editRequestPermits = options.editRequestPermits ?? (yield* Semaphore.make(16))
     const performEdit = (input: EditMessageTextInput): Effect.Effect<Message, ApiError, HttpClient.HttpClient> =>
       Effect.gen(function* () {
         const sawFlood = yield* Ref.make(false)
@@ -635,8 +672,9 @@ export const Live: Layer.Layer<TelegramApi, ConfigError, AppConfig | HttpClient.
       if (priority === "progress") event = Effect.logDebug(message)
       if (warning) event = Effect.logWarning(message)
       return Effect.annotateLogs({
-        component: "telegram/api",
-        boundary: "telegram-edit-scheduler",
+          component: "telegram/api",
+          boundary: "telegram-edit-scheduler",
+          deliveryBotKey: options.botKey,
         stage,
         chatId: request.input.chatId,
         messageId: request.input.messageId,
@@ -804,6 +842,7 @@ export const Live: Layer.Layer<TelegramApi, ConfigError, AppConfig | HttpClient.
           const body = yield* jsonBody("sendMessage", {
             chat_id: input.chatId,
             text: input.text,
+            parse_mode: input.parseMode,
             reply_markup: input.replyMarkup,
             message_thread_id: input.messageThreadId,
             reply_parameters: input.replyToMessageId === undefined
@@ -876,6 +915,23 @@ export const Live: Layer.Layer<TelegramApi, ConfigError, AppConfig | HttpClient.
             }),
           ),
         ),
+      getMe: () => call("getMe", BotUserSchema, redact)(
+        HttpClientRequest.get(`${base}/getMe`),
+      ),
+      getChatMember: (chatId, userId) => call("getChatMember", ChatMemberSchema, redact)(
+        HttpClientRequest.get(`${base}/getChatMember`).pipe(
+          HttpClientRequest.setUrlParams({ chat_id: chatId, user_id: userId }),
+        ),
+      ),
     }
+  })
+
+export const Live: Layer.Layer<TelegramApi, ConfigError, AppConfig | HttpClient.HttpClient> = Layer.effect(
+  TelegramApi,
+  Effect.gen(function* () {
+    const config = yield* AppConfigTag
+    const token = config.telegramBotToken
+    if (token === undefined) return yield* new ConfigError({ message: "TELEGRAM_BOT_TOKEN is required by the Telegram API" })
+    return yield* makeTelegramApiClient(token, { botKey: TELEGRAM_CONTROLLER_BOT_KEY })
   }),
 )

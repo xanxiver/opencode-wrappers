@@ -1,7 +1,11 @@
 import { Cause, Clock, Context, Effect, FiberMap, FileSystem, Layer, Option, Path, Random, Ref, Schedule, Schema, Semaphore } from "effect"
 import type { HttpClient } from "effect/unstable/http"
 import { Buffer } from "node:buffer"
-import { AppConfigTag, type AppConfig } from "../config.js"
+import {
+  AppConfigTag,
+  TELEGRAM_CONTROLLER_BOT_KEY,
+  type AppConfig,
+} from "../config.js"
 import type { Attachment } from "../core/attachments.js"
 import {
   DurableExecutorStore,
@@ -15,14 +19,28 @@ import {
 } from "../core/durable-executor.js"
 import { logBoundary } from "../core/logging.js"
 import { GitChanges, type GitChangesService } from "../core/git-changes.js"
-import { OpenCode, type OpenCodeError } from "../core/opencode.js"
+import { OpenCode, type OpenCodeError, type OpenCodeService } from "../core/opencode.js"
 import { Sessions, type SessionsError, type SessionsService } from "../core/sessions.js"
-import { Store, type StoreError, type StoreService } from "../core/store.js"
+import { Store, type StoredModel, type StoreError, type StoreService } from "../core/store.js"
+import { DEFAULT_STREAM_VERBOSITY, StreamVerbositySchema, type StreamVerbosity } from "../core/stream-verbosity.js"
 import { AttachmentDownloadError, collectAttachments, FileValidationError } from "./files.js"
 import { sendText } from "./handlers/shared.js"
-import { conversationId } from "./conversation.js"
-import { AgentSwitchError, limitMedia, recoveredResponseFromHistory, runPrompt, type RunFinalization } from "./run.js"
-import { MessageSchema, TelegramApi, type ApiError, type Message } from "./api.js"
+import {
+  controllerRoute,
+  conversationId,
+  deliveryRoute,
+  TelegramDeliveryRouteSchema,
+  type TelegramDeliveryRoute,
+} from "./conversation.js"
+import {
+  AgentSwitchError,
+  limitMedia,
+  ModelSwitchError,
+  recoveredResponseFromHistory,
+  runPrompt,
+  type RunFinalization,
+} from "./run.js"
+import { MessageSchema, TelegramApi, type ApiError, type Message, type TelegramDeliveryClient } from "./api.js"
 import { PermissionRegistry } from "./permissions.js"
 import { QuestionRegistry } from "./questions.js"
 import { reconcilePendingSession } from "./resurface.js"
@@ -30,10 +48,21 @@ import type { InteractionStoreError } from "./interaction-store.js"
 import { InteractionStore } from "./interaction-store.js"
 import { renderFinal, truncate, appendChangesSummary, renderRunQueue, type RunQueueItem } from "./render.js"
 import { renderTelegramMermaid } from "./mermaid.js"
+import { resolveEffectiveModel } from "./models.js"
+import { SessionSelection } from "./session-selection.js"
+import {
+  TelegramDeliveryAssignments,
+  type DeliveryAssignmentError,
+} from "./delivery-assignments.js"
+import { DeliveryBotUnavailable, TelegramBotPool } from "./bot-pool.js"
 
-const TelegramJobPayload = Schema.Struct({
+const TelegramJobPayloadSchema = Schema.Struct({
   chatId: Schema.Number,
   threadId: Schema.optional(Schema.Number),
+  conversationId: Schema.optional(Schema.String),
+  controllerRoute: Schema.optional(TelegramDeliveryRouteSchema),
+  runDeliveryRoute: Schema.optional(TelegramDeliveryRouteSchema),
+  assignmentGeneration: Schema.optional(Schema.Number),
   message: MessageSchema,
   text: Schema.String,
   sessionID: Schema.String,
@@ -50,8 +79,37 @@ const TelegramJobPayload = Schema.Struct({
     variant: Schema.optional(Schema.String),
   })),
   agent: Schema.optional(Schema.String),
+  // Optional so jobs accepted before stream verbosity existed still decode.
+  verbosity: Schema.optional(StreamVerbositySchema),
 })
-type TelegramJobPayload = Schema.Schema.Type<typeof TelegramJobPayload>
+type TelegramJobPayloadEncoded = Schema.Schema.Type<typeof TelegramJobPayloadSchema>
+type TelegramJobPayload = TelegramJobPayloadEncoded & {
+  readonly conversationId: string
+  readonly controllerRoute: TelegramDeliveryRoute
+  readonly runDeliveryRoute: TelegramDeliveryRoute
+  readonly assignmentGeneration: number
+}
+
+/** Force reconnect reroutes controller interactions without moving run output. */
+export const forceReconnectPayload = (
+  payload: TelegramJobPayload,
+  route: { readonly chatId: number; readonly threadId?: number },
+): TelegramJobPayload => ({
+  ...payload,
+  controllerRoute: controllerRoute(route),
+})
+
+/** Normalize legacy jobs to explicit controller ownership before any delivery. */
+export const normalizeTelegramJobPayload = (payload: TelegramJobPayloadEncoded): TelegramJobPayload => {
+  const destination = { chatId: payload.chatId, threadId: payload.threadId }
+  return {
+    ...payload,
+    conversationId: payload.conversationId ?? conversationId(destination),
+    controllerRoute: payload.controllerRoute ?? controllerRoute(destination),
+    runDeliveryRoute: payload.runDeliveryRoute ?? deliveryRoute(TELEGRAM_CONTROLLER_BOT_KEY, destination),
+    assignmentGeneration: payload.assignmentGeneration ?? 0,
+  }
+}
 
 export const encodeAttachmentSnapshots = (attachments: readonly Attachment[]) => attachments.map((attachment) => ({
   name: attachment.name,
@@ -99,11 +157,14 @@ const decodeFinalization = (value: string): Effect.Effect<PersistedFinalization,
   )
 
 export interface TelegramDurableExecutorService {
-  readonly submit: (chatId: number, message: Message, text: string, agent?: string) => Effect.Effect<void, DurableExecutorError | SessionsError | StoreError | AttachmentDownloadError>
+  readonly submit: (chatId: number, message: Message, text: string, agent?: string) => Effect.Effect<
+    void,
+    DurableExecutorError | SessionsError | StoreError | AttachmentDownloadError | OpenCodeError | DeliveryAssignmentError
+  >
   /** Reset only when the conversation's current durable run pipeline is empty. */
   readonly resetConversation: (chatId: number, threadId?: number) =>
     Effect.Effect<"reset" | "blocked", DurableExecutorError | SessionsError>
-  readonly reconnect: (chatId: number, message: Message, force: boolean) => Effect.Effect<void, DurableExecutorError | InteractionStoreError | OpenCodeError | SessionsError | StoreError>
+  readonly reconnect: (chatId: number, message: Message, force: boolean) => Effect.Effect<void, DurableExecutorError | InteractionStoreError | OpenCodeError | SessionsError | StoreError | DeliveryAssignmentError>
   readonly listReviews: (chatId: number, threadId?: number) => Effect.Effect<void, DurableExecutorError | SessionsError | InteractionStoreError>
   readonly resolveReview: (chatId: number, reviewID: string, threadId?: number) => Effect.Effect<void, DurableExecutorError | SessionsError | InteractionStoreError>
   readonly listQueue: (chatId: number, threadId?: number) => Effect.Effect<void, DurableExecutorError>
@@ -118,7 +179,8 @@ export class TelegramDurableExecutor extends Context.Service<TelegramDurableExec
 
 const decodePayload = (job: DurableJob): Effect.Effect<TelegramJobPayload, unknown> =>
   Effect.try({ try: () => JSON.parse(job.payload), catch: (cause) => cause }).pipe(
-    Effect.flatMap(Schema.decodeUnknownEffect(TelegramJobPayload)),
+    Effect.flatMap(Schema.decodeUnknownEffect(TelegramJobPayloadSchema)),
+    Effect.map(normalizeTelegramJobPayload),
   )
 
 const ownerFor = (sessionID: string): string => `session:${sessionID}`
@@ -167,10 +229,89 @@ export const submitForCurrentConversationUsing = (
     })),
   ))
 
+/** Run a new submission effect only when this owner has no matching source. */
+export const whenSubmissionSourceMissingUsing = <A, E, R>(
+  jobs: Pick<DurableExecutorRepository, "listOwner">,
+  channel: string,
+  owner: string,
+  sourceKey: string,
+  onMissing: Effect.Effect<A, E, R>,
+): Effect.Effect<Option.Option<A>, DurableExecutorError | E, R> =>
+  jobs.listOwner(channel, owner).pipe(
+    Effect.flatMap((existing) => existing.some((job) => job.sourceKey === sourceKey)
+      ? Effect.succeed(Option.none<A>())
+      : onMissing.pipe(Effect.map(Option.some))),
+  )
+
 export const agentSwitchRetriesExhausted = (cause: Cause.Cause<unknown>, attempt: number): boolean =>
   attempt >= 3 && Cause.findErrorOption(cause).pipe(
     Option.exists((error) => error instanceof AgentSwitchError),
   )
+
+export const modelSwitchRetriesExhausted = (cause: Cause.Cause<unknown>, attempt: number): boolean =>
+  attempt >= 3 && Cause.findErrorOption(cause).pipe(
+    Option.exists((error) => error instanceof ModelSwitchError),
+  )
+
+export interface RunSelection {
+  readonly agent?: string
+  readonly model?: StoredModel
+}
+
+export interface RunSnapshot extends RunSelection {
+  readonly verbosity: StreamVerbosity
+}
+
+/** Copy only defined run-snapshot fields into a new durable payload. */
+export const runSelectionFields = (selection: RunSelection): RunSelection => {
+  if (selection.agent !== undefined && selection.model !== undefined) {
+    return { agent: selection.agent, model: selection.model }
+  }
+  if (selection.agent !== undefined) return { agent: selection.agent }
+  if (selection.model !== undefined) return { model: selection.model }
+  return {}
+}
+
+/** Copy immutable run settings, defaulting old payloads to normal streaming. */
+export const runSnapshotFields = (
+  selection: RunSelection,
+  verbosity: StreamVerbosity | undefined,
+): RunSnapshot => ({
+  ...runSelectionFields(selection),
+  verbosity: verbosity ?? DEFAULT_STREAM_VERBOSITY,
+})
+
+/** Snapshot the agent and model before a durable Telegram job is accepted. */
+export const resolveRunSelectionUsing = (
+  store: Pick<StoreService, "getDirectoryModelFallback" | "getSessionAgentModel">,
+  opencode: Pick<OpenCodeService, "getSession" | "listAgents">,
+  input: {
+    readonly sessionID: string
+    readonly directory: string
+    readonly agent?: string
+  },
+): Effect.Effect<RunSelection, OpenCodeError> =>
+  Effect.gen(function* () {
+    const session = yield* opencode.getSession(input.sessionID)
+    const agent = input.agent ?? session.agent
+    const sessionAgentModel = agent === undefined
+      ? Option.none<StoredModel>()
+      : yield* store.getSessionAgentModel(input.sessionID, agent)
+    const directoryFallback = yield* store.getDirectoryModelFallback(input.directory)
+    const agentConfig = agent === undefined || Option.isSome(sessionAgentModel)
+      ? undefined
+      : (yield* opencode.listAgents(input.directory)).find((candidate) => candidate.id === agent)?.model
+    const effectiveModel = resolveEffectiveModel({
+      sessionAgent: Option.getOrUndefined(sessionAgentModel),
+      agentConfig,
+      session: session.model,
+      directory: Option.getOrUndefined(directoryFallback),
+    })
+    const selection: RunSelection = {}
+    if (agent !== undefined) Object.assign(selection, { agent })
+    if (Option.isSome(effectiveModel)) Object.assign(selection, { model: effectiveModel.value.model })
+    return selection
+  })
 
 /**
  * Build queue items from the run-pipeline jobs of a session, in execution
@@ -340,7 +481,7 @@ export const withChangesSummaryUsing = (
 export const TelegramDurableExecutorLive: Layer.Layer<
   TelegramDurableExecutor,
   never,
-  DurableExecutorStore | Sessions | Store | OpenCode | TelegramApi | AppConfig | FileSystem.FileSystem | Path.Path | HttpClient.HttpClient | PermissionRegistry | QuestionRegistry | GitChanges | InteractionStore
+  DurableExecutorStore | Sessions | Store | OpenCode | TelegramApi | TelegramBotPool | TelegramDeliveryAssignments | AppConfig | FileSystem.FileSystem | Path.Path | HttpClient.HttpClient | PermissionRegistry | QuestionRegistry | GitChanges | InteractionStore | SessionSelection
 > = Layer.effect(
   TelegramDurableExecutor,
   Effect.gen(function* () {
@@ -348,7 +489,9 @@ export const TelegramDurableExecutorLive: Layer.Layer<
     const sessions = yield* Sessions
     const store = yield* Store
     const opencode = yield* OpenCode
-    const api = yield* TelegramApi
+    yield* TelegramApi
+    const botPool = yield* TelegramBotPool
+    const deliveryAssignments = yield* TelegramDeliveryAssignments
     yield* AppConfigTag
     yield* FileSystem.FileSystem
     yield* Path.Path
@@ -356,7 +499,8 @@ export const TelegramDurableExecutorLive: Layer.Layer<
     const questionRegistry = yield* QuestionRegistry
     const gitChanges = yield* GitChanges
     const interaction = yield* InteractionStore
-    const context = yield* Effect.context<DurableExecutorStore | Sessions | Store | OpenCode | TelegramApi | AppConfig | FileSystem.FileSystem | Path.Path | HttpClient.HttpClient | PermissionRegistry | QuestionRegistry | GitChanges | InteractionStore>()
+    const selections = yield* SessionSelection
+    const context = yield* Effect.context<DurableExecutorStore | Sessions | Store | OpenCode | TelegramApi | TelegramBotPool | TelegramDeliveryAssignments | AppConfig | FileSystem.FileSystem | Path.Path | HttpClient.HttpClient | PermissionRegistry | QuestionRegistry | GitChanges | InteractionStore | SessionSelection>()
     const fibers = yield* FiberMap.make<string, void, never>()
     const conversationLocks = yield* Ref.make<ReadonlyMap<string, Semaphore.Semaphore>>(new Map())
     const conversationLockFor = (conversation: string): Effect.Effect<Semaphore.Semaphore> =>
@@ -380,6 +524,25 @@ export const TelegramDurableExecutorLive: Layer.Layer<
         submission,
       )),
     )
+    const resolveDeliveryOwnership = (
+      conversation: string,
+      sessionID: string,
+      chatId: number,
+      threadId?: number,
+    ): Effect.Effect<{
+      readonly route: TelegramDeliveryRoute
+      readonly generation: number
+    }, DeliveryAssignmentError> => chatId >= 0
+      ? Effect.succeed({
+          route: controllerRoute({ chatId, threadId }),
+          generation: 0,
+        })
+      : deliveryAssignments.resolve(conversation, sessionID, chatId).pipe(
+          Effect.map((assignment) => ({
+            route: deliveryRoute(assignment.deliveryBotKey, { chatId, threadId }),
+            generation: assignment.generation,
+          })),
+        )
     yield* Effect.addFinalizer(() => FiberMap.clear(fibers).pipe(
       Effect.andThen(jobs.releaseWorkerLeases),
       Effect.catchCause((cause) => logBoundary("telegram/executor", "durable-store", "release worker leases failed")(cause)),
@@ -387,6 +550,7 @@ export const TelegramDurableExecutorLive: Layer.Layer<
 
     const deliverPersistedFinal = (lease: DurableJobLease, payload: TelegramJobPayload) =>
       Effect.gen(function* () {
+        const deliveryApi = yield* botPool.getClient(payload.runDeliveryRoute.botKey)
         const encoded = lease.job.terminalResult
         if (encoded === undefined) {
           yield* jobs.fail(lease.job.id, lease.generation, "finalizing job has no terminal result", true)
@@ -397,9 +561,9 @@ export const TelegramDurableExecutorLive: Layer.Layer<
         if (progressMessageID === undefined) {
           yield* jobs.fail(lease.job.id, lease.generation, "finalizing job has no durable Telegram anchor", true)
           yield* sendText(
-            payload.chatId,
+            payload.controllerRoute.chatId,
             "The run finished, but its Telegram delivery anchor is missing. The result was not sent again.",
-            payload.threadId,
+            payload.controllerRoute.threadId,
           )
           return
         }
@@ -411,14 +575,14 @@ export const TelegramDurableExecutorLive: Layer.Layer<
             true,
           )
           yield* sendText(
-            payload.chatId,
+            payload.controllerRoute.chatId,
             "A media upload may have completed before tracking stopped. It was not uploaded again.",
-            payload.threadId,
+            payload.controllerRoute.threadId,
           )
           return
         }
-        const finalEditSucceeded = yield* api.editMessageText({
-          chatId: payload.chatId,
+        const finalEditSucceeded = yield* deliveryApi.editMessageText({
+          chatId: payload.runDeliveryRoute.chatId,
           messageId: progressMessageID,
           text: result.text,
           priority: "final",
@@ -430,10 +594,10 @@ export const TelegramDurableExecutorLive: Layer.Layer<
         // A new reply (unlike an edit) makes Telegram notify the user that
         // this run finished, with the outcome as the whole message.
         const word = finishNotificationWord(result.outcome, result.text)
-        yield* api.sendMessage({
-          chatId: payload.chatId,
+        yield* deliveryApi.sendMessage({
+          chatId: payload.runDeliveryRoute.chatId,
           text: word,
-          messageThreadId: payload.threadId,
+          messageThreadId: payload.runDeliveryRoute.threadId,
           replyToMessageId: progressMessageID,
         }).pipe(
           Effect.catchCause((cause) =>
@@ -444,24 +608,24 @@ export const TelegramDurableExecutorLive: Layer.Layer<
           const media = result.media[index]
           if (media === undefined) continue
           const mediaInput = {
-            chatId: payload.chatId,
+            chatId: payload.runDeliveryRoute.chatId,
             bytes: Buffer.from(media.base64, "base64"),
             name: media.name,
             mime: media.mime,
             caption: truncate(media.name, 1024),
-            messageThreadId: payload.threadId,
+            messageThreadId: payload.runDeliveryRoute.threadId,
             replyToMessageId: progressMessageID,
             retryTransient: false,
           }
-          let upload = api.sendDocument(mediaInput)
-          if (media.delivery !== "document" && media.mime.startsWith("image/")) upload = api.sendPhoto(mediaInput)
-          else if (media.mime.startsWith("video/")) upload = api.sendVideo(mediaInput)
+          let upload = deliveryApi.sendDocument(mediaInput)
+          if (media.delivery !== "document" && media.mime.startsWith("image/")) upload = deliveryApi.sendPhoto(mediaInput)
+          else if (media.mime.startsWith("video/")) upload = deliveryApi.sendVideo(mediaInput)
           yield* jobs.beginMediaDelivery(lease.job.id, lease.generation, index)
           yield* upload
           yield* jobs.markMediaDelivered(lease.job.id, lease.generation, index + 1)
         }
         yield* jobs.complete(lease.job.id, lease.generation)
-        yield* maybeAutoContinue(lease, payload, result.outcome, progressMessageID).pipe(
+        yield* maybeAutoContinue(lease, payload, result.outcome, progressMessageID, deliveryApi).pipe(
           Effect.catchCause((cause) =>
             logBoundary("telegram/executor", "auto-continue", "auto continue handling failed")(cause),
           ),
@@ -475,17 +639,18 @@ export const TelegramDurableExecutorLive: Layer.Layer<
       payload: TelegramJobPayload,
       outcome: string | undefined,
       progressMessageID: number,
+      deliveryApi: TelegramDeliveryClient,
     ) => Effect.gen(function* () {
-      const conversation = conversationId({ chatId: payload.chatId, threadId: payload.threadId })
+      const conversation = payload.conversationId
       const enabled = yield* store.getAutoContinue(conversation)
       const storedCount = yield* interaction.get(autoContinueKey(payload.sessionID))
       const currentCount = Option.isSome(storedCount) ? Number(storedCount.value) || 0 : 0
       const decision = decideAutoContinue(enabled, currentCount, outcome)
 
-      const notify = (text: string) => api.sendMessage({
-        chatId: payload.chatId,
+      const notify = (text: string) => deliveryApi.sendMessage({
+        chatId: payload.runDeliveryRoute.chatId,
         text,
-        messageThreadId: payload.threadId,
+        messageThreadId: payload.runDeliveryRoute.threadId,
         replyToMessageId: progressMessageID > 0 ? progressMessageID : undefined,
       }).pipe(
         Effect.catchCause((cause) =>
@@ -514,20 +679,27 @@ export const TelegramDurableExecutorLive: Layer.Layer<
       // snapshots carry over so the retry runs with the same configuration.
       const syntheticMessage: Message = {
         message_id: progressMessageID > 0 ? progressMessageID : 0,
-        chat: { id: payload.chatId },
+        chat: { id: payload.controllerRoute.chatId },
         text: "continue",
       }
-      if (payload.threadId !== undefined) Object.assign(syntheticMessage, { message_thread_id: payload.threadId })
+      if (payload.controllerRoute.threadId !== undefined) {
+        Object.assign(syntheticMessage, { message_thread_id: payload.controllerRoute.threadId })
+      }
       const nextPayload: TelegramJobPayload = {
-        chatId: payload.chatId,
+        chatId: payload.controllerRoute.chatId,
         message: syntheticMessage,
         text: "continue",
         sessionID: payload.sessionID,
         directory: payload.directory,
+        conversationId: payload.conversationId,
+        controllerRoute: payload.controllerRoute,
+        runDeliveryRoute: payload.runDeliveryRoute,
+        assignmentGeneration: payload.assignmentGeneration,
+        ...runSnapshotFields(payload, payload.verbosity),
       }
-      if (payload.model !== undefined) Object.assign(nextPayload, { model: payload.model })
-      if (payload.agent !== undefined) Object.assign(nextPayload, { agent: payload.agent })
-      if (payload.threadId !== undefined) Object.assign(nextPayload, { threadId: payload.threadId })
+      if (payload.controllerRoute.threadId !== undefined) {
+        Object.assign(nextPayload, { threadId: payload.controllerRoute.threadId })
+      }
       const now = yield* Clock.currentTimeMillis
       const rand = (yield* Random.nextIntBetween(0, 999)) / 1000
       const availableAt = now + autoContinueDelayMs(decision.round, rand)
@@ -552,6 +724,16 @@ export const TelegramDurableExecutorLive: Layer.Layer<
     const execute = (lease: DurableJobLease) =>
       Effect.gen(function* () {
         const payload = yield* decodePayload(lease.job)
+        yield* Effect.annotateLogs({
+          controllerBotKey: payload.controllerRoute.botKey,
+          deliveryBotKey: payload.runDeliveryRoute.botKey,
+          conversationId: payload.conversationId,
+          chatId: payload.runDeliveryRoute.chatId,
+          threadId: payload.runDeliveryRoute.threadId,
+          sessionID: payload.sessionID,
+          assignmentGeneration: payload.assignmentGeneration,
+          legacyOwnership: payload.assignmentGeneration === 0,
+        })(Effect.logDebug("executing Telegram durable delivery"))
         if (lease.job.progressMessageID === PROGRESS_DELIVERY_IN_FLIGHT_MESSAGE_ID) {
           yield* jobs.fail(
             lease.job.id,
@@ -560,9 +742,9 @@ export const TelegramDurableExecutorLive: Layer.Layer<
             true,
           )
           yield* sendText(
-            payload.chatId,
+            payload.controllerRoute.chatId,
             "The initial status message may have been created before tracking stopped. The run was not started again.",
-            payload.threadId,
+            payload.controllerRoute.threadId,
           )
           return
         }
@@ -579,9 +761,9 @@ export const TelegramDurableExecutorLive: Layer.Layer<
             true,
           )
           yield* sendText(
-            payload.chatId,
+            payload.controllerRoute.chatId,
             "The bot restarted while OpenCode prompt acceptance was uncertain. The prompt was not submitted again.",
-            payload.threadId,
+            payload.controllerRoute.threadId,
           )
           return
         }
@@ -615,9 +797,9 @@ export const TelegramDurableExecutorLive: Layer.Layer<
               true,
             )
             yield* sendText(
-              payload.chatId,
+              payload.controllerRoute.chatId,
               "The previous run ended while the bot was unavailable. Its final response could not be recovered.",
-              payload.threadId,
+              payload.controllerRoute.threadId,
             )
             return
           }
@@ -636,13 +818,13 @@ export const TelegramDurableExecutorLive: Layer.Layer<
                 Effect.map(Option.some),
                 Effect.catchTags({
                 FileValidationError: (error: FileValidationError) =>
-                  sendText(payload.chatId, `Error: ${error.message}`, payload.threadId).pipe(
+                  sendText(payload.controllerRoute.chatId, `Error: ${error.message}`, payload.controllerRoute.threadId).pipe(
                     Effect.andThen(jobs.fail(lease.job.id, lease.generation, error.message)),
                     Effect.as(Option.none()),
                   ),
                 AttachmentDownloadError: (error: AttachmentDownloadError) => error.transient
                   ? Effect.fail(error)
-                  : sendText(payload.chatId, `Error: ${error.message}`, payload.threadId).pipe(
+                  : sendText(payload.controllerRoute.chatId, `Error: ${error.message}`, payload.controllerRoute.threadId).pipe(
                       Effect.andThen(jobs.fail(lease.job.id, lease.generation, error.message)),
                       Effect.as(Option.none()),
                     ),
@@ -651,17 +833,20 @@ export const TelegramDurableExecutorLive: Layer.Layer<
         }
         if (Option.isNone(filesOption)) return
         const files = filesOption.value
+        const deliveryApi = yield* botPool.getClient(payload.runDeliveryRoute.botKey)
         yield* runPrompt({
-          chatId: payload.chatId,
           sessionID: payload.sessionID,
           text: payload.text,
           files,
-          threadId: payload.threadId,
+          controllerRoute: payload.controllerRoute,
+          runDeliveryRoute: payload.runDeliveryRoute,
           model: payload.model,
           agent: payload.agent,
+          verbosity: payload.verbosity ?? DEFAULT_STREAM_VERBOSITY,
           reconnect,
           inputID: lease.job.inputID,
           progressMessageID: lease.job.progressMessageID,
+          deliveryApi,
           onProgressDispatching: () => jobs.beginProgressDelivery(lease.job.id, lease.generation),
           onProgressRejected: () => jobs.fail(
             lease.job.id,
@@ -692,6 +877,9 @@ export const TelegramDurableExecutorLive: Layer.Layer<
         Effect.catchCause((cause) => {
           if (Cause.hasInterruptsOnly(cause)) return jobs.release(lease.job.id, lease.generation).pipe(Effect.catchCause(() => Effect.void))
           const leaseLost = Cause.findErrorOption(cause).pipe(Option.exists((error) => error instanceof DurableLeaseLost))
+          const deliveryUnavailable = Cause.findErrorOption(cause).pipe(
+            Option.exists((error) => error instanceof DeliveryBotUnavailable),
+          )
           return logBoundary("telegram/executor", "durable-job", leaseLost ? "durable job lease lost" : "durable job failed")(cause).pipe(
             Effect.andThen(leaseLost
               ? Effect.void
@@ -700,6 +888,14 @@ export const TelegramDurableExecutorLive: Layer.Layer<
                     onNone: () => Effect.void,
                     onSome: (current) => {
                       const delay = Math.min(60_000, 1_000 * 2 ** Math.min(current.attempt, 6))
+                      if (deliveryUnavailable && RUN_PIPELINE_STATES.includes(current.state)) {
+                        return jobs.defer(
+                          lease.job.id,
+                          lease.generation,
+                          "assigned Telegram delivery bot is unavailable",
+                          delay,
+                        )
+                      }
                       if (current.state === "finalizing") {
                         return jobs.defer(lease.job.id, lease.generation, Cause.pretty(cause), delay)
                       }
@@ -712,7 +908,9 @@ export const TelegramDurableExecutorLive: Layer.Layer<
                             true,
                           )
                         }
-                        if (agentSwitchRetriesExhausted(cause, current.attempt)) {
+                        const agentUnavailable = agentSwitchRetriesExhausted(cause, current.attempt)
+                        const modelUnavailable = modelSwitchRetriesExhausted(cause, current.attempt)
+                        if (agentUnavailable || modelUnavailable) {
                           return jobs.fail(
                             lease.job.id,
                             lease.generation,
@@ -720,9 +918,11 @@ export const TelegramDurableExecutorLive: Layer.Layer<
                           ).pipe(Effect.andThen(
                             decodePayload(lease.job).pipe(
                               Effect.flatMap((payload) => sendText(
-                                payload.chatId,
-                                "The selected agent is unavailable. The prompt was not run.",
-                                payload.threadId,
+                                payload.controllerRoute.chatId,
+                                agentUnavailable
+                                  ? "The selected agent is unavailable. The prompt was not run."
+                                  : "The selected model is unavailable. The prompt was not run.",
+                                payload.controllerRoute.threadId,
                               )),
                               Effect.catchCause((notificationCause) =>
                                 logBoundary("telegram/executor", "telegram-notification", "agent failure notification failed")(notificationCause)
@@ -737,9 +937,9 @@ export const TelegramDurableExecutorLive: Layer.Layer<
                       return failed.pipe(Effect.andThen(
                         decodePayload(lease.job).pipe(
                           Effect.flatMap((payload) => sendText(
-                            payload.chatId,
+                            payload.controllerRoute.chatId,
                             "Run tracking stopped after an uncertain external operation. The prompt was not submitted again.",
-                            payload.threadId,
+                            payload.controllerRoute.threadId,
                           )),
                           Effect.catchCause((notificationCause) => logBoundary("telegram/executor", "telegram-notification", "uncertain run notification failed")(notificationCause)),
                         ),
@@ -776,7 +976,17 @@ export const TelegramDurableExecutorLive: Layer.Layer<
       resetConversation: (chatId, threadId) => Effect.gen(function* () {
         const conversation = conversationId({ chatId, threadId })
         const lock = yield* conversationLockFor(conversation)
-        return yield* resetConversationUsing(lock, store, sessions, jobs, conversation)
+        const result = yield* resetConversationUsing(lock, store, sessions, jobs, conversation)
+        if (result === "reset") {
+          yield* deliveryAssignments.clear(conversation).pipe(
+            Effect.catchCause((cause) => logBoundary(
+              "telegram/executor",
+              "delivery-assignment",
+              "clear assignment after session reset failed",
+            )(cause)),
+          )
+        }
+        return result
       }),
       submit: (chatId: number, message: Message, text: string, agent?: string) => Effect.gen(function* () {
         const attachments = yield* collectAttachments(message).pipe(
@@ -797,30 +1007,58 @@ export const TelegramDurableExecutorLive: Layer.Layer<
         const lock = yield* conversationLockFor(conversation)
         yield* lock.withPermit(Effect.gen(function* () {
           const sessionID = yield* sessions.getOrCreate(conversation)
-          const directory = yield* sessions.directoryFor(conversation)
-          const model = yield* store.getModel(directory).pipe(Effect.map(Option.getOrUndefined))
-          const payload: TelegramJobPayload = {
-            chatId,
-            message,
-            text,
-            sessionID,
-            directory,
-            attachments: encodeAttachmentSnapshots(attachments.value),
-          }
-          if (message.message_thread_id !== undefined) Object.assign(payload, { threadId: message.message_thread_id })
-          if (model !== undefined) Object.assign(payload, { model })
-          if (agent !== undefined) Object.assign(payload, { agent })
-          const submitted = yield* jobs.submit({
-            sourceKey: `telegram:${conversation}:${message.message_id}`,
-            channel: "telegram",
-            owner: ownerFor(sessionID),
-            payload: JSON.stringify(payload),
-            sessionID,
-          })
-          if (!submitted.created) return
-          const ownerJobs = yield* jobs.listOwner("telegram", ownerFor(sessionID))
+          const owner = ownerFor(sessionID)
+          const sourceKey = `telegram:${conversation}:${message.message_id}`
+          const submitted = yield* whenSubmissionSourceMissingUsing(
+            jobs,
+            "telegram",
+            owner,
+            sourceKey,
+            Effect.gen(function* () {
+              const directory = yield* sessions.directoryFor(conversation)
+              const ownership = yield* resolveDeliveryOwnership(
+                conversation,
+                sessionID,
+                chatId,
+                message.message_thread_id,
+              )
+              return yield* selections.withSession(sessionID, Effect.gen(function* () {
+                const selection = yield* resolveRunSelectionUsing(store, opencode, {
+                  sessionID,
+                  directory,
+                  agent,
+                })
+                const verbosity = yield* store.getStreamVerbosity(conversation)
+                const payload: TelegramJobPayload = {
+                  chatId,
+                  message,
+                  text,
+                  sessionID,
+                  directory,
+                  conversationId: conversation,
+                  controllerRoute: controllerRoute({ chatId, threadId: message.message_thread_id }),
+                  runDeliveryRoute: ownership.route,
+                  assignmentGeneration: ownership.generation,
+                  attachments: encodeAttachmentSnapshots(attachments.value),
+                  ...runSnapshotFields(selection, verbosity),
+                }
+                if (message.message_thread_id !== undefined) {
+                  Object.assign(payload, { threadId: message.message_thread_id })
+                }
+                return yield* jobs.submit({
+                  sourceKey,
+                  channel: "telegram",
+                  owner,
+                  payload: JSON.stringify(payload),
+                  sessionID,
+                })
+              }))
+            }),
+          )
+          if (Option.isNone(submitted) || !submitted.value.created) return
+          const ownerJobs = yield* jobs.listOwner("telegram", owner)
           const waitingBehindAnother = ownerJobs.some((job) =>
-            job.id !== submitted.job.id && RUN_PIPELINE_STATES.includes(job.state))
+            job.id !== submitted.value.job.id && RUN_PIPELINE_STATES.includes(job.state))
           if (waitingBehindAnother) {
             yield* sendText(chatId, "Queued. It runs when the current task finishes.", message.message_thread_id)
           }
@@ -846,15 +1084,22 @@ export const TelegramDurableExecutorLive: Layer.Layer<
             return
           }
            const route = { chatId, threadId }
+           const verbosity = yield* store.getStreamVerbosity(conversation)
+           const ownership = yield* resolveDeliveryOwnership(conversation, sessionID.value, chatId, threadId)
            const payload: TelegramJobPayload = {
             chatId,
             threadId,
             message,
             text: "",
             sessionID: sessionID.value,
-            directory,
-            reconnect: true,
-          }
+              directory,
+              conversationId: conversation,
+              controllerRoute: controllerRoute(route),
+              runDeliveryRoute: ownership.route,
+              assignmentGeneration: ownership.generation,
+              reconnect: true,
+             verbosity,
+           }
            const submitted = yield* submitForCurrentConversation(conversation, sessionID.value, {
              sourceKey: `telegram:${conversation}:${message.message_id}`,
              channel: "telegram",
@@ -909,12 +1154,7 @@ export const TelegramDurableExecutorLive: Layer.Layer<
         }
         const replacement = yield* decodePayload(activeJob).pipe(
           Effect.mapError((cause) => new DurableExecutorError({ operation: "decode force reconnect payload", cause })),
-          Effect.map((payload) => JSON.stringify({
-            ...payload,
-            chatId,
-            ...(threadId === undefined ? { threadId: undefined } : { threadId }),
-            message,
-          })),
+          Effect.map((payload) => JSON.stringify(forceReconnectPayload(payload, route))),
         )
         const lease = yield* jobs.forceClaim("telegram", owner, replacement)
         yield* Option.match(lease, {

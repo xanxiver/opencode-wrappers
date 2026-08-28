@@ -1,7 +1,9 @@
 import { describe, expect, test } from "bun:test"
-import { Cause, Effect, Option, Ref, Semaphore } from "effect"
+import { Cause, Effect, Option, Ref, Schema, Semaphore } from "effect"
 import { TestClock } from "effect/testing"
 import { BunCrypto, BunFileSystem, BunPath } from "@effect/platform-bun"
+import { Session } from "@opencode-ai/client/effect"
+import * as Agent from "@opencode-ai/schema/agent"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { AppConfig, AppConfigTag } from "../src/config.js"
@@ -17,9 +19,9 @@ import {
 } from "../src/core/durable-executor.js"
 import { GitChangesError, type ChangesSummaryResult, type GitChangesService } from "../src/core/git-changes.js"
 import type { SessionsError } from "../src/core/sessions.js"
-import { AUTO_CONTINUE_BASE_DELAY_MS, AUTO_CONTINUE_MAX_DELAY_MS, agentSwitchRetriesExhausted, decideAutoContinue, decodeAttachmentSnapshots, encodeAttachmentSnapshots, autoContinueDelayMs, finalEditDisposition, finishNotificationWord, hasRunPipeline, redactedReviewEvidence, resetConversationUsing, resolveOwnedDurableReview, runQueueItems, settleFinalEditError, submitForCurrentConversationUsing, withChangesSummaryUsing } from "../src/telegram/durable-executor.js"
+import { AUTO_CONTINUE_BASE_DELAY_MS, AUTO_CONTINUE_MAX_DELAY_MS, agentSwitchRetriesExhausted, decideAutoContinue, decodeAttachmentSnapshots, encodeAttachmentSnapshots, autoContinueDelayMs, finalEditDisposition, finishNotificationWord, forceReconnectPayload, hasRunPipeline, modelSwitchRetriesExhausted, normalizeTelegramJobPayload, redactedReviewEvidence, resetConversationUsing, resolveOwnedDurableReview, resolveRunSelectionUsing, runQueueItems, runSelectionFields, runSnapshotFields, settleFinalEditError, submitForCurrentConversationUsing, whenSubmissionSourceMissingUsing, withChangesSummaryUsing } from "../src/telegram/durable-executor.js"
 import { ApiError } from "../src/telegram/api.js"
-import { AgentSwitchError } from "../src/telegram/run.js"
+import { AgentSwitchError, ModelSwitchError } from "../src/telegram/run.js"
 
 const config = () => new AppConfig({
   telegramBotToken: "test-token",
@@ -58,6 +60,64 @@ const submit = (store: DurableExecutorRepository, sourceKey: string, owner = "1"
   })
 
 describe("DurableExecutorStore", () => {
+  test("normalizes legacy Telegram payloads to controller-owned routes", () => {
+    const payload = normalizeTelegramJobPayload({
+      chatId: -100,
+      threadId: 42,
+      message: { message_id: 7, chat: { id: -100 }, message_thread_id: 42 },
+      text: "legacy task",
+      sessionID: "ses_legacy",
+      directory: "/tmp/project",
+    })
+
+    expect(payload.conversationId).toBe("tg:-100:thread:42")
+    expect(payload.controllerRoute).toEqual({ botKey: "controller", chatId: -100, threadId: 42 })
+    expect(payload.runDeliveryRoute).toEqual({ botKey: "controller", chatId: -100, threadId: 42 })
+    expect(payload.assignmentGeneration).toBe(0)
+  })
+
+  test("preserves explicit worker ownership in new Telegram payloads", () => {
+    const payload = normalizeTelegramJobPayload({
+      chatId: -100,
+      threadId: 42,
+      conversationId: "tg:-100:thread:42",
+      controllerRoute: { botKey: "controller", chatId: -100, threadId: 42 },
+      runDeliveryRoute: { botKey: "delivery-4", chatId: -100, threadId: 42 },
+      assignmentGeneration: 7,
+      message: { message_id: 8, chat: { id: -100 }, message_thread_id: 42 },
+      text: "new task",
+      sessionID: "ses_new",
+      directory: "/tmp/project",
+    })
+
+    expect(payload.runDeliveryRoute.botKey).toBe("delivery-4")
+    expect(payload.assignmentGeneration).toBe(7)
+  })
+
+  test("force reconnect reroutes controller interactions but preserves the run anchor route", () => {
+    const original = normalizeTelegramJobPayload({
+      chatId: -100,
+      threadId: 42,
+      conversationId: "tg:-100:thread:42",
+      controllerRoute: { botKey: "controller", chatId: -100, threadId: 42 },
+      runDeliveryRoute: { botKey: "delivery-4", chatId: -100, threadId: 42 },
+      assignmentGeneration: 7,
+      message: { message_id: 8, chat: { id: -100 }, message_thread_id: 42 },
+      text: "task",
+      sessionID: "ses_shared",
+      directory: "/tmp/project",
+    })
+
+    const reconnected = forceReconnectPayload(original, { chatId: -200, threadId: 99 })
+
+    expect(reconnected.controllerRoute).toEqual({ botKey: "controller", chatId: -200, threadId: 99 })
+    expect(reconnected.runDeliveryRoute).toEqual(original.runDeliveryRoute)
+    expect(reconnected.conversationId).toBe("tg:-100:thread:42")
+    expect(reconnected.chatId).toBe(-100)
+    expect(reconnected.threadId).toBe(42)
+    expect(reconnected.message).toEqual(original.message)
+  })
+
   test("detects every executable run-pipeline state", () => {
     expect(hasRunPipeline([{ state: "pending" }])).toBe(true)
     expect(hasRunPipeline([{ state: "dispatching" }])).toBe(true)
@@ -209,6 +269,40 @@ describe("DurableExecutorStore", () => {
     expect(result.first.created).toBe(true)
     expect(result.second.created).toBe(false)
     expect(result.second.job.id).toBe(result.first.job.id)
+  })
+
+  test("lists only non-terminal jobs for one channel", async () => {
+    const states = await run(Effect.gen(function* () {
+      const store = yield* DurableExecutorStore
+      yield* submit(store, "terminal", "terminal-owner")
+      yield* submit(store, "active", "active-owner")
+      const terminal = yield* store.claimNext("telegram")
+      if (Option.isSome(terminal)) yield* store.complete(terminal.value.job.id, terminal.value.generation)
+      return (yield* store.listNonTerminal("telegram")).map((job) => ({ sourceKey: job.sourceKey, state: job.state }))
+    }))
+
+    expect(states).toEqual([{ sourceKey: "active", state: "pending" }])
+  })
+
+  test("a duplicate replay skips snapshot resolution before idempotent submit", async () => {
+    const result = await run(Effect.gen(function* () {
+      const store = yield* DurableExecutorStore
+      const sourceKey = "telegram:tg:7:thread:42:10"
+      const owner = "session:ses_1"
+      yield* submit(store, sourceKey, owner)
+      const resolutions = yield* Ref.make(0)
+      const replay = yield* whenSubmissionSourceMissingUsing(
+        store,
+        "telegram",
+        owner,
+        sourceKey,
+        Ref.update(resolutions, (count) => count + 1).pipe(Effect.as("resolved")),
+      )
+      return { replay, resolutions: yield* Ref.get(resolutions) }
+    }))
+
+    expect(result.replay).toEqual(Option.none())
+    expect(result.resolutions).toBe(0)
   })
 
   test("moves pending jobs by one-based queue position", async () => {
@@ -622,7 +716,7 @@ describe("runQueueItems", () => {
     expect(items.map((item) => item.id)).toEqual(["j-running", "j-pending", "j-finalizing"])
   })
 
-  test("decodes the prompt text from the job payload", async () => {
+  test("decodes an old payload without agent or model snapshots", async () => {
     const items = await Effect.runPromise(runQueueItems([
       job({ id: "j1", state: "pending", payload: payload("Add a /diff command") }),
     ]))
@@ -634,6 +728,203 @@ describe("runQueueItems", () => {
       job({ id: "j1", state: "pending", payload: "not a telegram payload" }),
     ]))
     expect(items[0]?.text).toBe("")
+  })
+})
+
+describe("resolveRunSelectionUsing", () => {
+  const session = (input: {
+    readonly id: string
+    readonly agent?: string
+    readonly model?: { readonly id: string; readonly providerID: string; readonly variant?: string }
+  }) => {
+    const base = {
+      id: input.id,
+      projectID: "project",
+      location: { directory: "/tmp/project" },
+      cost: 0,
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      time: { created: 1, updated: 1 },
+    }
+    const withAgent = input.agent === undefined ? base : { ...base, agent: input.agent }
+    const withModel = input.model === undefined ? withAgent : { ...withAgent, model: input.model }
+    return Schema.decodeUnknownSync(Session.Info)(withModel)
+  }
+
+  const configuredAgent = Schema.decodeUnknownSync(Agent.Info)({
+    ...Agent.Info.default(Agent.ID.make("build")),
+    name: "Build",
+    model: { id: "configured", providerID: "provider" },
+  })
+
+  test("snapshots the active session agent and its pair model", async () => {
+    const selection = await Effect.runPromise(resolveRunSelectionUsing(
+      {
+        getSessionAgentModel: (_sessionID, agentID) => Effect.succeed(
+          agentID === "build"
+            ? Option.some({ id: "pair", providerID: "provider", variant: "high" })
+            : Option.none(),
+        ),
+        getDirectoryModelFallback: () => Effect.succeed(
+          Option.some({ id: "directory", providerID: "provider" }),
+        ),
+      },
+      {
+        getSession: () => Effect.succeed(session({
+          id: "ses_1",
+          agent: "build",
+          model: { id: "session", providerID: "provider" },
+        })),
+        listAgents: () => Effect.succeed([configuredAgent]),
+      },
+      { sessionID: "ses_1", directory: "/tmp/project" },
+    ))
+
+    expect(selection).toEqual({
+      agent: "build",
+      model: { id: "pair", providerID: "provider", variant: "high" },
+    })
+  })
+
+  test("uses an explicit prompt agent instead of the active session agent", async () => {
+    const selection = await Effect.runPromise(resolveRunSelectionUsing(
+      {
+        getSessionAgentModel: (_sessionID, agentID) => Effect.succeed(
+          agentID === "plan"
+            ? Option.some({ id: "plan-model", providerID: "provider" })
+            : Option.some({ id: "build-model", providerID: "provider" }),
+        ),
+        getDirectoryModelFallback: () => Effect.succeed(Option.none()),
+      },
+      {
+        getSession: () => Effect.succeed(session({ id: "ses_1", agent: "build" })),
+        listAgents: () => Effect.succeed([]),
+      },
+      { sessionID: "ses_1", directory: "/tmp/project", agent: "plan" },
+    ))
+
+    expect(selection).toEqual({
+      agent: "plan",
+      model: { id: "plan-model", providerID: "provider" },
+    })
+  })
+
+  test("uses the configured agent model before session and directory fallbacks", async () => {
+    const selection = await Effect.runPromise(resolveRunSelectionUsing(
+      {
+        getSessionAgentModel: () => Effect.succeed(Option.none()),
+        getDirectoryModelFallback: () => Effect.succeed(
+          Option.some({ id: "directory", providerID: "provider" }),
+        ),
+      },
+      {
+        getSession: () => Effect.succeed(session({
+          id: "ses_1",
+          agent: "build",
+          model: { id: "session", providerID: "provider" },
+        })),
+        listAgents: () => Effect.succeed([configuredAgent]),
+      },
+      { sessionID: "ses_1", directory: "/tmp/project" },
+    ))
+
+    expect(selection).toEqual({
+      agent: "build",
+      model: { id: "configured", providerID: "provider" },
+    })
+  })
+
+  test("uses the session model without inventing an agent", async () => {
+    const selection = await Effect.runPromise(resolveRunSelectionUsing(
+      {
+        getSessionAgentModel: () => Effect.succeed(Option.none()),
+        getDirectoryModelFallback: () => Effect.succeed(
+          Option.some({ id: "directory", providerID: "provider" }),
+        ),
+      },
+      {
+        getSession: () => Effect.succeed(session({
+          id: "ses_1",
+          model: { id: "session", providerID: "provider" },
+        })),
+        listAgents: () => Effect.die("listAgents must not run without an agent"),
+      },
+      { sessionID: "ses_1", directory: "/tmp/project" },
+    ))
+
+    expect(selection).toEqual({
+      model: { id: "session", providerID: "provider" },
+    })
+  })
+
+  test("keeps an accepted queued snapshot after the stored preference changes", async () => {
+    const preference = await Effect.runPromise(Ref.make({ id: "first", providerID: "provider" }))
+    const store = {
+      getSessionAgentModel: () => Ref.get(preference).pipe(Effect.map(Option.some)),
+      getDirectoryModelFallback: () => Effect.succeed(Option.none()),
+    }
+    const opencode = {
+      getSession: () => Effect.succeed(session({ id: "ses_1", agent: "build" })),
+      listAgents: () => Effect.succeed([]),
+    }
+    const first = await Effect.runPromise(resolveRunSelectionUsing(
+      store,
+      opencode,
+      { sessionID: "ses_1", directory: "/tmp/project" },
+    ))
+    const acceptedPayload = JSON.stringify({ selection: first })
+    await Effect.runPromise(Ref.set(preference, { id: "second", providerID: "provider" }))
+    const second = await Effect.runPromise(resolveRunSelectionUsing(
+      store,
+      opencode,
+      { sessionID: "ses_1", directory: "/tmp/project" },
+    ))
+
+    expect(JSON.parse(acceptedPayload)).toEqual({
+      selection: {
+        agent: "build",
+        model: { id: "first", providerID: "provider" },
+      },
+    })
+    expect(second.model?.id).toBe("second")
+  })
+})
+
+describe("runSelectionFields", () => {
+  test("copies the original agent and model into an auto-continue payload", () => {
+    const selection = runSelectionFields({
+      agent: "build",
+      model: { id: "accepted-model", providerID: "provider", variant: "high" },
+    })
+    const nextPayload = { text: "continue", ...selection }
+
+    expect(nextPayload).toEqual({
+      text: "continue",
+      agent: "build",
+      model: { id: "accepted-model", providerID: "provider", variant: "high" },
+    })
+  })
+
+  test("keeps old payload snapshots optional", () => {
+    expect(runSelectionFields({})).toEqual({})
+  })
+})
+
+describe("runSnapshotFields", () => {
+  test("keeps stream verbosity with the agent and model in follow-up jobs", () => {
+    const snapshot = runSnapshotFields({
+      agent: "build",
+      model: { id: "accepted-model", providerID: "provider" },
+    }, "detailed")
+
+    expect(snapshot).toEqual({
+      agent: "build",
+      model: { id: "accepted-model", providerID: "provider" },
+      verbosity: "detailed",
+    })
+  })
+
+  test("defaults jobs accepted before verbosity snapshots to normal", () => {
+    expect(runSnapshotFields({}, undefined)).toEqual({ verbosity: "normal" })
   })
 })
 
@@ -650,6 +941,22 @@ describe("agent switch retries", () => {
 
   test("does not classify unrelated pending failures as agent exhaustion", () => {
     expect(agentSwitchRetriesExhausted(Cause.fail(new Error("network")), 3)).toBe(false)
+  })
+})
+
+describe("model switch retries", () => {
+  const failure = Cause.fail(new ModelSwitchError({
+    model: { id: "removed-model", providerID: "provider" },
+    cause: Cause.fail(new Error("not found")),
+  }))
+
+  test("allows bounded retries before failing the queued job", () => {
+    expect(modelSwitchRetriesExhausted(failure, 2)).toBe(false)
+    expect(modelSwitchRetriesExhausted(failure, 3)).toBe(true)
+  })
+
+  test("does not classify unrelated pending failures as model exhaustion", () => {
+    expect(modelSwitchRetriesExhausted(Cause.fail(new Error("network")), 3)).toBe(false)
   })
 })
 

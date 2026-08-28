@@ -1,6 +1,12 @@
 import { describe, expect, test } from "bun:test"
 import { Effect, Option } from "effect"
-import { Live, ModelRegistry, type ModelEntry, type PageModel } from "../src/telegram/models.js"
+import {
+  Live,
+  ModelRegistry,
+  resolveEffectiveModel,
+  type ModelEntry,
+  type PageModel,
+} from "../src/telegram/models.js"
 
 const run = <A>(effect: Effect.Effect<A, never, never>) =>
   Effect.runPromise(effect.pipe(Effect.provide(Live)))
@@ -17,6 +23,7 @@ describe("ModelRegistry", () => {
         const registry = yield* ModelRegistry
         const token = yield* registry.registerPage({
           sessionID: "ses_1",
+          agentID: "build",
           directory: "/project",
           models,
           page: 0,
@@ -46,7 +53,7 @@ describe("ModelRegistry", () => {
       Effect.gen(function* () {
         const registry = yield* ModelRegistry
         const token = yield* registry.registerPage({
-          sessionID: "s", directory: "/project", models, page: 0, total: 2, chatId: 1,
+          sessionID: "s", agentID: "build", directory: "/project", models, page: 0, total: 2, chatId: 1,
         })
         yield* registry.take(token, 1, 0)
         return yield* registry.take(token, 1, 0)
@@ -60,7 +67,7 @@ describe("ModelRegistry", () => {
       Effect.gen(function* () {
         const registry = yield* ModelRegistry
         const token = yield* registry.registerPage({
-          sessionID: "s", directory: "/project", models, page: 0, total: 2, chatId: 1,
+          sessionID: "s", agentID: "build", directory: "/project", models, page: 0, total: 2, chatId: 1,
         })
         yield* registry.attachMessageId(token, 99)
         const entry = yield* registry.take(token, 1, 99)
@@ -75,7 +82,7 @@ describe("ModelRegistry", () => {
       Effect.gen(function* () {
         const registry = yield* ModelRegistry
         const token = yield* registry.registerVariant({
-          sessionID: "s", directory: "/project", providerID: "p", modelID: "m", variants: ["v1", "v2"], chatId: 1, messageId: 5,
+          sessionID: "s", agentID: "build", directory: "/project", providerID: "p", modelID: "m", variants: ["v1", "v2"], chatId: 1, messageId: 5,
         })
         return yield* registry.take(token, 1, 5)
       }).pipe(Effect.provide(Live)),
@@ -96,10 +103,10 @@ describe("ModelRegistry", () => {
       Effect.gen(function* () {
         const registry = yield* ModelRegistry
         const t1 = yield* registry.registerPage({
-          sessionID: "s", directory: "/project", models, page: 0, total: 2, chatId: 1,
+          sessionID: "s", agentID: "build", directory: "/project", models, page: 0, total: 2, chatId: 1,
         })
         const t2 = yield* registry.registerVariant({
-          sessionID: "s", directory: "/project", providerID: "p", modelID: "m", variants: ["v"], chatId: 1, messageId: 5,
+          sessionID: "s", agentID: "build", directory: "/project", providerID: "p", modelID: "m", variants: ["v"], chatId: 1, messageId: 5,
         })
         return [t1, t2] as const
       }).pipe(Effect.provide(Live)),
@@ -112,7 +119,7 @@ describe("ModelRegistry", () => {
       Effect.gen(function* () {
         const registry = yield* ModelRegistry
         const token = yield* registry.registerPage({
-          sessionID: "s", directory: "/project", models, page: 0, total: 2, chatId: 1,
+          sessionID: "s", agentID: "build", directory: "/project", models, page: 0, total: 2, chatId: 1,
         })
         yield* registry.attachMessageId(token, 10)
         const stale = yield* registry.take(token, 1, 9)
@@ -129,10 +136,10 @@ describe("ModelRegistry", () => {
       Effect.gen(function* () {
         const registry = yield* ModelRegistry
         const page = yield* registry.registerPage({
-          sessionID: "s", directory: "/project", models, page: 0, total: 2, chatId: 1,
+          sessionID: "s", agentID: "build", directory: "/project", models, page: 0, total: 2, chatId: 1,
         })
         const variant = yield* registry.registerVariant({
-          sessionID: "s", directory: "/project", providerID: "p", modelID: "m", variants: ["v"], chatId: 1, messageId: 10,
+          sessionID: "s", agentID: "build", directory: "/project", providerID: "p", modelID: "m", variants: ["v"], chatId: 1, messageId: 10,
         })
         yield* registry.attachMessageId(page, 10)
         const cancelled = yield* registry.cancel(page, 1, 10)
@@ -142,5 +149,31 @@ describe("ModelRegistry", () => {
     )
     expect(Option.isSome(result.cancelled)).toBe(true)
     expect(Option.isNone(result.remaining)).toBe(true)
+  })
+})
+
+describe("resolveEffectiveModel", () => {
+  const sessionAgent = { id: "pair", providerID: "provider" }
+  const agentConfig = { id: "configured", providerID: "provider" }
+  const session = { id: "session", providerID: "provider" }
+  const directory = { id: "directory", providerID: "provider" }
+
+  test("uses the session-agent preference first", () => {
+    expect(resolveEffectiveModel({ sessionAgent, agentConfig, session, directory })).toEqual(
+      Option.some({ model: sessionAgent, source: "session-agent" }),
+    )
+  })
+
+  test("falls back through agent config, session, and directory", () => {
+    expect(resolveEffectiveModel({ agentConfig, session, directory })).toEqual(
+      Option.some({ model: agentConfig, source: "agent-config" }),
+    )
+    expect(resolveEffectiveModel({ session, directory })).toEqual(
+      Option.some({ model: session, source: "session" }),
+    )
+    expect(resolveEffectiveModel({ directory })).toEqual(
+      Option.some({ model: directory, source: "directory" }),
+    )
+    expect(resolveEffectiveModel({})).toEqual(Option.none())
   })
 })

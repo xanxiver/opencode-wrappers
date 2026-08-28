@@ -7,6 +7,55 @@ export class ConfigError extends Data.TaggedError("ConfigError")<{
   readonly cause?: unknown
 }> {}
 
+export const TELEGRAM_CONTROLLER_BOT_KEY = "controller"
+
+export class TelegramBotMemberConfig extends Schema.Class<TelegramBotMemberConfig>("TelegramBotMemberConfig")({
+  id: Schema.NonEmptyString,
+  token: Schema.NonEmptyString,
+}) {}
+
+const TelegramBotPoolSchema = Schema.Array(TelegramBotMemberConfig)
+const TELEGRAM_BOT_KEY_PATTERN = /^[a-z][a-z0-9-]{0,31}$/
+type JsonValue = ReturnType<typeof JSON.parse>
+
+/** Decode the optional outbound delivery pool without retaining secrets in failures. */
+export const parseTelegramBotPool = (
+  value: string | undefined,
+  controllerToken?: string,
+): Effect.Effect<readonly TelegramBotMemberConfig[], ConfigError> => Effect.gen(function* () {
+  if (value === undefined || value.trim() === "") return []
+  const parsed = yield* Effect.try({
+    try: (): JsonValue => JSON.parse(value),
+    catch: () => new ConfigError({ message: "TELEGRAM_BOT_POOL must be valid JSON" }),
+  })
+  const members = yield* Schema.decodeUnknownEffect(TelegramBotPoolSchema)(parsed).pipe(
+    Effect.mapError(() => new ConfigError({
+      message: "TELEGRAM_BOT_POOL must be an array of non-empty id and token entries",
+    })),
+  )
+  const ids = new Set<string>()
+  const tokens = new Set<string>()
+  for (const member of members) {
+    if (!TELEGRAM_BOT_KEY_PATTERN.test(member.id)) {
+      return yield* new ConfigError({
+        message: "TELEGRAM_BOT_POOL ids must start with a letter and contain only lowercase letters, numbers, or hyphens",
+      })
+    }
+    if (member.id === TELEGRAM_CONTROLLER_BOT_KEY) {
+      return yield* new ConfigError({ message: `TELEGRAM_BOT_POOL id ${TELEGRAM_CONTROLLER_BOT_KEY} is reserved` })
+    }
+    if (ids.has(member.id)) {
+      return yield* new ConfigError({ message: "TELEGRAM_BOT_POOL contains a duplicate id" })
+    }
+    if (tokens.has(member.token) || member.token === controllerToken) {
+      return yield* new ConfigError({ message: "TELEGRAM_BOT_POOL contains a duplicate token" })
+    }
+    ids.add(member.id)
+    tokens.add(member.token)
+  }
+  return members
+})
+
 /** Expand a leading `~` and absolutize a path. */
 export const expandHome = (value: string): string =>
   value.startsWith("~/") ? resolve(homedir(), value.slice(2)) : resolve(value)
@@ -28,6 +77,7 @@ const expandOptionalPath = (value: string | undefined): string | undefined => {
 
 export class AppConfig extends Schema.Class<AppConfig>("AppConfig")({
   telegramBotToken: Schema.optional(Schema.NonEmptyString),
+  telegramBotPool: Schema.optional(TelegramBotPoolSchema),
   opencodeBaseUrl: Schema.optional(Schema.String),
   opencodeUsername: Schema.optional(Schema.String),
   opencodePassword: Schema.optional(Schema.String),
@@ -77,6 +127,7 @@ export const AppConfigTag: Context.Service<AppConfig, AppConfig> = Context.Servi
 
 const raw = Config.all({
   telegramBotToken: Config.option(Config.string("TELEGRAM_BOT_TOKEN")),
+  telegramBotPoolJson: Config.option(Config.string("TELEGRAM_BOT_POOL")),
   opencodeBaseUrl: Config.option(Config.string("OPENCODE_BASE_URL")),
   opencodeUsername: Config.option(Config.string("OPENCODE_USERNAME")),
   opencodePassword: Config.option(Config.string("OPENCODE_PASSWORD")),
@@ -104,6 +155,7 @@ export const Live: Layer.Layer<AppConfig, ConfigError> = Layer.effect(
     Effect.map((env) => ({
       ...env,
        telegramBotToken: emptyToUndefined(Option.getOrUndefined(env.telegramBotToken)),
+       telegramBotPoolJson: emptyToUndefined(Option.getOrUndefined(env.telegramBotPoolJson)),
        opencodeBaseUrl: emptyToUndefined(Option.getOrUndefined(env.opencodeBaseUrl)),
        opencodeUsername: emptyToUndefined(Option.getOrUndefined(env.opencodeUsername)),
        opencodePassword: emptyToUndefined(Option.getOrUndefined(env.opencodePassword)),
@@ -120,19 +172,21 @@ export const Live: Layer.Layer<AppConfig, ConfigError> = Layer.effect(
         webWorkspaceRoots: emptyToUndefined(Option.getOrUndefined(env.webWorkspaceRoots)),
        webUiPort: Option.getOrUndefined(env.webUiPort),
     })),
-    Effect.flatMap((env) => {
+    Effect.flatMap((env) => Effect.gen(function* () {
       const timeout = env.telegramRunTimeout.trim().toLowerCase()
       const valid = timeout === "none" || Option.isSome(parseRunTimeout(timeout))
-      if (!valid) return Effect.fail(new ConfigError({ message: "TELEGRAM_RUN_TIMEOUT must be a duration or none" }))
+      if (!valid) return yield* new ConfigError({ message: "TELEGRAM_RUN_TIMEOUT must be a duration or none" })
       if (env.webJwtSecret !== undefined && !isStrongWebJwtSecret(env.webJwtSecret)) {
-        return Effect.fail(new ConfigError({ message: "WEB_JWT_SECRET must contain at least 32 bytes" }))
+        return yield* new ConfigError({ message: "WEB_JWT_SECRET must contain at least 32 bytes" })
       }
       if (env.webSecureCookies !== true && !isLoopbackWebHost(env.webHost ?? "127.0.0.1")) {
-        return Effect.fail(new ConfigError({ message: "WEB_SECURE_COOKIES must be true when WEB_HOST is not loopback" }))
+        return yield* new ConfigError({ message: "WEB_SECURE_COOKIES must be true when WEB_HOST is not loopback" })
       }
-      return Schema.decodeUnknownEffect(AppConfig)(env).pipe(
+      const telegramBotPool = yield* parseTelegramBotPool(env.telegramBotPoolJson, env.telegramBotToken)
+      const { telegramBotPoolJson: _, ...appConfig } = env
+      return yield* Schema.decodeUnknownEffect(AppConfig)({ ...appConfig, telegramBotPool }).pipe(
         Effect.mapError((cause) => new ConfigError({ message: "invalid configuration", cause })),
       )
-    }),
+    })),
   ),
 )

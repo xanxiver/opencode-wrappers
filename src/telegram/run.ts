@@ -7,11 +7,20 @@ import { toFileAttachment } from "../core/attachments.js"
 import type { DurableExecutorError, DurableLeaseLost } from "../core/durable-executor.js"
 import { logBoundary } from "../core/logging.js"
 import { OpenCode, questionRequestFromEvent, rootSessionID, type OpenCodeService, type PendingQuestionRequest } from "../core/opencode.js"
-import { isDefinitiveSendRejection, recordDefinitiveSendFailure, TelegramApi, type KeyboardMarkup } from "./api.js"
+import type { StreamVerbosity } from "../core/stream-verbosity.js"
+import {
+  isDefinitiveSendRejection,
+  recordDefinitiveSendFailure,
+  TelegramApi,
+  type KeyboardMarkup,
+  type TelegramDeliveryClient,
+} from "./api.js"
 import { AppConfigTag, parseRunTimeout } from "../config.js"
 import { renderTelegramMermaid } from "./mermaid.js"
 import { PermissionRegistry, type PermissionRegistryService } from "./permissions.js"
 import { QuestionRegistry, type QuestionRegistryService } from "./questions.js"
+import { SessionSelection } from "./session-selection.js"
+import type { TelegramDeliveryRoute } from "./conversation.js"
 import {
   renderFinal,
   renderPermission,
@@ -24,22 +33,27 @@ import {
 } from "./render.js"
 
 export interface RunInput {
-  readonly chatId: number
   readonly sessionID: string
   readonly text?: string
   readonly files: readonly Attachment[]
-  /** Forum topic thread id; all messages of this run go into that thread. */
-  readonly threadId?: number
-  /** The model to (re-)apply before prompting, from the per-directory memory. */
+  /** Controller-owned destination for permissions, questions, and callbacks. */
+  readonly controllerRoute: TelegramDeliveryRoute
+  /** Immutable destination owned by the selected run-delivery bot. */
+  readonly runDeliveryRoute: TelegramDeliveryRoute
+  /** The accepted effective-model snapshot to apply before prompting. */
   readonly model?: { readonly id: string; readonly providerID: string; readonly variant?: string }
   /** The agent to apply immediately before this prompt. */
   readonly agent?: string
+  /** Accepted live-content level for this run. */
+  readonly verbosity: StreamVerbosity
   /** Attach to an already running session instead of starting a new prompt. */
   readonly reconnect?: boolean
   /** Accepted OpenCode input used to select only this run's final response. */
   readonly inputID?: string
   /** Reuse the durable Telegram anchor while recovering a run. */
   readonly progressMessageID?: number
+  /** Explicit token-local client that owns the run anchor and all run output. */
+  readonly deliveryApi: TelegramDeliveryClient
   /** Persist the Telegram anchor before execution continues. */
   readonly onProgressMessage?: (messageID: number) => Effect.Effect<void, DurableExecutorError | DurableLeaseLost>
   /** Fence initial Telegram message creation before crossing the API boundary. */
@@ -56,6 +70,11 @@ export interface RunInput {
 
 export class AgentSwitchError extends Data.TaggedError("AgentSwitchError")<{
   readonly agent: string
+  readonly cause: Cause.Cause<unknown>
+}> {}
+
+export class ModelSwitchError extends Data.TaggedError("ModelSwitchError")<{
+  readonly model: { readonly id: string; readonly providerID: string; readonly variant?: string }
   readonly cause: Cause.Cause<unknown>
 }> {}
 
@@ -81,8 +100,7 @@ interface RunState {
   readonly usage: Option.Option<UsageView>
   readonly lastSent: string
   readonly dirty: boolean
-  /** Group chats omit live reasoning to save message budget for replies. */
-  readonly includeReasoning: boolean
+  readonly verbosity: StreamVerbosity
   readonly media: readonly MediaArtifact[]
   readonly mediaKeys: ReadonlySet<string>
 }
@@ -578,9 +596,9 @@ export const nextProgressEdit = (current: {
   readonly activity: Option.Option<string>
   readonly lastSent: string
   readonly dirty: boolean
-  readonly includeReasoning?: boolean
+  readonly verbosity: StreamVerbosity
 }): Option.Option<string> => {
-  if (!current.dirty) return Option.none()
+  if (!current.dirty || current.verbosity === "quiet") return Option.none()
   const text = truncate(renderProgress({ ...current, text: visibleResponseText(current.text) }))
   return text === current.lastSent ? Option.none() : Option.some(text)
 }
@@ -607,6 +625,35 @@ const logTelegramFailure = (message: string) => (cause: Cause.Cause<unknown>): E
 
 const logOpenCodeFailure = (message: string) => (cause: Cause.Cause<unknown>): Effect.Effect<void> =>
   logBoundary("telegram/run", "opencode-client", message)(cause)
+
+/** Apply one accepted run snapshot in agent-then-model order. */
+export const applyRunSelectionUsing = (
+  opencode: Pick<OpenCodeService, "switchAgent" | "switchModel">,
+  input: Pick<RunInput, "sessionID" | "agent" | "model">,
+) => Effect.gen(function* () {
+  const agent = input.agent
+  if (agent !== undefined) {
+    yield* opencode.switchAgent({
+      sessionID: input.sessionID,
+      agent,
+    }).pipe(Effect.catchCause((cause) =>
+      logOpenCodeFailure("apply agent failed")(cause).pipe(
+        Effect.andThen(Effect.fail(new AgentSwitchError({ agent, cause }))),
+      ),
+    ))
+  }
+  const model = input.model
+  if (model !== undefined) {
+    yield* opencode.switchModel({
+      sessionID: input.sessionID,
+      model,
+    }).pipe(Effect.catchCause((cause) =>
+      logOpenCodeFailure("apply model failed")(cause).pipe(
+        Effect.andThen(Effect.fail(new ModelSwitchError({ model, cause }))),
+      ),
+    ))
+  }
+})
 
 const showActivity = (state: Ref.Ref<RunState>, label: string) =>
   Ref.update(state, (current) => ({ ...current, activity: Option.some(label), dirty: true }))
@@ -944,8 +991,11 @@ const handleEvent = (
 export const runPrompt = (input: RunInput) =>
   Effect.gen(function* () {
     const config = yield* AppConfigTag
-    const api = yield* TelegramApi
+    // TelegramApi remains required below for controller-owned permissions and questions.
+    yield* TelegramApi
+    const api = input.deliveryApi
     const opencode = yield* OpenCode
+    const selections = yield* SessionSelection
     const registry = yield* PermissionRegistry
     const questionRegistry = yield* QuestionRegistry
     const attachments = yield* Effect.forEach(input.files, (attachment) =>
@@ -955,9 +1005,9 @@ export const runPrompt = (input: RunInput) =>
     if (progressMessageID === undefined) {
       if (input.onProgressDispatching !== undefined) yield* input.onProgressDispatching()
       const status = yield* api.sendMessage({
-          chatId: input.chatId,
+          chatId: input.runDeliveryRoute.chatId,
           text: "Working…",
-          messageThreadId: input.threadId,
+          messageThreadId: input.runDeliveryRoute.threadId,
         }).pipe(Effect.catchTag("ApiError", (error) =>
           isDefinitiveSendRejection(error) && input.onProgressRejected !== undefined
             ? input.onProgressRejected().pipe(Effect.andThen(Effect.fail(error)))
@@ -973,13 +1023,12 @@ export const runPrompt = (input: RunInput) =>
       usage: Option.none(),
       lastSent: "Working…",
       dirty: false,
-      // Groups share a ~20 msg/min budget with replies and notifications;
-      // dropping the fast-changing reasoning line keeps that budget free.
-      includeReasoning: input.chatId >= 0,
+      verbosity: input.verbosity,
       media: [],
       mediaKeys: new Set(),
     })
     const acceptedInputID = yield* Ref.make(Option.fromNullishOr(input.inputID))
+    const dispatchStarted = yield* Ref.make(input.reconnect === true)
 
     const flusher = yield* Effect.forkChild(
       Effect.repeat(
@@ -988,7 +1037,7 @@ export const runPrompt = (input: RunInput) =>
           const nextText = nextProgressEdit(current)
           if (Option.isSome(nextText)) {
             const edited = yield* api.editMessageText({
-              chatId: input.chatId,
+              chatId: input.runDeliveryRoute.chatId,
               messageId: current.messageId,
               text: nextText.value,
               priority: "progress",
@@ -1050,34 +1099,16 @@ export const runPrompt = (input: RunInput) =>
       // ---- Phase 1: preparation (bounded, never interrupts the session) ----
       let dispatchable = false
       if (input.reconnect === true) {
-        yield* registry.setSessionRoute(input.sessionID, { chatId: input.chatId, threadId: input.threadId })
-        yield* questionRegistry.setSessionRoute(input.sessionID, { chatId: input.chatId, threadId: input.threadId })
+        yield* registry.setSessionRoute(input.sessionID, input.controllerRoute)
+        yield* questionRegistry.setSessionRoute(input.sessionID, input.controllerRoute)
         dispatchable = true
       } else {
         const prepared = yield* Effect.timeoutOption(
           Effect.gen(function* () {
             const idle = yield* waitUntilIdle("wait before prompt failed")
             if (!idle) return false as const
-            yield* registry.setSessionRoute(input.sessionID, { chatId: input.chatId, threadId: input.threadId })
-            yield* questionRegistry.setSessionRoute(input.sessionID, { chatId: input.chatId, threadId: input.threadId })
-            // Re-apply the last chosen model for this directory, so a fresh
-            // session (/new or compaction) does not fall back to default.
-            if (input.model !== undefined) {
-              yield* opencode.switchModel({
-                sessionID: input.sessionID,
-                model: input.model,
-              }).pipe(Effect.catchCause(logOpenCodeFailure("re-apply model failed")))
-            }
-            if (input.agent !== undefined) {
-              yield* opencode.switchAgent({
-                sessionID: input.sessionID,
-                agent: input.agent,
-              }).pipe(Effect.catchCause((cause) =>
-                logOpenCodeFailure("apply agent failed")(cause).pipe(
-                  Effect.andThen(Effect.fail(new AgentSwitchError({ agent: input.agent ?? "", cause }))),
-                ),
-              ))
-            }
+            yield* registry.setSessionRoute(input.sessionID, input.controllerRoute)
+            yield* questionRegistry.setSessionRoute(input.sessionID, input.controllerRoute)
             return true as const
           }),
           PRE_DISPATCH_WAIT,
@@ -1101,8 +1132,8 @@ export const runPrompt = (input: RunInput) =>
 
       let outcome: RunOutcome = "error"
       if (dispatchable) {
-        // Only this dispatched phase may time out into an interrupt: the
-        // session is now running work this job owns.
+        // A timeout interrupts the session only after the durable dispatch
+        // fence is set, or while reconnecting a run that already exists.
         const configuredTimeout = config.telegramRunTimeout.trim().toLowerCase()
         const drive = configuredTimeout === "none"
           ? driveDispatchedRun(waitUntilIdle)
@@ -1118,12 +1149,14 @@ export const runPrompt = (input: RunInput) =>
               onSome: (error) => error instanceof Cause.TimeoutError,
             })
             return timedOut
-              ? Effect.andThen(
-                opencode.interrupt(input.sessionID).pipe(
-                  Effect.catchCause((cause) => logOpenCodeFailure("interrupt on timeout")(cause)),
-                ),
-                Effect.succeed<RunOutcome>("timeout"),
-              )
+              ? Ref.get(dispatchStarted).pipe(
+                  Effect.flatMap((started) => started
+                    ? opencode.interrupt(input.sessionID).pipe(
+                        Effect.catchCause((cause) => logOpenCodeFailure("interrupt on timeout")(cause)),
+                      )
+                    : Effect.void),
+                  Effect.andThen(Effect.succeed<RunOutcome>("timeout")),
+                )
               : logBoundary("telegram/run", "opencode-client", "open code run failed")(cause).pipe(
                   Effect.andThen(Effect.failCause(cause)),
                 )
@@ -1169,8 +1202,8 @@ export const runPrompt = (input: RunInput) =>
         Stream.runForEach((event) =>
           handleEvent(
             event,
-            input.chatId,
-            Option.fromNullishOr(input.threadId),
+            input.controllerRoute.chatId,
+            Option.fromNullishOr(input.controllerRoute.threadId),
             state,
             terminal,
             terminalHandled,
@@ -1191,14 +1224,33 @@ export const runPrompt = (input: RunInput) =>
         return "error" as const
       }
       if (input.reconnect !== true) {
-        if (input.onDispatching !== undefined) yield* input.onDispatching()
-        const pending = yield* opencode.prompt({
-           sessionID: input.sessionID,
-          text: input.text ?? "",
-          files: attachments,
-        })
-        yield* Ref.set(acceptedInputID, Option.some(pending.id))
-        if (input.onAccepted !== undefined) yield* input.onAccepted(pending.id)
+        const inputID = yield* selections.withSession(input.sessionID, Effect.gen(function* () {
+          const applied = yield* Effect.timeoutOption(
+            // The session permit stays held until OpenCode accepts the prompt.
+            applyRunSelectionUsing(opencode, input),
+            PRE_DISPATCH_WAIT,
+          )
+          if (Option.isNone(applied)) return Option.none<string>()
+          if (input.onDispatching !== undefined) yield* input.onDispatching()
+          yield* Ref.set(dispatchStarted, true)
+          const pending = yield* opencode.prompt({
+            sessionID: input.sessionID,
+            text: input.text ?? "",
+            files: attachments,
+          })
+          yield* Ref.set(acceptedInputID, Option.some(pending.id))
+          if (input.onAccepted !== undefined) yield* input.onAccepted(pending.id)
+          return Option.some(pending.id)
+        }))
+        if (Option.isNone(inputID)) {
+          yield* Fiber.interrupt(eventFiber)
+          yield* Ref.update(state, (current) => ({
+            ...current,
+            text: "The agent and model could not be applied before this prompt.",
+            dirty: true,
+          }))
+          return "error" as const
+        }
       }
       // The wait call is the completion fallback when the event stream misses
       // an event during connection setup. It also keeps this run blocked while

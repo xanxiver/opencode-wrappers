@@ -5,9 +5,11 @@ import { OpenCode, OpenCodeError, type OpenCodeService } from "../src/core/openc
 import { Sessions, type SessionsService } from "../src/core/sessions.js"
 import { Store, type StoreService } from "../src/core/store.js"
 import { GitChanges, type GitChangesService } from "../src/core/git-changes.js"
+import type { StreamVerbosity } from "../src/core/stream-verbosity.js"
 import type { Message, TelegramApiClient } from "../src/telegram/api.js"
 import { TelegramApi } from "../src/telegram/api.js"
 import { Live as AgentRegistryLive } from "../src/telegram/agents.js"
+import { Live as SessionSelectionLive } from "../src/telegram/session-selection.js"
 import {
   TelegramDurableExecutor,
   type TelegramDurableExecutorService,
@@ -75,8 +77,10 @@ describe("loose prompt mode", () => {
     const submitted = await Effect.runPromise(Ref.make<string | undefined>(undefined))
     const sent = await Effect.runPromise(Ref.make<readonly string[]>([]))
     const loose = await Effect.runPromise(Ref.make(false))
+    const verbosity = await Effect.runPromise(Ref.make<StreamVerbosity>("normal"))
     const store: StoreService = {
       getSessionIDForConversation: () => Effect.succeed(Option.some("ses_1")),
+      listConversationSessions: () => Effect.succeed([]),
       setSessionIDForConversation: () => Effect.void,
       removeSessionIDForConversation: () => Effect.void,
       getSessionIDForDirectory: () => Effect.succeed(Option.none()),
@@ -85,12 +89,15 @@ describe("loose prompt mode", () => {
       getDirectory: () => Effect.succeed(Option.none()),
       setDirectory: () => Effect.void,
       switchConversationDirectory: () => Effect.void,
-      getModel: () => Effect.succeed(Option.none()),
-      setModel: () => Effect.void,
+      getDirectoryModelFallback: () => Effect.succeed(Option.none()),
+      getSessionAgentModel: () => Effect.succeed(Option.none()),
+      setSessionAgentModel: () => Effect.void,
       getLoosePrompts: () => Ref.get(loose),
       setLoosePrompts: (_conversation, enabled) => Ref.set(loose, enabled),
       getAutoContinue: () => Effect.succeed(false),
       setAutoContinue: () => Effect.void,
+      getStreamVerbosity: () => Ref.get(verbosity),
+      setStreamVerbosity: (_conversation, level) => Ref.set(verbosity, level),
       listClients: () => Effect.succeed([]),
       listDirectories: () => Effect.succeed([]),
     }
@@ -117,6 +124,7 @@ describe("loose prompt mode", () => {
         Effect.provide(ModelRegistryLive),
         Effect.provide(PickersLive),
         Effect.provide(AgentRegistryLive),
+        Effect.provide(SessionSelectionLive),
         Effect.provide(PermissionRegistryLive),
         Effect.provide(QuestionRegistryLive),
         Effect.provide(InteractionStoreMemory),
@@ -139,6 +147,19 @@ describe("loose prompt mode", () => {
     expect(await Effect.runPromise(Ref.get(submitted))).toBe("hello world")
     expect((await Effect.runPromise(Ref.get(sent))).length).toBeGreaterThan(0)
 
+    // Verbosity is a command, not a prompt, and updates the stream setting.
+    await run("/verbosity detailed")
+    expect(await Effect.runPromise(Ref.get(verbosity))).toBe("detailed")
+    expect(await Effect.runPromise(Ref.get(submitted))).toBe("hello world")
+    expect(await Effect.runPromise(Ref.get(sent))).toContain(
+      "Stream verbosity set to detailed. Response text, activity, and reasoning will stream.",
+    )
+    await run("/verbosity")
+    expect(await Effect.runPromise(Ref.get(verbosity))).toBe("detailed")
+    expect(await Effect.runPromise(Ref.get(sent))).toContain(
+      "Stream verbosity is detailed. Use /verbosity quiet, /verbosity normal, or /verbosity detailed.",
+    )
+
     // Unknown slash commands are never treated as prompts.
     await run("/nope")
     expect(await Effect.runPromise(Ref.get(submitted))).toBe("hello world")
@@ -151,6 +172,7 @@ describe("loose prompt mode", () => {
     const questionCalls = await Effect.runPromise(Ref.make(0))
     const store: StoreService = {
       getSessionIDForConversation: () => Effect.succeed(Option.some("ses_1")),
+      listConversationSessions: () => Effect.succeed([]),
       setSessionIDForConversation: () => Effect.void,
       removeSessionIDForConversation: () => Effect.void,
       getSessionIDForDirectory: () => Effect.succeed(Option.none()),
@@ -159,12 +181,15 @@ describe("loose prompt mode", () => {
       getDirectory: () => Effect.succeed(Option.none()),
       setDirectory: () => Effect.void,
       switchConversationDirectory: () => Effect.void,
-      getModel: () => Effect.succeed(Option.none()),
-      setModel: () => Effect.void,
+      getDirectoryModelFallback: () => Effect.succeed(Option.none()),
+      getSessionAgentModel: () => Effect.succeed(Option.none()),
+      setSessionAgentModel: () => Effect.void,
       getLoosePrompts: () => Effect.succeed(true),
       setLoosePrompts: () => Effect.void,
       getAutoContinue: () => Effect.succeed(false),
       setAutoContinue: () => Effect.void,
+      getStreamVerbosity: () => Effect.succeed("normal"),
+      setStreamVerbosity: () => Effect.void,
       listClients: () => Effect.succeed([]),
       listDirectories: () => Effect.succeed([]),
     }
@@ -210,6 +235,7 @@ describe("loose prompt mode", () => {
       Effect.provide(ModelRegistryLive),
       Effect.provide(PickersLive),
       Effect.provide(AgentRegistryLive),
+      Effect.provide(SessionSelectionLive),
       Effect.provide(PermissionRegistryLive),
       Effect.provide(QuestionRegistryLive),
       Effect.provide(InteractionStoreMemory),
