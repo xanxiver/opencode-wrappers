@@ -1,12 +1,18 @@
 import { Clock, Context, Effect, Layer, Option, Ref } from "effect"
+import type { Info as AgentInfo } from "@opencode-ai/schema/agent"
+import type { StoredModel } from "../core/store.js"
 
 export const AGENT_PICKER_TTL_MS = 60 * 60 * 1000
 export const AGENT_PICKER_MAX_ENTRIES = 1_000
+
+export const isSelectableAgent = (agent: AgentInfo): boolean =>
+  !agent.hidden && agent.mode !== "subagent"
 
 export interface SelectableAgent {
   readonly id: string
   readonly name: string
   readonly description?: string
+  readonly model?: StoredModel
 }
 
 export interface AgentPickerEntry {

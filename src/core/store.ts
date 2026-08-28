@@ -3,13 +3,18 @@ import { dirname } from "node:path"
 import type { PlatformError } from "effect/PlatformError"
 import { AppConfigTag, type AppConfig } from "../config.js"
 import { logBoundary } from "./logging.js"
+import {
+  DEFAULT_STREAM_VERBOSITY,
+  StreamVerbositySchema,
+  type StreamVerbosity,
+} from "./stream-verbosity.js"
 
 export class StoreError extends Data.TaggedError("StoreError")<{
   readonly message: string
   readonly cause: unknown
 }> {}
 
-/** The model remembered for a directory. */
+/** Model coordinates stored by the wrapper. */
 export interface StoredModel {
   readonly id: string
   readonly providerID: string
@@ -23,12 +28,16 @@ interface State {
   readonly conversationSessions: Record<string, string>
   /** clientId -> directory override. Chats without an entry use the default. */
   readonly directories: Record<string, string>
-  /** directory -> last chosen model, re-applied when a run starts. */
+  /** directory -> legacy model fallback retained for state compatibility. */
   readonly models: Record<string, StoredModel>
+  /** sessionID -> agentID -> explicitly chosen model. */
+  readonly sessionAgentModels: Record<string, Record<string, StoredModel>>
   /** conversation id -> loose prompts enabled. */
   readonly loosePrompts: Record<string, boolean>
   /** conversation id -> auto-continue on failure enabled. */
   readonly autoContinue: Record<string, boolean>
+  /** conversation id -> amount of live run content shown. */
+  readonly streamVerbosity: Record<string, StreamVerbosity>
 }
 
 const StoredModelSchema = Schema.Struct({
@@ -42,15 +51,28 @@ const StateSchema = Schema.Struct({
   conversationSessions: Schema.optional(Schema.Record(Schema.String, Schema.String)),
   directories: Schema.Record(Schema.String, Schema.String),
   models: Schema.optional(Schema.Record(Schema.String, StoredModelSchema)),
+  sessionAgentModels: Schema.optional(
+    Schema.Record(Schema.String, Schema.Record(Schema.String, StoredModelSchema)),
+  ),
   loosePrompts: Schema.optional(Schema.Record(Schema.String, Schema.Boolean)),
   autoContinue: Schema.optional(Schema.Record(Schema.String, Schema.Boolean)),
+  streamVerbosity: Schema.optional(Schema.Record(Schema.String, StreamVerbositySchema)),
 })
 
 /** Legacy format: clientId -> sessionID (one session per chat). */
 const LegacySchema = Schema.Record(Schema.String, Schema.String)
 type JsonValue = ReturnType<typeof JSON.parse>
 
-const emptyState = (): State => ({ sessions: {}, conversationSessions: {}, directories: {}, models: {}, loosePrompts: {}, autoContinue: {} })
+const emptyState = (): State => ({
+  sessions: {},
+  conversationSessions: {},
+  directories: {},
+  models: {},
+  sessionAgentModels: {},
+  loosePrompts: {},
+  autoContinue: {},
+  streamVerbosity: {},
+})
 
 /** Migrate the legacy chat->session map: each chat keeps its session under its own key. */
 const migrateLegacy = (legacy: Record<string, string>): State => {
@@ -58,7 +80,16 @@ const migrateLegacy = (legacy: Record<string, string>): State => {
   for (const clientId of Object.keys(legacy)) {
     directories[clientId] = clientId
   }
-  return { sessions: { ...legacy }, conversationSessions: { ...legacy }, directories, models: {}, loosePrompts: {}, autoContinue: {} }
+  return {
+    sessions: { ...legacy },
+    conversationSessions: { ...legacy },
+    directories,
+    models: {},
+    sessionAgentModels: {},
+    loosePrompts: {},
+    autoContinue: {},
+    streamVerbosity: {},
+  }
 }
 
 const parseState = (json: JsonValue): Option.Option<{ readonly state: State; readonly migrated: boolean }> =>
@@ -75,12 +106,28 @@ const parseState = (json: JsonValue): Option.Option<{ readonly state: State; rea
           return sessionID === undefined ? [] : [[conversation, sessionID]]
         }),
       )
-      return Option.some({ state: { ...state, conversationSessions, models: state.models ?? {}, loosePrompts: state.loosePrompts ?? {}, autoContinue: state.autoContinue ?? {} }, migrated: false })
+      return Option.some({
+        state: {
+          ...state,
+          conversationSessions,
+          models: state.models ?? {},
+          sessionAgentModels: state.sessionAgentModels ?? {},
+          loosePrompts: state.loosePrompts ?? {},
+          autoContinue: state.autoContinue ?? {},
+          streamVerbosity: state.streamVerbosity ?? {},
+        },
+        migrated: false,
+      })
     },
   })
 
 export interface StoreService {
   readonly getSessionIDForConversation: (conversationId: string) => Effect.Effect<Option.Option<string>, never>
+  /** Snapshot every persisted conversation-to-session selection. */
+  readonly listConversationSessions: () => Effect.Effect<readonly {
+    readonly conversationId: string
+    readonly sessionID: string
+  }[], never>
   readonly setSessionIDForConversation: (conversationId: string, sessionID: string) => Effect.Effect<void, StoreError>
   readonly removeSessionIDForConversation: (conversationId: string) => Effect.Effect<void, StoreError>
   readonly getSessionIDForDirectory: (directory: string) => Effect.Effect<Option.Option<string>, never>
@@ -90,14 +137,29 @@ export interface StoreService {
   readonly setDirectory: (clientId: string, directory: string) => Effect.Effect<void, StoreError>
   /** Change a conversation directory and clear its incompatible active session atomically. */
   readonly switchConversationDirectory: (conversationId: string, directory: string) => Effect.Effect<void, StoreError>
-  readonly getModel: (directory: string) => Effect.Effect<Option.Option<StoredModel>, never>
-  readonly setModel: (directory: string, model: StoredModel) => Effect.Effect<void, StoreError>
+  /** Read the old per-directory value only as a compatibility fallback. */
+  readonly getDirectoryModelFallback: (directory: string) => Effect.Effect<Option.Option<StoredModel>, never>
+  readonly getSessionAgentModel: (
+    sessionID: string,
+    agentID: string,
+  ) => Effect.Effect<Option.Option<StoredModel>, never>
+  readonly setSessionAgentModel: (
+    sessionID: string,
+    agentID: string,
+    model: StoredModel,
+  ) => Effect.Effect<void, StoreError>
   /** True when plain messages start runs for this conversation. */
   readonly getLoosePrompts: (conversationId: string) => Effect.Effect<boolean, never>
   readonly setLoosePrompts: (conversationId: string, enabled: boolean) => Effect.Effect<void, StoreError>
   /** True when failed runs auto-send a continue prompt for this conversation. */
   readonly getAutoContinue: (conversationId: string) => Effect.Effect<boolean, never>
   readonly setAutoContinue: (conversationId: string, enabled: boolean) => Effect.Effect<void, StoreError>
+  /** Live content level for this conversation. */
+  readonly getStreamVerbosity: (conversationId: string) => Effect.Effect<StreamVerbosity, never>
+  readonly setStreamVerbosity: (
+    conversationId: string,
+    verbosity: StreamVerbosity,
+  ) => Effect.Effect<void, StoreError>
   /** Every client id the store knows about. */
   readonly listClients: () => Effect.Effect<readonly string[], never>
   /** Every directory retained by a client or session mapping. */
@@ -166,6 +228,12 @@ export const Live: Layer.Layer<Store, StoreError, FileSystem.FileSystem | AppCon
     return {
       getSessionIDForConversation: (conversationId) =>
         Ref.get(ref).pipe(Effect.map((state) => Option.fromNullishOr(state.conversationSessions[conversationId]))),
+      listConversationSessions: () => Ref.get(ref).pipe(
+        Effect.map((state) => Object.entries(state.conversationSessions).map(([conversationId, sessionID]) => ({
+          conversationId,
+          sessionID,
+        }))),
+      ),
       setSessionIDForConversation: (conversationId, sessionID) =>
         commit((state) => ({ ...state, conversationSessions: { ...state.conversationSessions, [conversationId]: sessionID } })),
       removeSessionIDForConversation: (conversationId) =>
@@ -204,12 +272,22 @@ export const Live: Layer.Layer<Store, StoreError, FileSystem.FileSystem | AppCon
             directories: { ...state.directories, [conversationId]: directory },
           }
         }),
-      getModel: (directory) =>
+      getDirectoryModelFallback: (directory) =>
         Ref.get(ref).pipe(Effect.map((state) => Option.fromNullishOr(state.models[directory]))),
-      setModel: (directory, model) =>
+      getSessionAgentModel: (sessionID, agentID) =>
+        Ref.get(ref).pipe(Effect.map((state) =>
+          Option.fromNullishOr(state.sessionAgentModels[sessionID]?.[agentID])
+        )),
+      setSessionAgentModel: (sessionID, agentID, model) =>
         commit((state) => ({
           ...state,
-          models: { ...state.models, [directory]: model },
+          sessionAgentModels: {
+            ...state.sessionAgentModels,
+            [sessionID]: {
+              ...state.sessionAgentModels[sessionID],
+              [agentID]: model,
+            },
+          },
         })),
       getLoosePrompts: (conversationId) =>
         Ref.get(ref).pipe(Effect.map((state) => state.loosePrompts[conversationId] ?? false)),
@@ -224,6 +302,13 @@ export const Live: Layer.Layer<Store, StoreError, FileSystem.FileSystem | AppCon
         commit((state) => ({
           ...state,
           autoContinue: { ...state.autoContinue, [conversationId]: enabled },
+        })),
+      getStreamVerbosity: (conversationId) =>
+        Ref.get(ref).pipe(Effect.map((state) => state.streamVerbosity[conversationId] ?? DEFAULT_STREAM_VERBOSITY)),
+      setStreamVerbosity: (conversationId, verbosity) =>
+        commit((state) => ({
+          ...state,
+          streamVerbosity: { ...state.streamVerbosity, [conversationId]: verbosity },
         })),
       listClients: () => Ref.get(ref).pipe(Effect.map((state) => Object.keys(state.directories))),
       listDirectories: () => Ref.get(ref).pipe(Effect.map((state) => [

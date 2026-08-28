@@ -40,6 +40,42 @@ describe("Telegram API response decoding", () => {
     }
   })
 
+  test("forwards HTML parse mode for a formatted message", async () => {
+    const requestBody = await Effect.runPromise(Ref.make(""))
+    const client = HttpClient.make((request) => {
+      const body = request.body
+      const text = body._tag === "Uint8Array" ? new TextDecoder().decode(body.body) : ""
+      return Ref.set(requestBody, text).pipe(
+        Effect.as(HttpClientResponse.fromWeb(request, new Response(JSON.stringify({
+          ok: true,
+          result: { message_id: 10, chat: { id: 7 } },
+        }), { status: 200 }))),
+      )
+    })
+    const config = Layer.succeed(AppConfigTag, new AppConfig({
+      telegramBotToken: "test-token",
+      projectDirectory: "/tmp",
+      stateFile: "/tmp/state.json",
+      webDatabaseFile: "/tmp/web.sqlite",
+      telegramRunTimeout: "10 minutes",
+      webPort: 3001,
+    }))
+
+    await Effect.runPromise(Effect.gen(function* () {
+      const api = yield* TelegramApi
+      yield* api.sendMessage({ chatId: 7, text: "<b>Status</b>", parseMode: "HTML" })
+    }).pipe(
+      Effect.provide(Layer.provide(Live, config)),
+      Effect.provide(Layer.succeed(HttpClient.HttpClient, client)),
+    ))
+
+    expect(JSON.parse(await Effect.runPromise(Ref.get(requestBody)))).toMatchObject({
+      chat_id: 7,
+      text: "<b>Status</b>",
+      parse_mode: "HTML",
+    })
+  })
+
   test("does not retry an expiring callback acknowledgement", async () => {
     let attempts = 0
     const client = HttpClient.make((request) => {

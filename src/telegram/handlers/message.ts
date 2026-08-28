@@ -9,7 +9,7 @@ import { runWithFiles } from "./run.js"
 import { selectExactModel, showModels } from "./model.js"
 import { showProjects, showSessions } from "./picker.js"
 import { promptWithAgent, showAgents } from "./agent.js"
-import { clearRunQueue, compactSession, deleteRunQueue, listDurableReviews, listRunQueue, moveRunQueue, reconnectRun, resetSession, resolveDurableReview, setAutoContinue, setLoosePrompts, setProjectDirectory, setSessionById, showStatus, stopRun } from "./run.js"
+import { clearRunQueue, compactSession, deleteRunQueue, listDurableReviews, listRunQueue, moveRunQueue, reconnectRun, resetSession, resolveDurableReview, setAutoContinue, setLoosePrompts, setProjectDirectory, setSessionById, setStreamVerbosity, showStatus, stopRun } from "./run.js"
 
 type ParsedCommand = {
   readonly name: string
@@ -176,6 +176,9 @@ export const handleMessage = (message: Message) =>
         return
       case "/continue":
         yield* setAutoContinue(chatId, command.argument, threadId)
+        return
+      case "/verbosity":
+        yield* setStreamVerbosity(chatId, command.argument, threadId)
         return
       case "/resolve_review":
         yield* command.argument.length === 0

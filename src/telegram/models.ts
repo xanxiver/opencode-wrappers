@@ -1,4 +1,33 @@
 import { Context, Effect, Layer, Option, Ref } from "effect"
+import type { StoredModel } from "../core/store.js"
+
+export type ModelPreferenceSource = "session-agent" | "agent-config" | "session" | "directory"
+
+export interface ResolvedModelPreference {
+  readonly model: StoredModel
+  readonly source: ModelPreferenceSource
+}
+
+export const formatModelPreference = (model: StoredModel): string =>
+  `${model.providerID}/${model.id}${model.variant === undefined ? "" : ` [${model.variant}]`}`
+
+/** Resolve one model without converting a fallback into a saved preference. */
+export const resolveEffectiveModel = (input: {
+  readonly sessionAgent?: StoredModel
+  readonly agentConfig?: StoredModel
+  readonly session?: StoredModel
+  readonly directory?: StoredModel
+}): Option.Option<ResolvedModelPreference> => {
+  if (input.sessionAgent !== undefined) {
+    return Option.some({ model: input.sessionAgent, source: "session-agent" })
+  }
+  if (input.agentConfig !== undefined) {
+    return Option.some({ model: input.agentConfig, source: "agent-config" })
+  }
+  if (input.session !== undefined) return Option.some({ model: input.session, source: "session" })
+  if (input.directory !== undefined) return Option.some({ model: input.directory, source: "directory" })
+  return Option.none()
+}
 
 /** One selectable model in the picker. */
 export interface PageModel {
@@ -12,6 +41,7 @@ export type ModelEntry =
   | {
     readonly kind: "provider"
     readonly sessionID: string
+    readonly agentID: string | undefined
     readonly providers: readonly { readonly id: string; readonly models: readonly PageModel[] }[]
     readonly directory: string
     readonly chatId: number
@@ -21,6 +51,7 @@ export type ModelEntry =
   | {
     readonly kind: "page"
     readonly sessionID: string
+    readonly agentID: string | undefined
     readonly models: readonly PageModel[]
     readonly directory: string
     readonly page: number
@@ -32,6 +63,7 @@ export type ModelEntry =
   | {
     readonly kind: "variant"
     readonly sessionID: string
+    readonly agentID: string | undefined
     readonly providerID: string
     readonly modelID: string
     readonly variants: readonly string[]
@@ -44,6 +76,7 @@ export type ModelEntry =
 export interface ModelRegistryService {
   readonly registerProviders: (input: {
     readonly sessionID: string
+    readonly agentID: string | undefined
     readonly providers: readonly { readonly id: string; readonly models: readonly PageModel[] }[]
     readonly directory: string
     readonly chatId: number
@@ -51,6 +84,7 @@ export interface ModelRegistryService {
   }) => Effect.Effect<number>
   readonly registerPage: (input: {
     readonly sessionID: string
+    readonly agentID: string | undefined
     readonly models: readonly PageModel[]
     readonly directory: string
     readonly page: number
@@ -60,6 +94,7 @@ export interface ModelRegistryService {
   }) => Effect.Effect<number, never>
   readonly registerVariant: (input: {
     readonly sessionID: string
+    readonly agentID: string | undefined
     readonly providerID: string
     readonly modelID: string
     readonly variants: readonly string[]

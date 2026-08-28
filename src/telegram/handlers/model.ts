@@ -3,8 +3,13 @@ import type { Model } from "@opencode-ai/client/effect"
 import { logBoundary } from "../../core/logging.js"
 import { OpenCode } from "../../core/opencode.js"
 import { Sessions } from "../../core/sessions.js"
-import { Store } from "../../core/store.js"
-import { ModelRegistry, type ModelEntry } from "../models.js"
+import { Store, type StoredModel } from "../../core/store.js"
+import {
+  formatModelPreference,
+  ModelRegistry,
+  resolveEffectiveModel,
+  type ModelEntry,
+} from "../models.js"
 import {
   MODEL_PAGE_SIZE,
   modelPageKeyboard,
@@ -17,6 +22,7 @@ import {
   renderModelPageHeader,
 } from "../render.js"
 import type { CallbackQuery } from "../api.js"
+import { SessionSelection } from "../session-selection.js"
 import { answer, apiEdit, callbackFailure, chunk, sendMarkup, sendText } from "./shared.js"
 import { conversationId } from "../conversation.js"
 
@@ -32,18 +38,26 @@ const logModelSelection = (
   }),
 )
 
-/** Remember the chosen model for the chat's directory. */
-const rememberModel = (directory: string, model: { readonly id: string; readonly providerID: string; readonly variant?: string }) =>
+/** Save an explicit model only when the OpenCode session has a selected agent. */
+const rememberModel = (input: {
+  readonly sessionID: string
+  readonly agentID: string | undefined
+  readonly model: StoredModel
+}) =>
   Effect.gen(function* () {
+    if (input.agentID === undefined) return true
     const store = yield* Store
-    yield* store.setModel(directory, model).pipe(
+    return yield* store.setSessionAgentModel(input.sessionID, input.agentID, input.model).pipe(
+      Effect.as(true),
       Effect.catchCause((cause) =>
-        logBoundary("telegram/handlers", "sessions", "remember model failed")(cause),
+        logBoundary("telegram/handlers", "model-preference", "remember session-agent model failed")(cause).pipe(
+          Effect.as(false),
+        ),
       ),
     )
   })
 
-const modelPickerIsCurrent = (entry: ModelEntry) =>
+const modelPickerSessionIsCurrent = (entry: ModelEntry) =>
   Effect.gen(function* () {
     const sessions = yield* Sessions
     const store = yield* Store
@@ -55,6 +69,92 @@ const modelPickerIsCurrent = (entry: ModelEntry) =>
     if (currentDirectory !== entry.directory) return false
     const currentSession = yield* store.getSessionIDForConversation(conversation)
     return Option.exists(currentSession, (sessionID) => sessionID === entry.sessionID)
+  })
+
+/** Validate the remote agent only after the callback has been acknowledged. */
+const modelPickerAgentIsCurrent = (entry: ModelEntry) =>
+  Effect.gen(function* () {
+    const opencode = yield* OpenCode
+    const session = yield* opencode.getSession(entry.sessionID)
+    if (session.agent === entry.agentID) return true
+    yield* logModelSelection("picker-not-current", { action: "agent" })
+    yield* apiEdit(
+      entry.chatId,
+      entry.messageId,
+      "The active agent changed. Run /models again.",
+    )
+    return false
+  })
+
+const switchedModelText = (
+  model: StoredModel,
+  agentID: string | undefined,
+  saved: boolean,
+): string => {
+  const target = agentID === undefined ? "Session model" : `Model for ${agentID}`
+  const base = `${target} switched to ${formatModelPreference(model)}.`
+  return saved ? base : `${base} The preference could not be saved.`
+}
+
+const switchAndRememberModel = (input: {
+  readonly sessionID: string
+  readonly agentID: string | undefined
+  readonly model: StoredModel
+}) => Effect.gen(function* () {
+  const opencode = yield* OpenCode
+  yield* opencode.switchModel({ sessionID: input.sessionID, model: input.model })
+  const saved = yield* rememberModel(input)
+  return switchedModelText(input.model, input.agentID, saved)
+})
+
+type PickerModelSwitchResult =
+  | { readonly kind: "switched"; readonly text: string }
+  | { readonly kind: "session-stale" }
+  | { readonly kind: "agent-stale" }
+
+/** Revalidate and switch under the same session permit, then edit after release. */
+const switchModelFromPicker = (entry: ModelEntry, model: StoredModel) =>
+  Effect.gen(function* () {
+    const selections = yield* SessionSelection
+    const result = yield* selections.withSession(entry.sessionID, Effect.gen(function* () {
+      if (!(yield* modelPickerSessionIsCurrent(entry))) {
+        return { kind: "session-stale" } satisfies PickerModelSwitchResult
+      }
+      const opencode = yield* OpenCode
+      const session = yield* opencode.getSession(entry.sessionID)
+      if (session.agent !== entry.agentID) {
+        return { kind: "agent-stale" } satisfies PickerModelSwitchResult
+      }
+      const text = yield* switchAndRememberModel({
+        sessionID: entry.sessionID,
+        agentID: entry.agentID,
+        model,
+      })
+      return { kind: "switched", text } satisfies PickerModelSwitchResult
+    }))
+    switch (result.kind) {
+      case "session-stale":
+        return yield* logModelSelection("picker-not-current", { action: "model" }).pipe(
+          Effect.andThen(apiEdit(
+            entry.chatId,
+            entry.messageId,
+            "This model picker is no longer current. Run /models again.",
+          )),
+          Effect.as(false),
+        )
+      case "agent-stale":
+        return yield* logModelSelection("picker-not-current", { action: "agent" }).pipe(
+          Effect.andThen(apiEdit(
+            entry.chatId,
+            entry.messageId,
+            "The active agent changed. Run /models again.",
+          )),
+          Effect.as(false),
+        )
+      case "switched":
+        yield* apiEdit(entry.chatId, entry.messageId, result.text)
+        return true
+    }
   })
 
 /** Stop Telegram's button spinner before OpenCode work or throttled edits. */
@@ -87,7 +187,6 @@ export const handleModelCallback = (query: CallbackQuery, data: string) =>
       Effect.gen(function* () {
         yield* logModelSelection("model-callback-received", { index: parsed.index })
         const registry = yield* ModelRegistry
-        const opencode = yield* OpenCode
         const message = query.message
         if (message === undefined) {
           yield* answer(query.id, "Invalid callback.")
@@ -100,7 +199,7 @@ export const handleModelCallback = (query: CallbackQuery, data: string) =>
           ),
           onSome: (value) => Effect.gen(function* () {
             yield* logModelSelection("registry-entry-accepted", { action: "model", kind: value.kind })
-            if (!(yield* modelPickerIsCurrent(value))) {
+            if (!(yield* modelPickerSessionIsCurrent(value))) {
               yield* logModelSelection("picker-not-current", { action: "model" })
               yield* answer(query.id, "This model picker is no longer current.")
               return
@@ -126,21 +225,20 @@ export const handleModelCallback = (query: CallbackQuery, data: string) =>
                             Effect.andThen(runAcknowledgedModelAction(
                               query,
                               "Applying model.",
-                              opencode.switchModel({
-                                sessionID: value.sessionID,
-                                model: { id: selected.id, providerID: selected.providerID },
-                              }).pipe(
-                                Effect.andThen(rememberModel(value.directory, selected)),
-                                Effect.tap(() => logModelSelection("model-switched", {
+                              Effect.gen(function* () {
+                                const model = { id: selected.id, providerID: selected.providerID }
+                                const switched = yield* switchModelFromPicker(value, model)
+                                if (!switched) return
+                                yield* logModelSelection("model-switched", {
                                   model: selected.id,
                                   provider: selected.providerID,
-                                })),
-                                Effect.andThen(apiEdit(value.chatId, value.messageId, `Model switched to ${selected.id}`)),
-                              ),
+                                })
+                              }),
                             )),
                           ),
                         onSome: (variants) =>
                           runAcknowledgedModelAction(query, "Opening variants.", Effect.gen(function* () {
+                            if (!(yield* modelPickerAgentIsCurrent(value))) return
                             yield* logModelSelection("variant-picker-opened", {
                               model: selected.id,
                               provider: selected.providerID,
@@ -148,6 +246,7 @@ export const handleModelCallback = (query: CallbackQuery, data: string) =>
                             })
                             const variantToken = yield* registry.registerVariant({
                               sessionID: value.sessionID,
+                              agentID: value.agentID,
                               providerID: selected.providerID,
                               modelID: selected.id,
                               variants,
@@ -203,7 +302,7 @@ export const handleModelPageCallback = (query: CallbackQuery, data: string) =>
           ),
           onSome: (value) => Effect.gen(function* () {
             yield* logModelSelection("registry-entry-accepted", { action: "page", kind: value.kind })
-            if (!(yield* modelPickerIsCurrent(value))) {
+            if (!(yield* modelPickerSessionIsCurrent(value))) {
               yield* logModelSelection("picker-not-current", { action: "page" })
               yield* answer(query.id, "This model picker is no longer current.")
               return
@@ -218,8 +317,10 @@ export const handleModelPageCallback = (query: CallbackQuery, data: string) =>
                   return yield* answer(query.id, "Invalid page.")
                 }
                 return yield* runAcknowledgedModelAction(query, "Changing page.", Effect.gen(function* () {
+                  if (!(yield* modelPickerAgentIsCurrent(value))) return
                   const nextToken = yield* registry.registerPage({
                     sessionID: value.sessionID,
+                    agentID: value.agentID,
                     models: value.models,
                     directory: value.directory,
                     page: parsed.page,
@@ -266,7 +367,7 @@ export const handleModelProviderCallback = (query: CallbackQuery, data: string) 
           ),
           onSome: (value) => Effect.gen(function* () {
             yield* logModelSelection("registry-entry-accepted", { action: "provider", kind: value.kind })
-            if (!(yield* modelPickerIsCurrent(value))) {
+            if (!(yield* modelPickerSessionIsCurrent(value))) {
               yield* logModelSelection("picker-not-current", { action: "provider" })
               yield* answer(query.id, "This model picker is no longer current.")
               return
@@ -276,24 +377,26 @@ export const handleModelProviderCallback = (query: CallbackQuery, data: string) 
             return yield* Option.match(provider, {
               onNone: () => answer(query.id, "Invalid provider."),
               onSome: (selected) => runAcknowledgedModelAction(query, "Opening models.", Effect.gen(function* () {
+                if (!(yield* modelPickerAgentIsCurrent(value))) return
                 yield* logModelSelection("provider-selected", {
                   provider: selected.id,
                   models: selected.models.length,
                 })
                 const token = yield* registry.registerPage({
                   sessionID: value.sessionID,
+                  agentID: value.agentID,
                   models: selected.models,
                   directory: value.directory,
                   page: 0,
                   total: selected.models.length,
-                    chatId: value.chatId,
-                    threadId: value.threadId,
+                  chatId: value.chatId,
+                  threadId: value.threadId,
                 })
                 yield* registry.attachMessageId(token, value.messageId)
                 yield* apiEdit(
                   value.chatId,
                   value.messageId,
-                  `Provider ${selected.id} — select a model:`,
+                  `Provider ${selected.id} - select a model:`,
                   modelPageKeyboard(token, selected.models.slice(0, MODEL_PAGE_SIZE), 0, selected.models.length),
                 )
               })),
@@ -310,7 +413,6 @@ export const handleModelVariantCallback = (query: CallbackQuery, data: string) =
       Effect.gen(function* () {
         yield* logModelSelection("variant-callback-received", { index: parsed.index })
         const registry = yield* ModelRegistry
-        const opencode = yield* OpenCode
         const message = query.message
         if (message === undefined) {
           yield* answer(query.id, "Invalid callback.")
@@ -323,7 +425,7 @@ export const handleModelVariantCallback = (query: CallbackQuery, data: string) =
           ),
           onSome: (value) => Effect.gen(function* () {
             yield* logModelSelection("registry-entry-accepted", { action: "variant", kind: value.kind })
-            if (!(yield* modelPickerIsCurrent(value))) {
+            if (!(yield* modelPickerSessionIsCurrent(value))) {
               yield* logModelSelection("picker-not-current", { action: "variant" })
               yield* answer(query.id, "This model picker is no longer current.")
               return
@@ -345,30 +447,20 @@ export const handleModelVariantCallback = (query: CallbackQuery, data: string) =
                       Effect.andThen(runAcknowledgedModelAction(
                         query,
                         "Applying model.",
-                        opencode.switchModel({
-                          sessionID: value.sessionID,
-                          model: {
+                        Effect.gen(function* () {
+                          const model = {
                             id: value.modelID,
                             providerID: value.providerID,
                             variant,
-                          },
-                        }).pipe(
-                          Effect.andThen(
-                            rememberModel(value.directory, {
-                              id: value.modelID,
-                              providerID: value.providerID,
-                              variant,
-                            }),
-                          ),
-                          Effect.tap(() => logModelSelection("model-variant-switched", {
+                          }
+                          const switched = yield* switchModelFromPicker(value, model)
+                          if (!switched) return
+                          yield* logModelSelection("model-variant-switched", {
                             model: value.modelID,
                             provider: value.providerID,
                             variant,
-                          })),
-                          Effect.andThen(
-                            apiEdit(value.chatId, value.messageId, `Model switched to ${value.modelID} (${variant})`),
-                          ),
-                        ),
+                          })
+                        }),
                       )),
                     ),
                 })
@@ -417,10 +509,31 @@ export const showModels = (chatId: number, query = "", threadId?: number) =>
     yield* logModelSelection("picker-requested", { hasQuery: query.trim().length > 0 })
     const sessionID = yield* sessions.getOrCreate(conversation)
     const directory = yield* sessions.directoryFor(conversation)
-    const remembered = yield* store.getModel(directory)
-    const currentLine = Option.match(remembered, {
+    const session = yield* opencode.getSession(sessionID)
+    const directoryFallback = yield* store.getDirectoryModelFallback(directory)
+    const sessionAgentModel = session.agent === undefined
+      ? Option.none<StoredModel>()
+      : yield* store.getSessionAgentModel(sessionID, session.agent)
+    const agents = yield* opencode.listAgents(directory).pipe(
+      Effect.catchCause((cause) =>
+        logBoundary("telegram/handlers", "opencode-client", "list agents for model selection failed")(cause).pipe(
+          Effect.andThen(Effect.succeed([])),
+        ),
+      ),
+    )
+    const agentConfig = session.agent === undefined
+      ? undefined
+      : agents.find((agent) => agent.id === session.agent)?.model
+    const effective = resolveEffectiveModel({
+      sessionAgent: Option.getOrUndefined(sessionAgentModel),
+      agentConfig,
+      session: session.model,
+      directory: Option.getOrUndefined(directoryFallback),
+    })
+    const currentLine = Option.match(effective, {
       onNone: () => "",
-      onSome: (model) => `Current model: ${model.id}${model.variant === undefined ? "" : ` [${model.variant}]`}\n`,
+      onSome: ({ model }) =>
+        `Current model for ${session.agent ?? "the default agent"}: ${formatModelPreference(model)}\n`,
     })
     const models = yield* opencode.listModels(directory).pipe(
       Effect.catchCause((cause) =>
@@ -455,6 +568,7 @@ export const showModels = (chatId: number, query = "", threadId?: number) =>
     })
     const token = yield* registry.registerProviders({
       sessionID,
+      agentID: session.agent,
       providers,
       directory,
       chatId,
@@ -500,7 +614,14 @@ export const selectExactModel = (chatId: number, query: string, threadId?: numbe
       yield* sendText(chatId, `Model not found: ${trimmed}`, threadId)
       return
     }
-    yield* opencode.switchModel({ sessionID, model: { id: selected.id, providerID: selected.providerID } })
-    yield* rememberModel(directory, { id: selected.id, providerID: selected.providerID })
-    yield* sendText(chatId, `Model switched to ${selected.providerID}/${selected.id}.`, threadId)
+    const selections = yield* SessionSelection
+    const text = yield* selections.withSession(sessionID, Effect.gen(function* () {
+      const session = yield* opencode.getSession(sessionID)
+      return yield* switchAndRememberModel({
+        sessionID,
+        agentID: session.agent,
+        model: { id: selected.id, providerID: selected.providerID },
+      })
+    }))
+    yield* sendText(chatId, text, threadId)
   })

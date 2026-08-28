@@ -189,37 +189,37 @@ describe("truncate", () => {
 
 describe("renderProgress", () => {
   test("shows working placeholder when empty", () => {
-    expect(renderProgress({ text: "", reasoning: "", activity: Option.none() })).toBe("Working…")
+    expect(renderProgress({ text: "", reasoning: "", activity: Option.none(), verbosity: "normal" })).toBe("Working…")
   })
 
   test("shows text", () => {
-    expect(renderProgress({ text: "hello", reasoning: "", activity: Option.none() })).toBe("hello")
+    expect(renderProgress({ text: "hello", reasoning: "", activity: Option.none(), verbosity: "normal" })).toBe("hello")
   })
 
   test("shows text and activity", () => {
     expect(
-      renderProgress({ text: "partial", reasoning: "", activity: Option.some("Tool: git diff") }),
+      renderProgress({ text: "partial", reasoning: "", activity: Option.some("Tool: git diff"), verbosity: "normal" }),
     ).toBe("partial\n\nTool: git diff")
   })
 
   test("shows reasoning while thinking", () => {
     expect(
-      renderProgress({ text: "", reasoning: "let me check the code", activity: Option.none() }),
+      renderProgress({ text: "", reasoning: "let me check the code", activity: Option.none(), verbosity: "detailed" }),
     ).toBe("Thinking: let me check the code")
   })
 
   test("shows reasoning above text", () => {
     expect(
-      renderProgress({ text: "answer", reasoning: "thinking hard", activity: Option.none() }),
+      renderProgress({ text: "answer", reasoning: "thinking hard", activity: Option.none(), verbosity: "detailed" }),
     ).toBe("Thinking: thinking hard\n\nanswer")
   })
 
-  test("group chats omit live reasoning to save message budget", () => {
+  test("normal verbosity omits live reasoning", () => {
     const out = renderProgress({
       text: "answer",
       reasoning: "thinking hard",
       activity: Option.some("Tool: bash"),
-      includeReasoning: false,
+      verbosity: "normal",
     })
     expect(out).not.toContain("Thinking:")
     expect(out).toContain("answer")
@@ -228,13 +228,13 @@ describe("renderProgress", () => {
 
   test("separates adjacent bold reasoning updates", () => {
     expect(
-      renderProgress({ text: "", reasoning: "**first****second**", activity: Option.none() }),
+      renderProgress({ text: "", reasoning: "**first****second**", activity: Option.none(), verbosity: "detailed" }),
     ).toBe("Thinking: **first**\n\n**second**")
   })
 
   test("caps reasoning display length", () => {
     const long = "r".repeat(REASONING_DISPLAY_LIMIT + 500)
-    const rendered = renderProgress({ text: "", reasoning: long, activity: Option.none() })
+    const rendered = renderProgress({ text: "", reasoning: long, activity: Option.none(), verbosity: "detailed" })
     expect(rendered.length).toBeLessThan(REASONING_DISPLAY_LIMIT + 100)
     expect(rendered.startsWith("Thinking: ")).toBe(true)
     expect(rendered).toContain("truncated")
@@ -548,6 +548,7 @@ describe("nextProgressEdit", () => {
     activity: Option.none(),
     lastSent: "Working…",
     dirty: true,
+    verbosity: "normal" as const,
   }
 
   test("proposes an edit when the content changed", () => {
@@ -562,15 +563,22 @@ describe("nextProgressEdit", () => {
     expect(nextProgressEdit({ ...base, lastSent: "hello" })).toEqual(Option.none())
   })
 
-  test("group mode proposes nothing when only reasoning changed", () => {
-    // Reasoning deltas are invisible in groups, so a reasoning-only change
-    // must not consume message budget.
-    const groupBase = { ...base, text: "", reasoning: "grew", includeReasoning: false }
-    expect(nextProgressEdit({ ...groupBase, lastSent: "Working…" })).toEqual(Option.none())
-    // Contrast: DMs keep live reasoning and do propose the update.
-    const dm = { ...groupBase, includeReasoning: true }
-    const proposed = nextProgressEdit({ ...dm, lastSent: "Working…" })
+  test("normal mode proposes nothing when only reasoning changed", () => {
+    const normal = { ...base, text: "", reasoning: "grew" }
+    expect(nextProgressEdit({ ...normal, lastSent: "Working…" })).toEqual(Option.none())
+    const detailed = { ...normal, verbosity: "detailed" as const }
+    const proposed = nextProgressEdit({ ...detailed, lastSent: "Working…" })
     expect(Option.isSome(proposed)).toBe(true)
+  })
+
+  test("quiet mode never proposes a live edit", () => {
+    expect(nextProgressEdit({
+      ...base,
+      text: "partial answer",
+      reasoning: "private reasoning",
+      activity: Option.some("Tool: bash"),
+      verbosity: "quiet",
+    })).toEqual(Option.none())
   })
 
   test("proposes nothing for an empty first tick (same as the working message)", () => {
@@ -581,6 +589,7 @@ describe("nextProgressEdit", () => {
         activity: Option.none(),
         lastSent: "Working…",
         dirty: true,
+        verbosity: "normal",
       }),
     ).toEqual(Option.none())
   })

@@ -62,6 +62,7 @@ See `.env.example` for the complete list.
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |
 | `TELEGRAM_BOT_TOKEN` | For Telegram | None | Token from `@BotFather`. |
+| `TELEGRAM_BOT_POOL` | No | Empty | JSON array of outbound-only delivery bots, for example `[{"id":"delivery-1","token":"..."}]`. The controller remains a delivery candidate. |
 | `TELEGRAM_ALLOWED_USERS` | No | Empty | Comma-separated Telegram user IDs. Empty denies all except `/whoami`. |
 | `TELEGRAM_RUN_TIMEOUT` | No | `10 minutes` | Maximum run time. Use `none` for no limit. |
 | `PROJECT_DIRECTORY` | No | Current directory | Default OpenCode2 project directory. |
