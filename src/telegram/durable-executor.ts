@@ -362,6 +362,8 @@ export type AutoContinueDecision =
   | { readonly action: "giveup" }
   | { readonly action: "continue"; readonly round: number }
 
+type PreparedAutoContinue = AutoContinueDecision | { readonly action: "rejected" }
+
 /**
  * Decide what to do after a finished run. Success resets the consecutive
  * counter; qualifying failures increment it and continue while under the
@@ -624,8 +626,15 @@ export const TelegramDurableExecutorLive: Layer.Layer<
           yield* upload
           yield* jobs.markMediaDelivered(lease.job.id, lease.generation, index + 1)
         }
+        const autoContinue = yield* prepareAutoContinue(lease, payload, result.outcome, progressMessageID).pipe(
+          Effect.catchCause((cause) =>
+            logBoundary("telegram/executor", "auto-continue", "auto continue preparation failed")(cause).pipe(
+              Effect.as<PreparedAutoContinue>({ action: "none" }),
+            ),
+          ),
+        )
         yield* jobs.complete(lease.job.id, lease.generation)
-        yield* maybeAutoContinue(lease, payload, result.outcome, progressMessageID, deliveryApi).pipe(
+        yield* finishAutoContinue(autoContinue, payload, progressMessageID, deliveryApi).pipe(
           Effect.catchCause((cause) =>
             logBoundary("telegram/executor", "auto-continue", "auto continue handling failed")(cause),
           ),
@@ -634,47 +643,21 @@ export const TelegramDurableExecutorLive: Layer.Layer<
 
     const autoContinueKey = (sessionID: string): string => `autocontinue:${sessionID}`
 
-    const maybeAutoContinue = (
+    const prepareAutoContinue = (
       lease: DurableJobLease,
       payload: TelegramJobPayload,
       outcome: string | undefined,
       progressMessageID: number,
-      deliveryApi: TelegramDeliveryClient,
-    ) => Effect.gen(function* () {
+    ): Effect.Effect<PreparedAutoContinue, DurableExecutorError | StoreError | InteractionStoreError> => Effect.gen(function* () {
       const conversation = payload.conversationId
       const enabled = yield* store.getAutoContinue(conversation)
       const storedCount = yield* interaction.get(autoContinueKey(payload.sessionID))
       const currentCount = Option.isSome(storedCount) ? Number(storedCount.value) || 0 : 0
       const decision = decideAutoContinue(enabled, currentCount, outcome)
 
-      const notify = (text: string) => deliveryApi.sendMessage({
-        chatId: payload.runDeliveryRoute.chatId,
-        text,
-        messageThreadId: payload.runDeliveryRoute.threadId,
-        replyToMessageId: progressMessageID > 0 ? progressMessageID : undefined,
-      }).pipe(
-        Effect.catchCause((cause) =>
-          logBoundary("telegram/executor", "telegram-notification", "auto continue notice failed")(cause),
-        ),
-      )
+      if (decision.action !== "continue") return decision
 
-      if (decision.action === "reset") {
-        yield* interaction.set(autoContinueKey(payload.sessionID), 0).pipe(
-          Effect.catchCause((cause) => logBoundary("telegram/executor", "auto-continue", "counter reset failed")(cause)),
-        )
-        return
-      }
-      if (decision.action !== "continue") {
-        if (decision.action === "giveup") {
-          yield* interaction.set(autoContinueKey(payload.sessionID), 0).pipe(
-            Effect.catchCause((cause) => logBoundary("telegram/executor", "auto-continue", "counter reset failed")(cause)),
-          )
-          yield* notify(`Auto-continue stopped after ${AUTO_CONTINUE_MAX} attempts. Send /prompt to try again.`)
-        }
-        return
-      }
-
-      // Requeue a minimal "continue" prompt into the same session and topic.
+      // Queue a minimal "continue" prompt into the same session and topic.
       // Attachments are intentionally not re-downloaded; the model and agent
       // snapshots carry over so the retry runs with the same configuration.
       const syntheticMessage: Message = {
@@ -704,21 +687,51 @@ export const TelegramDurableExecutorLive: Layer.Layer<
       const rand = (yield* Random.nextIntBetween(0, 999)) / 1000
       const availableAt = now + autoContinueDelayMs(decision.round, rand)
       const submitted = yield* submitForCurrentConversation(conversation, payload.sessionID, {
-        sourceKey: `telegram:${conversation}:continue:${decision.round}:${lease.job.id}`,
+        sourceKey: `telegram:${conversation}:continue:${lease.job.id}`,
         channel: "telegram",
         owner: ownerFor(payload.sessionID),
         sessionID: payload.sessionID,
         payload: JSON.stringify(nextPayload),
         availableAt,
+        queuePosition: "front",
       })
-      if (!submitted) {
+      return submitted ? decision : { action: "rejected" }
+    })
+
+    const finishAutoContinue = (
+      prepared: PreparedAutoContinue,
+      payload: TelegramJobPayload,
+      progressMessageID: number,
+      deliveryApi: TelegramDeliveryClient,
+    ) => Effect.gen(function* () {
+      const notify = (text: string) => deliveryApi.sendMessage({
+        chatId: payload.runDeliveryRoute.chatId,
+        text,
+        messageThreadId: payload.runDeliveryRoute.threadId,
+        replyToMessageId: progressMessageID > 0 ? progressMessageID : undefined,
+      }).pipe(
+        Effect.catchCause((cause) =>
+          logBoundary("telegram/executor", "telegram-notification", "auto continue notice failed")(cause),
+        ),
+      )
+
+      if (prepared.action === "reset" || prepared.action === "rejected") {
         yield* interaction.set(autoContinueKey(payload.sessionID), 0).pipe(
           Effect.catchCause((cause) => logBoundary("telegram/executor", "auto-continue", "counter reset failed")(cause)),
         )
         return
       }
-      yield* interaction.set(autoContinueKey(payload.sessionID), decision.round)
-      yield* notify(`Auto-continue ${decision.round}/${AUTO_CONTINUE_MAX}…`)
+      if (prepared.action === "giveup") {
+        yield* interaction.set(autoContinueKey(payload.sessionID), 0).pipe(
+          Effect.catchCause((cause) => logBoundary("telegram/executor", "auto-continue", "counter reset failed")(cause)),
+        )
+        yield* notify(`Auto-continue stopped after ${AUTO_CONTINUE_MAX} attempts. Send /prompt to try again.`)
+        return
+      }
+      if (prepared.action === "continue") {
+        yield* interaction.set(autoContinueKey(payload.sessionID), prepared.round)
+        yield* notify(`Auto-continue ${prepared.round}/${AUTO_CONTINUE_MAX}…`)
+      }
     })
 
     const execute = (lease: DurableJobLease) =>
