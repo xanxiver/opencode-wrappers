@@ -59,6 +59,8 @@ export interface DurableExecutorRepository {
     readonly sessionID?: string
     /** Earliest claim time for the job; defaults to now. */
     readonly availableAt?: number
+    /** Insert before existing unclaimed jobs for this owner. */
+    readonly queuePosition?: "front"
   }) => Effect.Effect<{ readonly job: DurableJob; readonly created: boolean }, DurableExecutorError>
   readonly claimNext: (channel: string) => Effect.Effect<Option.Option<DurableJobLease>, DurableExecutorError>
   readonly forceClaim: (
@@ -276,6 +278,31 @@ export const DurableExecutorStoreLive: Layer.Layer<
         },
         catch: (cause) => cause instanceof DurableLeaseLost ? cause : fail(operation, cause),
       })
+    type PendingOrderRow = Pick<JobRow, "id" | "queue_order">
+    const listPendingOrderRows = (channel: string, owner: string): PendingOrderRow[] =>
+      database.query<PendingOrderRow, [string, string]>(`SELECT id, queue_order
+        FROM executor_jobs
+        WHERE channel = ? AND owner = ? AND state = 'pending' AND lease_generation IS NULL
+        ORDER BY queue_order, rowid`).all(channel, owner)
+    const reorderPendingRows = (
+      rows: PendingOrderRow[],
+      fromIndex: number,
+      toIndex: number,
+    ): boolean => {
+      const selected = rows[fromIndex]
+      if (selected === undefined) return false
+      const orders = rows.map((row) => row.queue_order)
+      rows.splice(fromIndex, 1)
+      rows.splice(toIndex, 0, selected)
+      const update = database.query("UPDATE executor_jobs SET queue_order = ? WHERE id = ? AND state = 'pending' AND lease_generation IS NULL")
+      for (let index = 0; index < rows.length; index += 1) {
+        const row = rows[index]
+        const order = orders[index]
+        if (row === undefined || order === undefined) continue
+        update.run(order, row.id)
+      }
+      return true
+    }
 
     return {
       submit: (input) => Effect.gen(function* () {
@@ -297,6 +324,11 @@ export const DurableExecutorStoreLive: Layer.Layer<
             now,
             now,
           )
+          if (input.queuePosition === "front") {
+            const rows = listPendingOrderRows(input.channel, input.owner)
+            const submittedIndex = rows.findIndex((row) => row.id === id)
+            if (submittedIndex > 0) reorderPendingRows(rows, submittedIndex, 0)
+          }
           const row = selectByID(id)
           if (row === null) throw fail("read submitted durable job", new Error("inserted job is missing"))
           return { job: fromRow(row), created: true }
@@ -469,27 +501,12 @@ export const DurableExecutorStoreLive: Layer.Layer<
           WHERE channel = ? AND state IN ('pending', 'dispatching', 'running', 'finalizing')
           ORDER BY queue_order, rowid`).all(channel).map(fromRow)),
       movePending: (channel, owner, from, to) => withDatabase("move pending durable job", () => transaction(() => {
-        const rows = database.query<Pick<JobRow, "id" | "queue_order">, [string, string]>(`SELECT id, queue_order
-          FROM executor_jobs
-          WHERE channel = ? AND owner = ? AND state = 'pending' AND lease_generation IS NULL
-          ORDER BY queue_order, rowid`).all(channel, owner)
+        const rows = listPendingOrderRows(channel, owner)
         if (from < 1 || to < 1 || from > rows.length || to > rows.length) {
           return { moved: false, count: rows.length }
         }
         if (from === to) return { moved: true, count: rows.length }
-        const orders = rows.map((row) => row.queue_order)
-        const selected = rows[from - 1]
-        if (selected === undefined) return { moved: false, count: rows.length }
-        rows.splice(from - 1, 1)
-        rows.splice(to - 1, 0, selected)
-        const update = database.query("UPDATE executor_jobs SET queue_order = ? WHERE id = ? AND state = 'pending' AND lease_generation IS NULL")
-        for (let index = 0; index < rows.length; index += 1) {
-          const row = rows[index]
-          const order = orders[index]
-          if (row === undefined || order === undefined) continue
-          update.run(order, row.id)
-        }
-        return { moved: true, count: rows.length }
+        return { moved: reorderPendingRows(rows, from - 1, to - 1), count: rows.length }
       })),
       deletePending: (channel, owner, position) => withDatabase("delete pending durable job", () => transaction(() => {
         const rows = database.query<Pick<JobRow, "id">, [string, string]>(`SELECT id FROM executor_jobs
