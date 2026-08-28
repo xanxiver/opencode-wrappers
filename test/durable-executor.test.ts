@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { Cause, Effect, Option, Ref, Schema, Semaphore } from "effect"
+import { Cause, Clock, Effect, Option, Ref, Schema, Semaphore } from "effect"
 import { TestClock } from "effect/testing"
 import { BunCrypto, BunFileSystem, BunPath } from "@effect/platform-bun"
 import { Session } from "@opencode-ai/client/effect"
@@ -320,6 +320,59 @@ describe("DurableExecutorStore", () => {
     expect(result.moved).toEqual({ moved: true, count: 3 })
     expect(result.ordered.map((job) => job.sourceKey)).toEqual(["third", "first", "second"])
     expect(Option.getOrUndefined(result.claimed)?.job.sourceKey).toBe("third")
+  })
+
+  test("puts a delayed front submission ahead of queued owner work without overtaking the active job", async () => {
+    const result = await runWithTestClock(Effect.gen(function* () {
+      const store = yield* DurableExecutorStore
+      yield* submit(store, "active")
+      const active = yield* store.claimNext("telegram")
+      if (Option.isNone(active)) return undefined
+      yield* store.markDispatching(active.value.job.id, active.value.generation)
+      yield* store.markRunning(active.value.job.id, active.value.generation)
+      yield* submit(store, "queued-first")
+      yield* submit(store, "queued-second")
+      const now = yield* Clock.currentTimeMillis
+      yield* store.submit({
+        sourceKey: "auto-continue",
+        channel: "telegram",
+        owner: "1",
+        payload: JSON.stringify({ text: "continue" }),
+        availableAt: now + 30_000,
+        queuePosition: "front",
+      })
+      const pendingOrder = (yield* store.listOwner("telegram", "1"))
+        .filter((job) => job.state === "pending")
+        .map((job) => job.sourceKey)
+      const whileActive = yield* store.claimNext("telegram")
+      yield* store.markFinalizing(active.value.job.id, active.value.generation, "failed")
+      yield* store.complete(active.value.job.id, active.value.generation)
+      const beforeDelay = yield* store.claimNext("telegram")
+      yield* TestClock.adjust("30 seconds")
+      const continuation = yield* store.claimNext("telegram")
+      if (Option.isSome(continuation)) {
+        yield* store.markDispatching(continuation.value.job.id, continuation.value.generation)
+        yield* store.markRunning(continuation.value.job.id, continuation.value.generation)
+        yield* store.markFinalizing(continuation.value.job.id, continuation.value.generation, "continued")
+        yield* store.complete(continuation.value.job.id, continuation.value.generation)
+      }
+      const following = yield* store.claimNext("telegram")
+      return {
+        pendingOrder,
+        whileActive: Option.getOrUndefined(whileActive)?.job.sourceKey,
+        beforeDelay: Option.getOrUndefined(beforeDelay)?.job.sourceKey,
+        continuation: Option.getOrUndefined(continuation)?.job.sourceKey,
+        following: Option.getOrUndefined(following)?.job.sourceKey,
+      }
+    }))
+
+    expect(result).toEqual({
+      pendingOrder: ["auto-continue", "queued-first", "queued-second"],
+      whileActive: undefined,
+      beforeDelay: undefined,
+      continuation: "auto-continue",
+      following: "queued-first",
+    })
   })
 
   test("rejects queue positions outside the movable pending jobs", async () => {
