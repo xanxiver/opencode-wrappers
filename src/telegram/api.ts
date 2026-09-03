@@ -3,6 +3,7 @@ import { HttpBody, HttpClient, HttpClientRequest, HttpClientResponse } from "eff
 import { Stream } from "effect"
 import { AppConfigTag, ConfigError, TELEGRAM_CONTROLLER_BOT_KEY } from "../config.js"
 import type { AppConfig } from "../config.js"
+import { logDebugEvent, type LogAnnotations } from "../core/logging.js"
 
 export class ApiError extends Data.TaggedError("ApiError")<{
   readonly operation: string
@@ -249,6 +250,8 @@ export type TelegramEditPriority = "interactive" | "final" | "progress"
 export type TelegramEditDelivery = "wait" | "background"
 
 export interface EditMessageTextInput {
+  /** Durable run identifier used only for structured diagnostics. */
+  readonly runID?: string
   readonly chatId: number
   readonly messageId: number
   readonly text: string
@@ -341,6 +344,8 @@ export interface TelegramApiClient {
   readonly getUpdates: (offset: number, timeoutSeconds: number) =>
     Effect.Effect<readonly Update[], ApiError, HttpClient.HttpClient>
   readonly sendMessage: (input: {
+    /** Durable run identifier used only for structured diagnostics. */
+    readonly runID?: string
     readonly chatId: number
     readonly text: string
     /** Telegram text parser. Status messages use HTML; other messages omit it. */
@@ -556,6 +561,7 @@ const concatBytes = (chunks: readonly Uint8Array<ArrayBufferLike>[]): Uint8Array
 export interface TelegramApiClientOptions {
   readonly botKey?: string
   readonly editRequestPermits?: Semaphore.Semaphore
+  readonly debug?: boolean
 }
 
 /** Build one token-local client and scheduler. Callers can share the edit semaphore across clients. */
@@ -572,6 +578,14 @@ export const makeTelegramApiClient = (
     const redact = (text: string): string => text.split(token).join("***")
     const base = `https://api.telegram.org/bot${token}`
     const fileBase = `https://api.telegram.org/file/bot${token}`
+    const debug = (
+      boundary: string,
+      message: string,
+      annotations: LogAnnotations = {},
+    ) => logDebugEvent(options.debug === true, "telegram/api", boundary, message, {
+      deliveryBotKey: options.botKey,
+      ...annotations,
+    })
     // Adaptive per-chat edit throttle. The interval starts at the chat-type
     // base (DM 1s, group 6s), doubles on every 429 (respecting Telegram's
     // retry_after) and relaxes halfway after each operation with no 429.
@@ -582,34 +596,59 @@ export const makeTelegramApiClient = (
       )),
     )
     /** Record an accepted edit. Only a request with no 429 relaxes the interval. */
-    const noteSuccessfulEdit = (chatId: number, clean: boolean): Effect.Effect<void> => Clock.currentTimeMillis.pipe(
-      Effect.flatMap((now) => Ref.update(editThrottle, (map) => {
+    const noteSuccessfulEdit = (
+      chatId: number,
+      clean: boolean,
+      runID?: string,
+    ): Effect.Effect<void> => Effect.gen(function* () {
+      const now = yield* Clock.currentTimeMillis
+      const state = yield* Ref.modify(editThrottle, (map) => {
         const base = editBaseInterval(chatId)
         const current = map.get(chatId)
         const previous = current?.intervalMs ?? base
-        return new Map(map).set(chatId, {
+        const next: EditThrottleState = {
           lastEditAt: now,
           quietUntil: current?.quietUntil ?? 0,
           intervalMs: clean ? relaxEditInterval(base, previous) : previous,
-        })
-      })),
-    )
+        }
+        return [next, new Map(map).set(chatId, next)]
+      })
+      yield* debug("telegram-edit-throttle", "Telegram edit throttle recorded an accepted edit", {
+        runID,
+        chatId,
+        clean,
+        intervalMs: state.intervalMs,
+        quietRemainingMs: Math.max(0, state.quietUntil - now),
+      })
+    })
     /** Widen the interval and hold the chat quiet for Telegram's wait. */
-    const penalizeFlood = (chatId: number, retryAfterMs: number | undefined): Effect.Effect<void> =>
-      Clock.currentTimeMillis.pipe(
-        Effect.flatMap((now) => Ref.update(editThrottle, (map) => {
-          const base = editBaseInterval(chatId)
-          const current = map.get(chatId)
-          const intervalMs = penalizeEditInterval(base, current?.intervalMs ?? base, retryAfterMs)
-          const requestedWait = Math.min(RETRY_CAP_MS, retryAfterMs ?? 0)
-          const quietUntil = now + Math.max(requestedWait, intervalMs)
-          return new Map(map).set(chatId, {
-            lastEditAt: current?.lastEditAt ?? 0,
-            quietUntil: Math.max(current?.quietUntil ?? 0, quietUntil),
-            intervalMs,
-          })
-        })),
-      )
+    const penalizeFlood = (
+      chatId: number,
+      retryAfterMs: number | undefined,
+      runID?: string,
+    ): Effect.Effect<void> => Effect.gen(function* () {
+      const now = yield* Clock.currentTimeMillis
+      const state = yield* Ref.modify(editThrottle, (map) => {
+        const base = editBaseInterval(chatId)
+        const current = map.get(chatId)
+        const intervalMs = penalizeEditInterval(base, current?.intervalMs ?? base, retryAfterMs)
+        const requestedWait = Math.min(RETRY_CAP_MS, retryAfterMs ?? 0)
+        const quietUntil = now + Math.max(requestedWait, intervalMs)
+        const next: EditThrottleState = {
+          lastEditAt: current?.lastEditAt ?? 0,
+          quietUntil: Math.max(current?.quietUntil ?? 0, quietUntil),
+          intervalMs,
+        }
+        return [next, new Map(map).set(chatId, next)]
+      })
+      yield* debug("telegram-edit-throttle", "Telegram edit throttle recorded a flood response", {
+        runID,
+        chatId,
+        retryAfterMs,
+        intervalMs: state.intervalMs,
+        quietRemainingMs: Math.max(0, state.quietUntil - now),
+      })
+    })
     const sendMedia = (
       operation: "sendPhoto" | "sendVideo" | "sendDocument",
       field: "photo" | "video" | "document",
@@ -642,7 +681,7 @@ export const makeTelegramApiClient = (
               retryTransient: input.priority !== "progress",
               onRetry: (error) => error.code === 429
                 ? Ref.set(sawFlood, true).pipe(
-                    Effect.andThen(penalizeFlood(input.chatId, error.retryAfterMs)),
+                    Effect.andThen(penalizeFlood(input.chatId, error.retryAfterMs, input.runID)),
                   )
                 : Effect.void,
             })(
@@ -652,12 +691,12 @@ export const makeTelegramApiClient = (
           Effect.catchTag("ApiError", (error) =>
             error.code === 429
               ? Ref.set(sawFlood, true).pipe(
-                  Effect.andThen(penalizeFlood(input.chatId, error.retryAfterMs)),
+                  Effect.andThen(penalizeFlood(input.chatId, error.retryAfterMs, input.runID)),
                   Effect.andThen(Effect.fail(error)),
                 )
               : Effect.fail(error)),
         )
-        yield* noteSuccessfulEdit(input.chatId, !(yield* Ref.get(sawFlood)))
+        yield* noteSuccessfulEdit(input.chatId, !(yield* Ref.get(sawFlood)), input.runID)
         return result
       })
     const logEditScheduler = (
@@ -667,21 +706,27 @@ export const makeTelegramApiClient = (
       warning = false,
     ): Effect.Effect<void> => {
       const priority = request.input.priority ?? "interactive"
-      const message = "telegram edit scheduler event"
-      let event = Effect.logInfo(message)
-      if (priority === "progress") event = Effect.logDebug(message)
-      if (warning) event = Effect.logWarning(message)
-      return Effect.annotateLogs({
-          component: "telegram/api",
-          boundary: "telegram-edit-scheduler",
-          deliveryBotKey: options.botKey,
+      const message = "Telegram edit scheduler changed request state"
+      const annotations = {
+        component: "telegram/api",
+        boundary: "telegram-edit-scheduler",
+        deliveryBotKey: options.botKey,
+        runID: request.input.runID,
+        requestId: request.id,
         stage,
         chatId: request.input.chatId,
         messageId: request.input.messageId,
         priority,
         delivery: request.input.delivery ?? "wait",
+        textLength: request.input.text.length,
+        hasReplyMarkup: request.input.replyMarkup !== undefined,
         ...details,
-      })(event)
+      }
+      if (warning) return Effect.annotateLogs(annotations)(Effect.logWarning(message))
+      if (priority !== "progress") return Effect.annotateLogs(annotations)(Effect.logInfo(message))
+      return options.debug === true
+        ? logDebugEvent(true, "telegram/api", "telegram-edit-scheduler", message, annotations)
+        : Effect.annotateLogs(annotations)(Effect.logDebug(message))
     }
     const runEditWorker = (chatId: number, scheduler: ChatEditScheduler): Effect.Effect<void> =>
       Effect.gen(function* () {
@@ -693,6 +738,16 @@ export const makeTelegramApiClient = (
               const delay = yield* editSlotDelay(chatId)
               if (delay <= 0) break
               throttleWaitMs += delay
+              const pending = yield* Ref.get(scheduler.pending)
+              const nextRequest = pending.urgent[0] ?? pending.progress[0]
+              yield* debug("telegram-edit-scheduler", "Telegram edit worker waits for a chat slot", {
+                runID: nextRequest?.input.runID,
+                chatId,
+                delayMs: delay,
+                throttleWaitMs,
+                urgentDepth: pending.urgent.length,
+                progressDepth: pending.progress.length,
+              })
               yield* Effect.sleep(Duration.millis(delay))
             }
             const processed = yield* editRequestPermits.withPermit(Effect.gen(function* () {
@@ -712,6 +767,13 @@ export const makeTelegramApiClient = (
                 throttleWaitMs,
               })
               const edit = performEdit(request.input).pipe(
+                Effect.annotateLogs({
+                  runID: request.input.runID,
+                  deliveryBotKey: options.botKey,
+                  chatId: request.input.chatId,
+                  messageId: request.input.messageId,
+                  priority: request.input.priority,
+                }),
                 Effect.provideService(HttpClient.HttpClient, httpClient),
               )
               const cancellable = request.cancellation === undefined
@@ -733,7 +795,7 @@ export const makeTelegramApiClient = (
                 // The interrupted HTTP request may already have reached
                 // Telegram. Record a conservative accepted-edit timestamp so
                 // preemption cannot weaken the chat-wide flood interval.
-                yield* noteSuccessfulEdit(request.input.chatId, false)
+                yield* noteSuccessfulEdit(request.input.chatId, false, request.input.runID)
                 yield* logEditScheduler(request, "cancelled", {
                   durationMs: Math.max(0, completedAt - startedAt),
                 })
@@ -816,7 +878,11 @@ export const makeTelegramApiClient = (
               })
             }
           }
-          yield* logEditScheduler(queued.request, "queued", { queueDepth: queued.queueDepth })
+          yield* logEditScheduler(queued.request, "queued", {
+            queueDepth: queued.queueDepth,
+            supersededCount: queued.superseded.length,
+            preemptedActiveProgress: Option.isSome(queued.preempt),
+          })
           yield* Queue.offer(scheduler.wake, undefined)
           if (completion === undefined || cancellation === undefined) return undefined
           return yield* restore(Deferred.await(completion)).pipe(
@@ -839,6 +905,14 @@ export const makeTelegramApiClient = (
         ),
       sendMessage: (input) =>
         Effect.gen(function* () {
+          yield* debug("telegram-message-send", "Telegram message send started", {
+            runID: input.runID,
+            chatId: input.chatId,
+            threadId: input.messageThreadId,
+            replyToMessageId: input.replyToMessageId,
+            textLength: input.text.length,
+            hasReplyMarkup: input.replyMarkup !== undefined,
+          })
           const body = yield* jsonBody("sendMessage", {
             chat_id: input.chatId,
             text: input.text,
@@ -858,12 +932,27 @@ export const makeTelegramApiClient = (
           ).pipe(
             Effect.catchTag("ApiError", (error) =>
               error.code === 429
-                ? penalizeFlood(input.chatId, error.retryAfterMs).pipe(
+                ? penalizeFlood(input.chatId, error.retryAfterMs, input.runID).pipe(
                     Effect.andThen(Effect.fail(error)),
                   )
                 : Effect.fail(error)),
           )
-          return yield* retryErrors(0, request, (error) => error.code === 429)
+          const result = yield* retryErrors(0, request, (error) => error.code === 429).pipe(
+            Effect.annotateLogs({
+              runID: input.runID,
+              deliveryBotKey: options.botKey,
+              chatId: input.chatId,
+              threadId: input.messageThreadId,
+            }),
+          )
+          yield* debug("telegram-message-send", "Telegram message send finished", {
+            runID: input.runID,
+            chatId: input.chatId,
+            threadId: input.messageThreadId,
+            messageId: result.message_id,
+            textLength: input.text.length,
+          })
+          return result
         }),
       sendPhoto: (input) => sendMedia("sendPhoto", "photo", input),
       sendVideo: (input) => sendMedia("sendVideo", "video", input),
@@ -932,6 +1021,9 @@ export const Live: Layer.Layer<TelegramApi, ConfigError, AppConfig | HttpClient.
     const config = yield* AppConfigTag
     const token = config.telegramBotToken
     if (token === undefined) return yield* new ConfigError({ message: "TELEGRAM_BOT_TOKEN is required by the Telegram API" })
-    return yield* makeTelegramApiClient(token, { botKey: TELEGRAM_CONTROLLER_BOT_KEY })
+    return yield* makeTelegramApiClient(token, {
+      botKey: TELEGRAM_CONTROLLER_BOT_KEY,
+      debug: config.telegramStreamDebug === true,
+    })
   }),
 )

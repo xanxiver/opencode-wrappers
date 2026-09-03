@@ -1,5 +1,5 @@
 import { Effect, Option } from "effect"
-import type { Model } from "@opencode-ai/client/effect"
+import type { ModelInfo } from "@opencode-ai/client"
 import { logBoundary } from "../../core/logging.js"
 import { OpenCode } from "../../core/opencode.js"
 import { Sessions } from "../../core/sessions.js"
@@ -14,6 +14,7 @@ import {
   MODEL_PAGE_SIZE,
   modelPageKeyboard,
   modelProviderKeyboard,
+  parseExactModelReference,
   parseModelCancelCallback,
   parseModelCallback,
   parseModelPageCallback,
@@ -538,7 +539,7 @@ export const showModels = (chatId: number, query = "", threadId?: number) =>
     const models = yield* opencode.listModels(directory).pipe(
       Effect.catchCause((cause) =>
         logBoundary("telegram/handlers", "opencode-client", "list models failed")(cause).pipe(
-          Effect.andThen(Effect.succeed<readonly Model.Info[]>([])),
+          Effect.andThen(Effect.succeed<readonly ModelInfo[]>([])),
         ),
       ),
     )
@@ -586,33 +587,49 @@ export const showModels = (chatId: number, query = "", threadId?: number) =>
     })
   })
 
-/** `/model <exact model>` — switch directly without opening the picker. */
+/** `/model <provider/model> [variant]` — switch directly without opening the picker. */
 export const selectExactModel = (chatId: number, query: string, threadId?: number) =>
   Effect.gen(function* () {
     const sessions = yield* Sessions
     const opencode = yield* OpenCode
     const trimmed = query.trim()
-    if (trimmed.length === 0) {
-      yield* sendText(chatId, "Usage: /model <exact-model>", threadId)
+    const reference = parseExactModelReference(trimmed)
+    if (trimmed.length === 0 || Option.isNone(reference)) {
+      yield* sendText(chatId, "Usage: /model <provider/model> [variant]", threadId)
       return
     }
+    const modelReference = reference.value.model
+    const variantReference = reference.value.variant
     const conversation = conversationId({ chatId, threadId })
     const directory = yield* sessions.directoryFor(conversation)
     const sessionID = yield* sessions.getOrCreate(conversation)
     const models = yield* opencode.listModels(directory).pipe(
       Effect.catchCause((cause) => logBoundary("telegram/handlers", "opencode-client", "list models failed")(cause).pipe(
-        Effect.andThen(Effect.succeed<readonly Model.Info[]>([])),
+        Effect.andThen(Effect.succeed<readonly ModelInfo[]>([])),
       )),
     )
-    const matches = models.filter((model) => model.id === trimmed || `${model.providerID}/${model.id}` === trimmed)
+    const matches = models.filter((model) => model.id === modelReference || `${model.providerID}/${model.id}` === modelReference)
     if (matches.length !== 1) {
-      yield* sendText(chatId, matches.length === 0 ? `Model not found: ${trimmed}` : "Model name is ambiguous; use provider/model.", threadId)
+      yield* sendText(chatId, matches.length === 0 ? `Model not found: ${modelReference}` : "Model name is ambiguous; use provider/model.", threadId)
       return
     }
     const selected = matches[0]
     if (selected === undefined) {
-      yield* sendText(chatId, `Model not found: ${trimmed}`, threadId)
+      yield* sendText(chatId, `Model not found: ${modelReference}`, threadId)
       return
+    }
+    if (variantReference !== undefined) {
+      const available = selected.variants.map((variant) => variant.id)
+      if (!available.includes(variantReference)) {
+        yield* sendText(
+          chatId,
+          available.length === 0
+            ? `Model ${modelReference} has no variants.`
+            : `Unknown variant "${variantReference}" for ${modelReference}. Available: ${available.join(", ")}`,
+          threadId,
+        )
+        return
+      }
     }
     const selections = yield* SessionSelection
     const text = yield* selections.withSession(sessionID, Effect.gen(function* () {
@@ -620,7 +637,9 @@ export const selectExactModel = (chatId: number, query: string, threadId?: numbe
       return yield* switchAndRememberModel({
         sessionID,
         agentID: session.agent,
-        model: { id: selected.id, providerID: selected.providerID },
+        model: variantReference === undefined
+          ? { id: selected.id, providerID: selected.providerID }
+          : { id: selected.id, providerID: selected.providerID, variant: variantReference },
       })
     }))
     yield* sendText(chatId, text, threadId)

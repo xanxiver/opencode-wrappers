@@ -1,5 +1,5 @@
 import { Effect, Option } from "effect"
-import type { Info as AgentInfo } from "@opencode-ai/schema/agent"
+import type { AgentInfo } from "@opencode-ai/client"
 import { logBoundary } from "../../core/logging.js"
 import { OpenCode } from "../../core/opencode.js"
 import { Sessions } from "../../core/sessions.js"

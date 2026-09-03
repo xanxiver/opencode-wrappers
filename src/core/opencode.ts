@@ -1,23 +1,24 @@
 import { Buffer } from "node:buffer"
-import { Brand, Context, Data, Effect, FileSystem, Layer, Option, Schema, Stream } from "effect"
-import { HttpClient, HttpClientRequest } from "effect/unstable/http"
+import { Context, Data, Effect, Layer, Option, Stream } from "effect"
 import {
-  AbsolutePath,
-  Form,
-  Location,
-  Model,
   OpenCode as Client,
-  Permission,
-  Project,
-  Provider,
-  Session,
-  SessionMessage,
-  SessionInbox,
-} from "@opencode-ai/client/effect"
-import { Service, type Endpoint } from "@opencode-ai/client/effect/service"
-import type { OpenCodeEvent } from "@opencode-ai/protocol/groups/event"
-import type { PromptInput } from "@opencode-ai/client/effect"
+  type AgentInfo,
+  type FormAnswer,
+  type FormInfo,
+  type FormInfo1,
+  type ModelInfo,
+  type OpenCodeEvent,
+  type PermissionReply,
+  type PermissionRequest,
+  type Project,
+  type SessionInboxInfo,
+  type SessionInboxUser,
+  type SessionInfo,
+  type SessionMessageInfo,
+} from "@opencode-ai/client"
+import { Service, type Endpoint } from "@opencode-ai/client/service"
 import { AppConfigTag, type AppConfig } from "../config.js"
+import type { PromptFileInput } from "./attachments.js"
 import { logBoundary } from "./logging.js"
 
 export class OpenCodeError extends Data.TaggedError("OpenCodeError")<{
@@ -58,10 +59,12 @@ export const projectDirectories = (
   ...project.sandboxes.map((directory) => ({ directory, strategy: "sandbox" })),
 ]
 
-const isQuestionForm = (form: Form.Info): boolean => form.metadata?.kind === "question"
+type QuestionForm = FormInfo | FormInfo1
+
+const isQuestionForm = (form: QuestionForm): boolean => form.metadata?.kind === "question"
 
 /** Convert the form emitted by OpenCode's question tool into the existing question view model. */
-export const questionRequestFromForm = (form: Form.Info): PendingQuestionRequest | undefined => {
+export const questionRequestFromForm = (form: QuestionForm): PendingQuestionRequest | undefined => {
   if (!isQuestionForm(form)) return undefined
   const questions = form.fields.flatMap((field): readonly AgentQuestion[] => {
     if (field.type !== "string" && field.type !== "multiselect") return []
@@ -92,31 +95,33 @@ export const questionRequestFromEvent = (event: OpenCodeEvent): PendingQuestionR
 
 /** Convert UI question answers back to the keyed values expected by a V2 form. */
 export const questionFormAnswer = (
-  form: Form.Info,
+  form: QuestionForm,
   answers: ReadonlyArray<readonly string[]>,
-): Form.Answer => {
-  const fields = form.fields.filter((field) => field.type === "string" || field.type === "multiselect")
-  const answer: Record<string, string | readonly string[]> = {}
-  fields.forEach((field, index) => {
-    const selected = answers[index] ?? []
+): FormAnswer => {
+  const answer: FormAnswer = {}
+  let answerIndex = 0
+  for (const field of form.fields) {
+    if (field.type !== "string" && field.type !== "multiselect") continue
+    const selected = answers[answerIndex] ?? []
     const values = selected.map((label) =>
       field.options?.find((option) => option.label === label)?.value ?? label
     )
     answer[field.key] = field.type === "multiselect" ? values : (values[0] ?? "")
-  })
+    answerIndex += 1
+  }
   return answer
 }
 
 export interface OpenCodeService {
-  readonly createSession: (directory: string) => Effect.Effect<Session.Info, OpenCodeError>
-  readonly getSession: (sessionID: string) => Effect.Effect<Session.Info, OpenCodeError>
+  readonly createSession: (directory: string) => Effect.Effect<SessionInfo, OpenCodeError>
+  readonly getSession: (sessionID: string) => Effect.Effect<SessionInfo, OpenCodeError>
   readonly prompt: (input: {
     readonly sessionID: string
     readonly text: string
-    readonly files?: readonly PromptInput.FileAttachment[]
+    readonly files?: readonly PromptFileInput[]
     readonly delivery?: "steer" | "queue"
-  }) => Effect.Effect<SessionInbox.User, OpenCodeError>
-  readonly listPending: (sessionID: string) => Effect.Effect<readonly SessionInbox.Info[], OpenCodeError>
+  }) => Effect.Effect<SessionInboxUser, OpenCodeError>
+  readonly listPending: (sessionID: string) => Effect.Effect<readonly SessionInboxInfo[], OpenCodeError>
   readonly cancelPending: (input: { readonly sessionID: string; readonly inputID: string }) => Effect.Effect<void, OpenCodeError>
   readonly interrupt: (sessionID: string) => Effect.Effect<void, OpenCodeError>
   readonly wait: (sessionID: string) => Effect.Effect<void, OpenCodeError>
@@ -125,23 +130,23 @@ export interface OpenCodeService {
   readonly revert: (input: { readonly sessionID: string; readonly messageID: string }) => Effect.Effect<void, OpenCodeError>
   readonly listSessions: (input: { readonly directory?: string; readonly cursor?: string; readonly limit?: number; readonly order?: "asc" | "desc" }) =>
     Effect.Effect<{
-      readonly data: readonly Session.Info[]
+      readonly data: readonly SessionInfo[]
       readonly cursor: { readonly previous?: string | null; readonly next?: string | null }
     }, OpenCodeError>
   readonly listMessages: (input: { readonly sessionID: string; readonly limit?: number; readonly cursor?: string; readonly order?: "asc" | "desc" }) =>
-    Effect.Effect<{ readonly data: readonly SessionMessage.Info[]; readonly cursor: { readonly previous?: string; readonly next?: string } }, OpenCodeError>
-  readonly listProjects: () => Effect.Effect<readonly Project.Info[], OpenCodeError>
+    Effect.Effect<{ readonly data: readonly SessionMessageInfo[]; readonly cursor: { readonly previous?: string | null; readonly next?: string | null } }, OpenCodeError>
+  readonly listProjects: () => Effect.Effect<readonly Project[], OpenCodeError>
   readonly listProjectDirectories: (project: ProjectDirectorySource) =>
     Effect.Effect<readonly { readonly directory: string; readonly strategy?: string }[], OpenCodeError>
-  readonly listPendingPermissions: (directory: string) => Effect.Effect<readonly Permission.Request[], OpenCodeError>
+  readonly listPendingPermissions: (directory: string) => Effect.Effect<readonly PermissionRequest[], OpenCodeError>
   readonly listPendingQuestions: (directory: string) => Effect.Effect<readonly PendingQuestionRequest[], OpenCodeError>
   readonly replyPermission: (input: {
     readonly sessionID: string
     readonly requestID: string
-    readonly reply: Permission.Reply
+    readonly reply: PermissionReply
   }) => Effect.Effect<void, OpenCodeError>
-  readonly listModels: (directory: string) => Effect.Effect<readonly Model.Info[], OpenCodeError>
-  readonly listAgents: (directory: string) => Effect.Effect<readonly import("@opencode-ai/schema/agent").Info[], OpenCodeError>
+  readonly listModels: (directory: string) => Effect.Effect<readonly ModelInfo[], OpenCodeError>
+  readonly listAgents: (directory: string) => Effect.Effect<readonly AgentInfo[], OpenCodeError>
   readonly switchAgent: (input: { readonly sessionID: string; readonly agent: string }) => Effect.Effect<void, OpenCodeError>
   readonly switchModel: (input: {
     readonly sessionID: string
@@ -197,6 +202,12 @@ const wrap = (operation: string) =>
       Effect.mapError((cause) => new OpenCodeError({ operation, cause })),
     )
 
+const fromPromise = <A>(
+  operation: string,
+  evaluate: (signal: AbortSignal) => PromiseLike<A>,
+): Effect.Effect<A, OpenCodeError> =>
+  Effect.tryPromise({ try: evaluate, catch: (cause) => cause }).pipe(wrap(operation))
+
 const basicHeader = (username: string, password: string) =>
   "Basic " + Buffer.from(`${username}:${password}`, "utf8").toString("base64")
 
@@ -225,7 +236,7 @@ export const normalizeBaseUrl = (value: string): Effect.Effect<string, OpenCodeE
     catch: (cause) => new OpenCodeError({ operation: "endpoint.url", cause }),
   })
 
-const resolveEndpoint = (): Effect.Effect<ResolvedEndpoint, OpenCodeError, FileSystem.FileSystem | AppConfig> =>
+const resolveEndpoint = (): Effect.Effect<ResolvedEndpoint, OpenCodeError, AppConfig> =>
   Effect.gen(function* () {
     const config = yield* AppConfigTag
     // An explicit endpoint is authoritative. Discovery may supply credentials
@@ -233,11 +244,12 @@ const resolveEndpoint = (): Effect.Effect<ResolvedEndpoint, OpenCodeError, FileS
     const hasConfiguredAuth = config.opencodeUsername !== undefined && config.opencodePassword !== undefined
     let discovered: Endpoint | undefined
     if (shouldDiscoverOpenCodeService(config.opencodeBaseUrl)) {
-      discovered = yield* Service.ensure({ command: ["opencode2", "serve", "--service"] }).pipe(
-        Effect.mapError((cause) => new OpenCodeError({ operation: "service.ensure", cause })),
+      discovered = yield* fromPromise(
+        "service.ensure",
+        () => Service.ensure({ command: ["opencode2", "serve", "--service"] }),
       )
     } else if (!hasConfiguredAuth) {
-      discovered = yield* Service.discover()
+      discovered = yield* fromPromise("service.discover", () => Service.discover())
     }
     const rawBaseUrl = config.opencodeBaseUrl ?? discovered?.url
     if (rawBaseUrl === undefined) {
@@ -267,86 +279,62 @@ const resolveEndpoint = (): Effect.Effect<ResolvedEndpoint, OpenCodeError, FileS
     }
   })
 
-/** Decode a plain string into a branded id required by the client contract. */
-type SessionID = Schema.Schema.Type<typeof Session.ID>
-type SessionCursor = string & Brand.Brand<"SessionsCursor">
-type PermissionID = Schema.Schema.Type<typeof Permission.ID>
-type FormID = Schema.Schema.Type<typeof Form.ID>
-type ModelID = Schema.Schema.Type<typeof Model.ID>
-type ProviderID = Schema.Schema.Type<typeof Provider.ID>
-type VariantID = Schema.Schema.Type<typeof Model.VariantID>
-
-const toSessionID = (value: string): SessionID => Schema.decodeUnknownSync(Session.ID)(value)
-const toMessageID = (value: string) => Schema.decodeUnknownSync(SessionMessage.ID)(value)
-const toSessionCursor = (value: string): SessionCursor =>
-  Schema.decodeUnknownSync(Schema.String.pipe(Schema.brand("SessionsCursor")))(value)
-const toPermissionID = (value: string): PermissionID => Schema.decodeUnknownSync(Permission.ID)(value)
-const toFormID = (value: string): FormID => Schema.decodeUnknownSync(Form.ID)(value)
-const toModelID = (value: string): ModelID => Schema.decodeUnknownSync(Model.ID)(value)
-const toProviderID = (value: string): ProviderID => Schema.decodeUnknownSync(Provider.ID)(value)
-const toVariantID = (value: string): VariantID => Schema.decodeUnknownSync(Model.VariantID)(value)
-
 export const Live: Layer.Layer<
   OpenCode,
   OpenCodeError,
-  FileSystem.FileSystem | HttpClient.HttpClient | AppConfig
+  AppConfig
 > = Layer.effect(
   OpenCode,
   Effect.gen(function* () {
     const endpoint = yield* resolveEndpoint()
-    const httpClient = yield* HttpClient.HttpClient
-    const authenticatedHttpClient = Option.match(endpoint.authorization, {
-      onNone: () => httpClient,
-      onSome: (authorization) =>
-        httpClient.pipe(
-          HttpClient.mapRequest(HttpClientRequest.setHeader("authorization", authorization)),
-        ),
+    const headers = Option.match(endpoint.authorization, {
+      onNone: () => undefined,
+      onSome: (authorization) => ({ authorization }),
     })
-    const client = yield* Client.make({ baseUrl: endpoint.baseUrl }).pipe(
-      Effect.provideService(HttpClient.HttpClient, authenticatedHttpClient),
-    )
+    const client = Client.make({ baseUrl: endpoint.baseUrl, headers })
     return {
       createSession: (directory) =>
-        client.session.create({
-          location: Location.Ref.make({ directory: AbsolutePath.make(directory) }),
-        }).pipe(wrap("session.create")),
+        fromPromise("session.create", (signal) =>
+          client.session.create({ location: { directory } }, { signal })),
       getSession: (sessionID) =>
-        client.session.get({ sessionID: toSessionID(sessionID) }).pipe(wrap("session.get")),
+        fromPromise("session.get", (signal) => client.session.get({ sessionID }, { signal })),
       prompt: (input) =>
-        client.session.prompt({
-          sessionID: toSessionID(input.sessionID),
+        fromPromise("session.prompt", (signal) => client.session.prompt({
+          sessionID: input.sessionID,
           text: input.text,
           files: input.files ?? [],
           delivery: input.delivery,
-        }).pipe(wrap("session.prompt")),
-       listPending: (sessionID) => client.session.inbox.list({ sessionID: toSessionID(sessionID) }).pipe(wrap("session.inbox.list")),
-       cancelPending: (input) =>
-         client.session.inbox.cancel({ sessionID: toSessionID(input.sessionID), inboxID: toMessageID(input.inputID) }).pipe(
-           wrap("session.inbox.cancel"),
-         ),
+        }, { signal })),
+      listPending: (sessionID) =>
+        fromPromise("session.inbox.list", (signal) =>
+          client.session.inbox.list({ sessionID }, { signal })),
+      cancelPending: (input) =>
+        fromPromise("session.inbox.cancel", (signal) =>
+          client.session.inbox.cancel({ sessionID: input.sessionID, inboxID: input.inputID }, { signal })),
       interrupt: (sessionID) =>
-        client.session.interrupt({ sessionID: toSessionID(sessionID) }).pipe(wrap("session.interrupt")),
+        fromPromise("session.interrupt", (signal) =>
+          client.session.interrupt({ sessionID }, { signal })).pipe(Effect.asVoid),
       wait: (sessionID) =>
-        client.session.wait({ sessionID: toSessionID(sessionID) }).pipe(wrap("session.wait")),
+        fromPromise("session.wait", (signal) => client.session.wait({ sessionID }, { signal })),
       activeSessions: () =>
-        client.session.active().pipe(
-          wrap("session.active"),
+        fromPromise("session.active", (signal) => client.session.active({ signal })).pipe(
           Effect.map((active) => Object.keys(active)),
         ),
       compact: (sessionID) =>
-        client.session.compact({ sessionID: toSessionID(sessionID) }).pipe(
-          Effect.map(() => undefined),
-         wrap("session.compact"),
-       ),
+        fromPromise("session.compact", (signal) =>
+          client.session.compact({ sessionID }, { signal })).pipe(Effect.asVoid),
       revert: (input) =>
-        client.session.revert.stage({ sessionID: toSessionID(input.sessionID), messageID: toMessageID(input.messageID), files: true }).pipe(
-          wrap("session.revert.stage"),
+        fromPromise("session.revert.stage", (signal) => client.session.revert.stage({
+          sessionID: input.sessionID,
+          messageID: input.messageID,
+          files: true,
+        }, { signal })).pipe(
           Effect.andThen(
-            client.session.revert.commit({ sessionID: toSessionID(input.sessionID) }).pipe(
-              wrap("session.revert.commit"),
+            fromPromise("session.revert.commit", (signal) =>
+              client.session.revert.commit({ sessionID: input.sessionID }, { signal })).pipe(
               Effect.catchCause((cause) =>
-                client.session.revert.clear({ sessionID: toSessionID(input.sessionID) }).pipe(
-                  wrap("session.revert.clear"),
+                fromPromise("session.revert.clear", (signal) =>
+                  client.session.revert.clear({ sessionID: input.sessionID }, { signal })).pipe(
                   Effect.catchCause((cleanupCause) =>
                     logBoundary("core/opencode", "session.revert.clear", "failed to clear staged revert after commit failure")(cleanupCause)),
                   Effect.andThen(Effect.failCause(cause)),
@@ -355,84 +343,84 @@ export const Live: Layer.Layer<
             ),
           ),
         ),
-       listSessions: (input) =>
-       client.session.list({
-          directory: input.directory === undefined ? undefined : AbsolutePath.make(input.directory),
-          cursor: input.cursor === undefined ? undefined : toSessionCursor(input.cursor),
+      listSessions: (input) =>
+        fromPromise("session.list", (signal) => client.session.list({
+          directory: input.directory,
+          cursor: input.cursor,
           limit: input.limit,
           order: input.order,
-        }).pipe(
-          wrap("session.list"),
-         Effect.map((output) => ({ data: output.data, cursor: output.cursor })),
-         ),
-      listMessages: (input) =>
-        client.message.list({ sessionID: toSessionID(input.sessionID), limit: input.limit, cursor: input.cursor, order: input.order }).pipe(
-          wrap("message.list"),
+        }, { signal })).pipe(
           Effect.map((output) => ({ data: output.data, cursor: output.cursor })),
         ),
-      listProjects: () => client.project.list().pipe(wrap("project.list")),
+      listMessages: (input) =>
+        fromPromise("message.list", (signal) => client.message.list({
+          sessionID: input.sessionID,
+          limit: input.limit,
+          cursor: input.cursor,
+          order: input.order,
+        }, { signal })).pipe(
+          Effect.map((output) => ({ data: output.data, cursor: output.cursor })),
+        ),
+      listProjects: () =>
+        fromPromise("project.list", (signal) => client.project.list({ signal })),
       listProjectDirectories: (project) => Effect.succeed(projectDirectories(project)),
-       listPendingPermissions: (directory) =>
-         client.permission.request.list({
-           location: { directory },
-        }).pipe(
-          wrap("permission.request.list"),
+      listPendingPermissions: (directory) =>
+        fromPromise("permission.request.list", (signal) => client.permission.request.list({
+          location: { directory },
+        }, { signal })).pipe(
           Effect.map((output) => output.data),
         ),
-       listPendingQuestions: (directory) =>
-          client.form.request.list({ location: { directory } }).pipe(
-            wrap("form.request.list"),
-            Effect.map((output) => output.data.flatMap((form) => {
-              const request = questionRequestFromForm(form)
-              return request === undefined ? [] : [request]
-            })),
-          ),
+      listPendingQuestions: (directory) =>
+        fromPromise("form.request.list", (signal) =>
+          client.form.request.list({ location: { directory } }, { signal })).pipe(
+          Effect.map((output) => output.data.flatMap((form) => {
+            const request = questionRequestFromForm(form)
+            return request === undefined ? [] : [request]
+          })),
+        ),
       replyPermission: (input) =>
-        client.permission.reply({
-          sessionID: toSessionID(input.sessionID),
-          requestID: toPermissionID(input.requestID),
+        fromPromise("permission.reply", (signal) => client.permission.reply({
+          sessionID: input.sessionID,
+          requestID: input.requestID,
           reply: input.reply,
-        }).pipe(wrap("permission.reply")),
+        }, { signal })),
       listModels: (directory) =>
-         client.model.list({
-           location: Location.Ref.make({ directory: AbsolutePath.make(directory) }),
-        }).pipe(
-          wrap("model.list"),
+        fromPromise("model.list", (signal) => client.model.list({
+          location: { directory },
+        }, { signal })).pipe(
           Effect.map((output) => output.data),
         ),
       listAgents: (directory) =>
-        client.agent.list({ location: { directory } }).pipe(
-          wrap("agent.list"),
+        fromPromise("agent.list", (signal) =>
+          client.agent.list({ location: { directory } }, { signal })).pipe(
           Effect.map((output) => output.data),
         ),
       switchAgent: (input) =>
-        client.session.switchAgent({
-          sessionID: toSessionID(input.sessionID),
-          agent: Schema.decodeUnknownSync(Schema.String.pipe(Schema.brand("Agent.ID")))(input.agent),
-        }).pipe(wrap("session.switchAgent")),
+        fromPromise("session.switchAgent", (signal) => client.session.switchAgent({
+          sessionID: input.sessionID,
+          agent: input.agent,
+        }, { signal })),
       switchModel: (input) =>
-        client.session.switchModel({
-          sessionID: toSessionID(input.sessionID),
-          model: {
-            id: toModelID(input.model.id),
-            providerID: toProviderID(input.model.providerID),
-            variant: input.model.variant === undefined ? undefined : toVariantID(input.model.variant),
-          },
-        }).pipe(wrap("session.switchModel")),
+        fromPromise("session.switchModel", (signal) => client.session.switchModel({
+          sessionID: input.sessionID,
+          model: input.model,
+        }, { signal })),
       replyQuestion: (input) => {
-        const sessionID = toSessionID(input.sessionID)
-        const formID = toFormID(input.requestID)
-        return client.form.get({ sessionID, formID }).pipe(
-          wrap("form.get"),
-          Effect.flatMap((form) => {
-            return client.form.reply({ sessionID, formID, answer: questionFormAnswer(form, input.answers) })
-          }),
-          wrap("form.reply"),
+        const sessionID = input.sessionID
+        const formID = input.requestID
+        return fromPromise("form.get", (signal) =>
+          client.form.get({ sessionID, formID }, { signal })).pipe(
+          Effect.flatMap((form) => fromPromise("form.reply", (signal) => client.form.reply({
+            sessionID,
+            formID,
+            answer: questionFormAnswer(form, input.answers),
+          }, { signal }))),
         )
       },
       events: () =>
-        client.event.subscribe().pipe(
-          Stream.mapError((cause) => new OpenCodeError({ operation: "event.subscribe", cause })),
+        Stream.fromAsyncIterable(
+          client.event.subscribe(),
+          (cause) => new OpenCodeError({ operation: "event.subscribe", cause }),
         ),
     }
   }),

@@ -1,9 +1,7 @@
 import { describe, expect, test } from "bun:test"
-import { Cause, Clock, Effect, Option, Ref, Schema, Semaphore } from "effect"
+import { Cause, Clock, Effect, Option, Ref, Semaphore } from "effect"
 import { TestClock } from "effect/testing"
 import { BunCrypto, BunFileSystem, BunPath } from "@effect/platform-bun"
-import { Session } from "@opencode-ai/client/effect"
-import * as Agent from "@opencode-ai/schema/agent"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { AppConfig, AppConfigTag } from "../src/config.js"
@@ -22,6 +20,7 @@ import type { SessionsError } from "../src/core/sessions.js"
 import { AUTO_CONTINUE_BASE_DELAY_MS, AUTO_CONTINUE_MAX_DELAY_MS, agentSwitchRetriesExhausted, decideAutoContinue, decodeAttachmentSnapshots, encodeAttachmentSnapshots, autoContinueDelayMs, finalEditDisposition, finishNotificationWord, forceReconnectPayload, hasRunPipeline, modelSwitchRetriesExhausted, normalizeTelegramJobPayload, redactedReviewEvidence, resetConversationUsing, resolveOwnedDurableReview, resolveRunSelectionUsing, runQueueItems, runSelectionFields, runSnapshotFields, settleFinalEditError, submitForCurrentConversationUsing, whenSubmissionSourceMissingUsing, withChangesSummaryUsing } from "../src/telegram/durable-executor.js"
 import { ApiError } from "../src/telegram/api.js"
 import { AgentSwitchError, ModelSwitchError } from "../src/telegram/run.js"
+import { makeAgentInfo, makeSessionInfo } from "./opencode-fixtures.js"
 
 const config = () => new AppConfig({
   telegramBotToken: "test-token",
@@ -800,11 +799,11 @@ describe("resolveRunSelectionUsing", () => {
     }
     const withAgent = input.agent === undefined ? base : { ...base, agent: input.agent }
     const withModel = input.model === undefined ? withAgent : { ...withAgent, model: input.model }
-    return Schema.decodeUnknownSync(Session.Info)(withModel)
+    return makeSessionInfo(withModel)
   }
 
-  const configuredAgent = Schema.decodeUnknownSync(Agent.Info)({
-    ...Agent.Info.default(Agent.ID.make("build")),
+  const configuredAgent = makeAgentInfo({
+    id: "build",
     name: "Build",
     model: { id: "configured", providerID: "provider" },
   })

@@ -17,7 +17,7 @@ import {
   type DurableJobState,
   type DurableExecutorRepository,
 } from "../core/durable-executor.js"
-import { logBoundary } from "../core/logging.js"
+import { logBoundary, logDebugEvent, type LogAnnotations } from "../core/logging.js"
 import { GitChanges, type GitChangesService } from "../core/git-changes.js"
 import { OpenCode, type OpenCodeError, type OpenCodeService } from "../core/opencode.js"
 import { Sessions, type SessionsError, type SessionsService } from "../core/sessions.js"
@@ -494,7 +494,8 @@ export const TelegramDurableExecutorLive: Layer.Layer<
     yield* TelegramApi
     const botPool = yield* TelegramBotPool
     const deliveryAssignments = yield* TelegramDeliveryAssignments
-    yield* AppConfigTag
+    const config = yield* AppConfigTag
+    const debugEnabled = config.telegramStreamDebug === true
     yield* FileSystem.FileSystem
     yield* Path.Path
     const permissionRegistry = yield* PermissionRegistry
@@ -503,6 +504,13 @@ export const TelegramDurableExecutorLive: Layer.Layer<
     const interaction = yield* InteractionStore
     const selections = yield* SessionSelection
     const context = yield* Effect.context<DurableExecutorStore | Sessions | Store | OpenCode | TelegramApi | TelegramBotPool | TelegramDeliveryAssignments | AppConfig | FileSystem.FileSystem | Path.Path | HttpClient.HttpClient | PermissionRegistry | QuestionRegistry | GitChanges | InteractionStore | SessionSelection>()
+    const debugStream = (message: string, annotations: LogAnnotations = {}) => logDebugEvent(
+      debugEnabled,
+      "telegram/executor",
+      "message-stream",
+      message,
+      annotations,
+    )
     const fibers = yield* FiberMap.make<string, void, never>()
     const conversationLocks = yield* Ref.make<ReadonlyMap<string, Semaphore.Semaphore>>(new Map())
     const conversationLockFor = (conversation: string): Effect.Effect<Semaphore.Semaphore> =>
@@ -552,15 +560,41 @@ export const TelegramDurableExecutorLive: Layer.Layer<
 
     const deliverPersistedFinal = (lease: DurableJobLease, payload: TelegramJobPayload) =>
       Effect.gen(function* () {
-        const deliveryApi = yield* botPool.getClient(payload.runDeliveryRoute.botKey)
+        const debugFinal = (message: string, annotations: LogAnnotations = {}) => debugStream(message, {
+          runID: lease.job.id,
+          sessionID: payload.sessionID,
+          deliveryBotKey: payload.runDeliveryRoute.botKey,
+          chatId: payload.runDeliveryRoute.chatId,
+          threadId: payload.runDeliveryRoute.threadId,
+          progressMessageId: lease.job.progressMessageID,
+          ...annotations,
+        })
+        yield* debugFinal("Persisted Telegram final delivery started", {
+          recoveredFrom: lease.recoveredFrom,
+          attempt: lease.job.attempt,
+        })
+        const deliveryApi = yield* botPool.getClient(payload.runDeliveryRoute.botKey).pipe(
+          Effect.catchTag("DeliveryBotUnavailable", (error) => debugFinal(
+            "Persisted Telegram final delivery could not acquire its bot",
+            { unavailableBotKey: error.botKey },
+          ).pipe(Effect.andThen(Effect.fail(error)))),
+        )
+        yield* debugFinal("Persisted Telegram final delivery acquired its bot")
         const encoded = lease.job.terminalResult
         if (encoded === undefined) {
+          yield* debugFinal("Persisted Telegram final response is missing")
           yield* jobs.fail(lease.job.id, lease.generation, "finalizing job has no terminal result", true)
           return
         }
         const result = yield* decodeFinalization(encoded)
-        let progressMessageID = lease.job.progressMessageID
+        yield* debugFinal("Persisted Telegram final response decoded", {
+          outcome: result.outcome,
+          finalTextLength: result.text.length,
+          finalMediaCount: result.media.length,
+        })
+        const progressMessageID = lease.job.progressMessageID
         if (progressMessageID === undefined) {
+          yield* debugFinal("Persisted Telegram final response has no anchor")
           yield* jobs.fail(lease.job.id, lease.generation, "finalizing job has no durable Telegram anchor", true)
           yield* sendText(
             payload.controllerRoute.chatId,
@@ -570,6 +604,9 @@ export const TelegramDurableExecutorLive: Layer.Layer<
           return
         }
         if (lease.job.mediaDeliveryIndex !== undefined) {
+          yield* debugFinal("Persisted Telegram media delivery has an uncertain result", {
+            mediaIndex: lease.job.mediaDeliveryIndex,
+          })
           yield* jobs.fail(
             lease.job.id,
             lease.generation,
@@ -583,7 +620,12 @@ export const TelegramDurableExecutorLive: Layer.Layer<
           )
           return
         }
+        yield* debugFinal("Telegram final edit entered the scheduler", {
+          messageId: progressMessageID,
+          finalTextLength: result.text.length,
+        })
         const finalEditSucceeded = yield* deliveryApi.editMessageText({
+          runID: lease.job.id,
           chatId: payload.runDeliveryRoute.chatId,
           messageId: progressMessageID,
           text: result.text,
@@ -592,20 +634,33 @@ export const TelegramDurableExecutorLive: Layer.Layer<
           Effect.as(true),
           Effect.catchTag("ApiError", (error) => settleFinalEditError(jobs, lease, error)),
         )
+        yield* debugFinal("Telegram final edit finished", {
+          messageId: progressMessageID,
+          accepted: finalEditSucceeded,
+        })
         if (!finalEditSucceeded) return
         // A new reply (unlike an edit) makes Telegram notify the user that
         // this run finished, with the outcome as the whole message.
         const word = finishNotificationWord(result.outcome, result.text)
-        yield* deliveryApi.sendMessage({
+        const notificationSent = yield* deliveryApi.sendMessage({
+          runID: lease.job.id,
           chatId: payload.runDeliveryRoute.chatId,
           text: word,
           messageThreadId: payload.runDeliveryRoute.threadId,
           replyToMessageId: progressMessageID,
         }).pipe(
+          Effect.as(true),
           Effect.catchCause((cause) =>
-            logBoundary("telegram/executor", "telegram-notification", "finish notification failed")(cause),
+            logBoundary("telegram/executor", "telegram-notification", "finish notification failed")(cause).pipe(
+              Effect.as(false),
+            ),
           ),
         )
+        yield* debugFinal("Telegram finish notification finished", {
+          messageId: progressMessageID,
+          notification: word,
+          sent: notificationSent,
+        })
         for (let index = lease.job.deliveredMediaCount; index < result.media.length; index += 1) {
           const media = result.media[index]
           if (media === undefined) continue
@@ -622,9 +677,15 @@ export const TelegramDurableExecutorLive: Layer.Layer<
           let upload = deliveryApi.sendDocument(mediaInput)
           if (media.delivery !== "document" && media.mime.startsWith("image/")) upload = deliveryApi.sendPhoto(mediaInput)
           else if (media.mime.startsWith("video/")) upload = deliveryApi.sendVideo(mediaInput)
+          yield* debugFinal("Telegram final media delivery started", {
+            mediaIndex: index,
+            mediaMime: media.mime,
+            mediaBytes: mediaInput.bytes.length,
+          })
           yield* jobs.beginMediaDelivery(lease.job.id, lease.generation, index)
           yield* upload
           yield* jobs.markMediaDelivered(lease.job.id, lease.generation, index + 1)
+          yield* debugFinal("Telegram final media delivery finished", { mediaIndex: index })
         }
         const autoContinue = yield* prepareAutoContinue(lease, payload, result.outcome, progressMessageID).pipe(
           Effect.catchCause((cause) =>
@@ -634,6 +695,7 @@ export const TelegramDurableExecutorLive: Layer.Layer<
           ),
         )
         yield* jobs.complete(lease.job.id, lease.generation)
+        yield* debugFinal("Telegram durable stream job completed")
         yield* finishAutoContinue(autoContinue, payload, progressMessageID, deliveryApi).pipe(
           Effect.catchCause((cause) =>
             logBoundary("telegram/executor", "auto-continue", "auto continue handling failed")(cause),
@@ -737,7 +799,8 @@ export const TelegramDurableExecutorLive: Layer.Layer<
     const execute = (lease: DurableJobLease) =>
       Effect.gen(function* () {
         const payload = yield* decodePayload(lease.job)
-        yield* Effect.annotateLogs({
+        const debugRun = (message: string, annotations: LogAnnotations = {}) => debugStream(message, {
+          runID: lease.job.id,
           controllerBotKey: payload.controllerRoute.botKey,
           deliveryBotKey: payload.runDeliveryRoute.botKey,
           conversationId: payload.conversationId,
@@ -746,8 +809,19 @@ export const TelegramDurableExecutorLive: Layer.Layer<
           sessionID: payload.sessionID,
           assignmentGeneration: payload.assignmentGeneration,
           legacyOwnership: payload.assignmentGeneration === 0,
-        })(Effect.logDebug("executing Telegram durable delivery"))
+          ...annotations,
+        })
+        yield* debugRun("Telegram durable stream execution started", {
+          state: lease.job.state,
+          recoveredFrom: lease.recoveredFrom,
+          attempt: lease.job.attempt,
+          inputID: lease.job.inputID,
+          progressMessageId: lease.job.progressMessageID,
+          promptTextLength: payload.text.length,
+          verbosity: payload.verbosity ?? DEFAULT_STREAM_VERBOSITY,
+        })
         if (lease.job.progressMessageID === PROGRESS_DELIVERY_IN_FLIGHT_MESSAGE_ID) {
+          yield* debugRun("Telegram stream anchor has an uncertain result")
           yield* jobs.fail(
             lease.job.id,
             lease.generation,
@@ -762,11 +836,13 @@ export const TelegramDurableExecutorLive: Layer.Layer<
           return
         }
         if (lease.recoveredFrom === "finalizing") {
+          yield* debugRun("Telegram durable stream resumes final delivery")
           yield* deliverPersistedFinal(lease, payload)
           return
         }
 
         if (lease.recoveredFrom === "dispatching") {
+          yield* debugRun("OpenCode prompt acceptance has an uncertain result")
           yield* jobs.fail(
             lease.job.id,
             lease.generation,
@@ -784,10 +860,14 @@ export const TelegramDurableExecutorLive: Layer.Layer<
         const recoveringRun = lease.recoveredFrom === "running"
         const reconnect = payload.reconnect === true || recoveringRun
         if (recoveringRun) {
+          yield* debugRun("Telegram durable stream recovery started")
           const active = yield* opencode.activeSessions()
           if (!active.includes(payload.sessionID)) {
             if (lease.job.inputID !== undefined) {
-              const response = yield* recoveredResponseFromHistory(payload.sessionID, lease.job.inputID)
+              const response = yield* recoveredResponseFromHistory(payload.sessionID, lease.job.inputID, {
+                enabled: debugEnabled,
+                runID: lease.job.id,
+              })
               if (Option.isSome(response)) {
                 const rendered = yield* renderTelegramMermaid(renderFinal(response.value.text, "done"))
                 const finalization = yield* withChangesSummaryUsing(gitChanges, {
@@ -796,6 +876,10 @@ export const TelegramDurableExecutorLive: Layer.Layer<
                   outcome: "done",
                 }, payload.directory)
                 yield* jobs.markFinalizing(lease.job.id, lease.generation, encodeFinalization(finalization))
+                yield* debugRun("Recovered Telegram final response was persisted", {
+                  finalTextLength: finalization.text.length,
+                  finalMediaCount: finalization.media.length,
+                })
                 const current = yield* jobs.get(lease.job.id)
                 if (Option.isSome(current)) {
                   yield* deliverPersistedFinal({ ...lease, job: current.value, recoveredFrom: "finalizing" }, payload)
@@ -803,6 +887,7 @@ export const TelegramDurableExecutorLive: Layer.Layer<
                 }
               }
             }
+            yield* debugRun("Telegram durable stream recovery could not find a final response")
             yield* jobs.fail(
               lease.job.id,
               lease.generation,
@@ -817,8 +902,10 @@ export const TelegramDurableExecutorLive: Layer.Layer<
             return
           }
           yield* jobs.markRunning(lease.job.id, lease.generation, lease.job.inputID)
+          yield* debugRun("Telegram durable stream reattached to the active session")
         } else if (payload.reconnect === true) {
           yield* jobs.markRunning(lease.job.id, lease.generation)
+          yield* debugRun("Telegram durable stream marked reconnect as running")
         }
 
         let filesOption: Option.Option<readonly Attachment[]>
@@ -844,10 +931,18 @@ export const TelegramDurableExecutorLive: Layer.Layer<
                 }),
               )
         }
-        if (Option.isNone(filesOption)) return
+        if (Option.isNone(filesOption)) {
+          yield* debugRun("Telegram stream attachment preparation stopped the run")
+          return
+        }
         const files = filesOption.value
+        yield* debugRun("Telegram stream attachment preparation finished", {
+          attachmentCount: files.length,
+        })
         const deliveryApi = yield* botPool.getClient(payload.runDeliveryRoute.botKey)
-        yield* runPrompt({
+        yield* debugRun("Telegram message stream runner started")
+        const finalization = yield* runPrompt({
+          runID: lease.job.id,
           sessionID: payload.sessionID,
           text: payload.text,
           files,
@@ -860,23 +955,45 @@ export const TelegramDurableExecutorLive: Layer.Layer<
           inputID: lease.job.inputID,
           progressMessageID: lease.job.progressMessageID,
           deliveryApi,
-          onProgressDispatching: () => jobs.beginProgressDelivery(lease.job.id, lease.generation),
+          onProgressDispatching: () => jobs.beginProgressDelivery(lease.job.id, lease.generation).pipe(
+            Effect.andThen(debugRun("Telegram stream anchor delivery was fenced")),
+          ),
           onProgressRejected: () => jobs.fail(
-            lease.job.id,
-            lease.generation,
-            "Telegram definitively rejected the initial progress message",
+              lease.job.id,
+              lease.generation,
+              "Telegram definitively rejected the initial progress message",
+            ).pipe(Effect.andThen(debugRun("Telegram rejected the stream anchor"))),
+          onDispatching: () => jobs.markDispatching(lease.job.id, lease.generation).pipe(
+            Effect.andThen(debugRun("OpenCode prompt dispatch was fenced")),
           ),
-          onDispatching: () => jobs.markDispatching(lease.job.id, lease.generation),
-          onProgressMessage: (messageID) => jobs.markProgressMessage(lease.job.id, lease.generation, messageID),
-          onAccepted: (inputID) => jobs.markRunning(lease.job.id, lease.generation, inputID),
-          onFinalizing: (result) => withChangesSummaryUsing(gitChanges, result, payload.directory).pipe(
-            Effect.andThen((enriched) =>
-              jobs.markFinalizing(lease.job.id, lease.generation, encodeFinalization(enriched))
-            ),
+          onProgressMessage: (messageID) => jobs.markProgressMessage(
+              lease.job.id,
+              lease.generation,
+              messageID,
+            ).pipe(Effect.andThen(debugRun("Telegram stream anchor was persisted", { messageId: messageID }))),
+          onAccepted: (inputID) => jobs.markRunning(lease.job.id, lease.generation, inputID).pipe(
+            Effect.andThen(debugRun("OpenCode prompt acceptance was persisted", { inputID })),
           ),
+          onFinalizing: (result) => Effect.gen(function* () {
+            const enriched = yield* withChangesSummaryUsing(gitChanges, result, payload.directory)
+            yield* jobs.markFinalizing(lease.job.id, lease.generation, encodeFinalization(enriched))
+            yield* debugRun("Telegram final response was persisted", {
+              outcome: enriched.outcome,
+              finalTextLength: enriched.text.length,
+              finalMediaCount: enriched.media.length,
+            })
+          }),
+        })
+        yield* debugRun("Telegram message stream runner finished", {
+          outcome: finalization.outcome,
+          finalTextLength: finalization.text.length,
+          finalMediaCount: finalization.media.length,
         })
         const current = yield* jobs.get(lease.job.id)
-        if (Option.isNone(current)) return
+        if (Option.isNone(current)) {
+          yield* debugRun("Telegram durable stream job disappeared before final delivery")
+          return
+        }
         yield* deliverPersistedFinal({ ...lease, job: current.value, recoveredFrom: "finalizing" }, payload)
       })
 
@@ -893,7 +1010,15 @@ export const TelegramDurableExecutorLive: Layer.Layer<
           const deliveryUnavailable = Cause.findErrorOption(cause).pipe(
             Option.exists((error) => error instanceof DeliveryBotUnavailable),
           )
-          return logBoundary("telegram/executor", "durable-job", leaseLost ? "durable job lease lost" : "durable job failed")(cause).pipe(
+          return debugStream("Telegram durable stream execution failed", {
+            runID: lease.job.id,
+            state: lease.job.state,
+            recoveredFrom: lease.recoveredFrom,
+            attempt: lease.job.attempt,
+            leaseLost,
+            deliveryUnavailable,
+          }).pipe(
+            Effect.andThen(logBoundary("telegram/executor", "durable-job", leaseLost ? "durable job lease lost" : "durable job failed")(cause)),
             Effect.andThen(leaseLost
               ? Effect.void
               : jobs.get(lease.job.id).pipe(
@@ -902,15 +1027,28 @@ export const TelegramDurableExecutorLive: Layer.Layer<
                     onSome: (current) => {
                       const delay = Math.min(60_000, 1_000 * 2 ** Math.min(current.attempt, 6))
                       if (deliveryUnavailable && RUN_PIPELINE_STATES.includes(current.state)) {
-                        return jobs.defer(
-                          lease.job.id,
-                          lease.generation,
-                          "assigned Telegram delivery bot is unavailable",
-                          delay,
+                        return debugStream("Telegram durable stream waits for its assigned bot", {
+                          runID: lease.job.id,
+                          state: current.state,
+                          attempt: current.attempt,
+                          retryDelayMs: delay,
+                        }).pipe(
+                          Effect.andThen(jobs.defer(
+                            lease.job.id,
+                            lease.generation,
+                            "assigned Telegram delivery bot is unavailable",
+                            delay,
+                          )),
                         )
                       }
                       if (current.state === "finalizing") {
-                        return jobs.defer(lease.job.id, lease.generation, Cause.pretty(cause), delay)
+                        return debugStream("Telegram final delivery was deferred", {
+                          runID: lease.job.id,
+                          attempt: current.attempt,
+                          retryDelayMs: delay,
+                        }).pipe(
+                          Effect.andThen(jobs.defer(lease.job.id, lease.generation, Cause.pretty(cause), delay)),
+                        )
                       }
                       if (current.state === "pending") {
                         if (current.progressMessageID === PROGRESS_DELIVERY_IN_FLIGHT_MESSAGE_ID) {
@@ -962,6 +1100,11 @@ export const TelegramDurableExecutorLive: Layer.Layer<
                   Effect.catchCause((storeCause) => logBoundary("telegram/executor", "durable-store", "record job failure failed")(storeCause)),
                 )),
           )
+        }),
+        Effect.annotateLogs({
+          runID: lease.job.id,
+          durableState: lease.job.state,
+          recoveredFrom: lease.recoveredFrom,
         }),
       )
     }
@@ -1068,7 +1211,38 @@ export const TelegramDurableExecutorLive: Layer.Layer<
               }))
             }),
           )
-          if (Option.isNone(submitted) || !submitted.value.created) return
+          if (Option.isNone(submitted)) {
+            yield* debugStream("Telegram stream job submission matched an existing source", {
+              sessionID,
+              conversationId: conversation,
+              controllerBotKey: TELEGRAM_CONTROLLER_BOT_KEY,
+              chatId,
+              threadId: message.message_thread_id,
+              sourceMessageId: message.message_id,
+            })
+            return
+          }
+          if (!submitted.value.created) {
+            yield* debugStream("Telegram stream job submission reused a durable job", {
+              runID: submitted.value.job.id,
+              sessionID,
+              conversationId: conversation,
+              chatId,
+              threadId: message.message_thread_id,
+              sourceMessageId: message.message_id,
+            })
+            return
+          }
+          yield* debugStream("Telegram stream job was submitted", {
+            runID: submitted.value.job.id,
+            sessionID,
+            conversationId: conversation,
+            chatId,
+            threadId: message.message_thread_id,
+            sourceMessageId: message.message_id,
+            promptTextLength: text.length,
+            attachmentCount: attachments.value.length,
+          })
           const ownerJobs = yield* jobs.listOwner("telegram", owner)
           const waitingBehindAnother = ownerJobs.some((job) =>
             job.id !== submitted.value.job.id && RUN_PIPELINE_STATES.includes(job.state))

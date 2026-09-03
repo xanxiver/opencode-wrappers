@@ -1,12 +1,13 @@
 import { Cause, Data, Deferred, Duration, Effect, Exit, FileSystem, Fiber, Option, Path, Ref, Schedule, Schema, Stream } from "effect"
 import { Buffer } from "node:buffer"
 import type { HttpClient } from "effect/unstable/http"
-import type { OpenCodeEvent } from "@opencode-ai/protocol/groups/event"
+import type { OpenCodeEvent } from "@opencode-ai/client"
 import type { Attachment } from "../core/attachments.js"
 import { toFileAttachment } from "../core/attachments.js"
 import type { DurableExecutorError, DurableLeaseLost } from "../core/durable-executor.js"
-import { logBoundary } from "../core/logging.js"
+import { logBoundary, logDebugEvent, type LogAnnotations } from "../core/logging.js"
 import { OpenCode, questionRequestFromEvent, rootSessionID, type OpenCodeService, type PendingQuestionRequest } from "../core/opencode.js"
+import { appendStreamTextDelta, beginStreamTextPart, joinTextParts, type StreamTextPartIdentity } from "../core/stream-text.js"
 import type { StreamVerbosity } from "../core/stream-verbosity.js"
 import {
   isDefinitiveSendRejection,
@@ -33,6 +34,8 @@ import {
 } from "./render.js"
 
 export interface RunInput {
+  /** Durable run identifier used only for structured diagnostics. */
+  readonly runID?: string
   readonly sessionID: string
   readonly text?: string
   readonly files: readonly Attachment[]
@@ -95,6 +98,8 @@ const reconnectSchedule = Schedule.exponential("500 millis", 2).pipe(
 interface RunState {
   readonly messageId: number
   readonly text: string
+  readonly textPartPending: boolean
+  readonly textPartIdentity: StreamTextPartIdentity | undefined
   readonly reasoning: string
   readonly activity: Option.Option<string>
   readonly usage: Option.Option<UsageView>
@@ -496,7 +501,7 @@ interface RecoverableMessage {
 
 interface RecoverableMessagePage {
   readonly data: readonly RecoverableMessage[]
-  readonly cursor: { readonly next?: string }
+  readonly cursor: { readonly next?: string | null }
 }
 
 export const MAX_RECOVERY_MESSAGE_PAGES = 100
@@ -518,9 +523,9 @@ const assistantTurnForInput = (
 
 /** Select the complete assistant turn after an accepted input from a descending page. */
 export const assistantResponseForInput = (messages: readonly RecoverableMessage[], inputID: string): string | undefined => {
-  const text = assistantTurnForInput(messages, inputID).flatMap((message) =>
+  const text = joinTextParts(assistantTurnForInput(messages, inputID).flatMap((message) =>
     (message.content ?? []).flatMap((part) => part.type === "text" && part.text !== undefined ? [part.text] : [])
-  ).filter((part) => part.length > 0).join("\n\n")
+  ))
   return text.length === 0 ? undefined : text
 }
 
@@ -566,7 +571,7 @@ export const recoveredResponseFromPages = <R>(
         return yield* recoveredResponseForInput(messages, inputID)
       }
       const next = page.cursor.next
-      if (next === undefined || cursors.has(next)) return Option.none()
+      if (next === undefined || next === null || cursors.has(next)) return Option.none()
       cursors.add(next)
       cursor = next
     }
@@ -576,13 +581,42 @@ export const recoveredResponseFromPages = <R>(
 export const recoveredResponseFromHistory = (
   sessionID: string,
   inputID: string,
+  diagnostics: {
+    readonly enabled?: boolean
+    readonly runID?: string
+  } = {},
 ): Effect.Effect<Option.Option<{ readonly text: string; readonly media: readonly MediaArtifact[] }>, never, OpenCode | FileSystem.FileSystem | Path.Path> =>
   Effect.gen(function* () {
     const opencode = yield* OpenCode
-    return yield* recoveredResponseFromPages(inputID, (cursor) =>
+    const debug = (message: string, annotations: LogAnnotations = {}) => logDebugEvent(
+      diagnostics.enabled === true,
+      "telegram/run",
+      "canonical-response",
+      message,
+      { runID: diagnostics.runID, sessionID, inputID, ...annotations },
+    )
+    let pageCount = 0
+    yield* debug("Canonical response recovery started")
+    const response = yield* recoveredResponseFromPages(inputID, (cursor) =>
       opencode.listMessages({ sessionID, limit: 100, order: "desc", cursor }).pipe(
+        Effect.tap((page) => {
+          pageCount += 1
+          return debug("Canonical response page received", {
+            pageCount,
+            messageCount: page.data.length,
+            requestedWithCursor: cursor !== undefined,
+            hasNextPage: page.cursor.next !== undefined,
+          })
+        }),
         Effect.catchCause((cause) => logOpenCodeFailure("read canonical final response failed")(cause).pipe(Effect.as(undefined))),
       ))
+    yield* debug("Canonical response recovery finished", {
+      pageCount,
+      recovered: Option.isSome(response),
+      responseTextLength: Option.isSome(response) ? response.value.text.length : 0,
+      mediaCount: Option.isSome(response) ? response.value.media.length : 0,
+    })
+    return response
   })
 
 /**
@@ -809,7 +843,18 @@ const surfaceQuestion = (
     )
   }).pipe(Effect.catchCause(logTelegramFailure("question prompt failed")))
 
-const handleEvent = (
+type MessageStreamDebug = (
+  message: string,
+  annotations?: LogAnnotations,
+) => Effect.Effect<void>
+
+const eventSessionID = (event: SessionEvent): string | undefined => {
+  if (event.type === "form.created") return event.data.form.sessionID
+  if ("sessionID" in event.data) return event.data.sessionID
+  return undefined
+}
+
+const applyEvent = (
   event: SessionEvent,
   chatId: number,
   threadId: Option.Option<number>,
@@ -821,11 +866,21 @@ const handleEvent = (
 ): Effect.Effect<void, never, TelegramApi | HttpClient.HttpClient | OpenCode | FileSystem.FileSystem | Path.Path> => {
   switch (event.type) {
     case "session.text.delta": {
-      return Ref.update(state, (current) => ({
-        ...current,
-        text: current.text + event.data.delta,
-        dirty: true,
-      }))
+      return Ref.update(state, (current) => {
+        const identity = { assistantMessageID: event.data.assistantMessageID, ordinal: event.data.ordinal }
+        const stream = appendStreamTextDelta(
+          { text: current.text, startsNewPart: current.textPartPending, activePartIdentity: current.textPartIdentity },
+          event.data.delta,
+          identity,
+        )
+        return {
+          ...current,
+          text: stream.text,
+          textPartPending: stream.startsNewPart,
+          textPartIdentity: stream.activePartIdentity,
+          dirty: true,
+        }
+      })
     }
     case "session.reasoning.delta": {
       return Ref.update(state, (current) => ({
@@ -872,7 +927,21 @@ const handleEvent = (
     case "session.step.failed":
       return showActivity(state, "Step failed")
     case "session.text.started":
-      return showActivity(state, "Writing response")
+      return Ref.update(state, (current) => {
+        const identity = { assistantMessageID: event.data.assistantMessageID, ordinal: event.data.ordinal }
+        const stream = beginStreamTextPart(
+          { text: current.text, startsNewPart: current.textPartPending, activePartIdentity: current.textPartIdentity },
+          identity,
+        )
+        return {
+          ...current,
+          text: stream.text,
+          textPartPending: stream.startsNewPart,
+          textPartIdentity: stream.activePartIdentity,
+          activity: Option.some("Writing response"),
+          dirty: true,
+        }
+      })
     case "session.text.ended":
       return showActivity(state, "Response written")
     case "session.reasoning.started":
@@ -984,6 +1053,80 @@ const handleEvent = (
   }
 }
 
+const logHandledEvent = (
+  event: SessionEvent,
+  state: Ref.Ref<RunState>,
+  debug: MessageStreamDebug,
+): Effect.Effect<void> => {
+  if (event.type === "session.text.delta") {
+    return Ref.get(state).pipe(
+      Effect.flatMap((current) => debug("OpenCode text delta accumulated", {
+        eventType: event.type,
+        eventSessionID: event.data.sessionID,
+        deltaLength: event.data.delta.length,
+        textLength: current.text.length,
+        reasoningLength: current.reasoning.length,
+      })),
+    )
+  }
+  if (event.type === "session.reasoning.delta") {
+    return Ref.get(state).pipe(
+      Effect.flatMap((current) => debug("OpenCode reasoning delta accumulated", {
+        eventType: event.type,
+        eventSessionID: event.data.sessionID,
+        deltaLength: event.data.delta.length,
+        textLength: current.text.length,
+        reasoningLength: current.reasoning.length,
+      })),
+    )
+  }
+  if (event.type === "session.execution.succeeded") {
+    return debug("OpenCode terminal event handled", { outcome: "done" })
+  }
+  if (event.type === "session.execution.failed") {
+    return debug("OpenCode terminal event handled", { outcome: "failed" })
+  }
+  if (event.type === "session.execution.interrupted") {
+    return debug("OpenCode terminal event handled", { outcome: "interrupted" })
+  }
+  if (event.type === "session.deleted") {
+    return debug("OpenCode terminal event handled", { outcome: "error" })
+  }
+  return Effect.void
+}
+
+const handleEvent = (
+  event: SessionEvent,
+  chatId: number,
+  threadId: Option.Option<number>,
+  state: Ref.Ref<RunState>,
+  terminal: Ref.Ref<Option.Option<RunOutcome>>,
+  terminalHandled: Deferred.Deferred<void>,
+  registry: PermissionRegistryService,
+  questionRegistry: QuestionRegistryService,
+  debug: MessageStreamDebug,
+): Effect.Effect<void, never, TelegramApi | HttpClient.HttpClient | OpenCode | FileSystem.FileSystem | Path.Path> => {
+  const received = event.type === "session.text.delta" || event.type === "session.reasoning.delta"
+    ? Effect.void
+    : debug("OpenCode stream event received", {
+        eventType: event.type,
+        eventSessionID: eventSessionID(event),
+      })
+  return received.pipe(
+    Effect.andThen(applyEvent(
+      event,
+      chatId,
+      threadId,
+      state,
+      terminal,
+      terminalHandled,
+      registry,
+      questionRegistry,
+    )),
+    Effect.andThen(logHandledEvent(event, state, debug)),
+  )
+}
+
 /**
  * Run one prompt in a session and live-edit a Telegram message with
  * progress. Ends with a final status message.
@@ -991,6 +1134,29 @@ const handleEvent = (
 export const runPrompt = (input: RunInput) =>
   Effect.gen(function* () {
     const config = yield* AppConfigTag
+    const debugEnabled = config.telegramStreamDebug === true
+    const debug: MessageStreamDebug = (message, annotations = {}) => logDebugEvent(
+      debugEnabled,
+      "telegram/run",
+      "message-stream",
+      message,
+      {
+        runID: input.runID,
+        sessionID: input.sessionID,
+        controllerBotKey: input.controllerRoute.botKey,
+        deliveryBotKey: input.runDeliveryRoute.botKey,
+        chatId: input.runDeliveryRoute.chatId,
+        threadId: input.runDeliveryRoute.threadId,
+        ...annotations,
+      },
+    )
+    yield* debug("Telegram message stream started", {
+      reconnect: input.reconnect === true,
+      verbosity: input.verbosity,
+      attachmentCount: input.files.length,
+      promptTextLength: input.text?.length ?? 0,
+      reusedProgressMessage: input.progressMessageID !== undefined,
+    })
     // TelegramApi remains required below for controller-owned permissions and questions.
     yield* TelegramApi
     const api = input.deliveryApi
@@ -1003,21 +1169,28 @@ export const runPrompt = (input: RunInput) =>
     )
     let progressMessageID = input.progressMessageID
     if (progressMessageID === undefined) {
+      yield* debug("Telegram stream anchor creation started")
       if (input.onProgressDispatching !== undefined) yield* input.onProgressDispatching()
       const status = yield* api.sendMessage({
           chatId: input.runDeliveryRoute.chatId,
           text: "Working…",
           messageThreadId: input.runDeliveryRoute.threadId,
+          runID: input.runID,
         }).pipe(Effect.catchTag("ApiError", (error) =>
           isDefinitiveSendRejection(error) && input.onProgressRejected !== undefined
             ? input.onProgressRejected().pipe(Effect.andThen(Effect.fail(error)))
             : Effect.fail(error)))
       progressMessageID = status.message_id
       if (input.onProgressMessage !== undefined) yield* input.onProgressMessage(progressMessageID)
+      yield* debug("Telegram stream anchor created", { messageId: progressMessageID })
+    } else {
+      yield* debug("Telegram stream anchor reused", { messageId: progressMessageID })
     }
     const state = yield* Ref.make<RunState>({
       messageId: progressMessageID,
       text: "",
+      textPartPending: false,
+      textPartIdentity: undefined,
       reasoning: "",
       activity: Option.none(),
       usage: Option.none(),
@@ -1030,23 +1203,42 @@ export const runPrompt = (input: RunInput) =>
     const acceptedInputID = yield* Ref.make(Option.fromNullishOr(input.inputID))
     const dispatchStarted = yield* Ref.make(input.reconnect === true)
 
+    yield* debug("Telegram progress flusher started", { messageId: progressMessageID })
     const flusher = yield* Effect.forkChild(
       Effect.repeat(
         Effect.gen(function* () {
           const current = yield* Ref.get(state)
           const nextText = nextProgressEdit(current)
           if (Option.isSome(nextText)) {
+            yield* debug("Telegram progress edit enqueue started", {
+              messageId: current.messageId,
+              responseTextLength: current.text.length,
+              reasoningLength: current.reasoning.length,
+              renderedTextLength: nextText.value.length,
+              hasActivity: Option.isSome(current.activity),
+            })
             const edited = yield* api.editMessageText({
               chatId: input.runDeliveryRoute.chatId,
               messageId: current.messageId,
               text: nextText.value,
               priority: "progress",
               delivery: "background",
+              runID: input.runID,
             }).pipe(
               Effect.as(true),
-              Effect.catchCause((cause) => logTelegramFailure("progress edit failed")(cause).pipe(Effect.as(false))),
+              Effect.catchCause((cause) => debug("Telegram progress edit enqueue failed", {
+                messageId: current.messageId,
+                renderedTextLength: nextText.value.length,
+              }).pipe(
+                Effect.andThen(logTelegramFailure("progress edit failed")(cause)),
+                Effect.as(false),
+              )),
             )
             if (edited) {
+              yield* debug("Telegram progress edit entered scheduler", {
+                messageId: current.messageId,
+                renderedTextLength: nextText.value.length,
+              })
               yield* Ref.update(state, (next) => ({
                 ...next,
                 dirty: next.text !== current.text || next.reasoning !== current.reasoning || Option.getOrUndefined(next.activity) !== Option.getOrUndefined(current.activity),
@@ -1054,6 +1246,14 @@ export const runPrompt = (input: RunInput) =>
               }))
             }
           } else {
+            if (current.dirty) {
+              yield* debug("Telegram progress edit skipped", {
+                messageId: current.messageId,
+                reason: current.verbosity === "quiet" ? "quiet-verbosity" : "unchanged-render",
+                responseTextLength: current.text.length,
+                reasoningLength: current.reasoning.length,
+              })
+            }
             yield* Ref.update(state, (next) => ({ ...next, dirty: false }))
           }
         }),
@@ -1064,7 +1264,13 @@ export const runPrompt = (input: RunInput) =>
     const run = Effect.gen(function* () {
       const waitUntilIdle = (failureMessage: string): Effect.Effect<boolean> =>
         Effect.gen(function* () {
+          let waitAttempt = 0
           while (true) {
+            waitAttempt += 1
+            yield* debug("OpenCode session wait started", {
+              waitAttempt,
+              waitPhase: failureMessage,
+            })
             const result = yield* opencode.wait(input.sessionID).pipe(
               Effect.as(Option.some(true)),
               Effect.catchCause((waitCause) =>
@@ -1089,8 +1295,15 @@ export const runPrompt = (input: RunInput) =>
                 ),
               ),
             )
-            if (Option.isNone(result)) return false
-            if (result.value) return true
+            if (Option.isNone(result)) {
+              yield* debug("OpenCode session wait failed", { waitAttempt, waitPhase: failureMessage })
+              return false
+            }
+            if (result.value) {
+              yield* debug("OpenCode session wait finished", { waitAttempt, waitPhase: failureMessage })
+              return true
+            }
+            yield* debug("OpenCode session wait will reconnect", { waitAttempt, waitPhase: failureMessage })
             // Bun aborts a quiet fetch after five minutes. The OpenCode run is
             // still active, so reconnect to the long-poll endpoint.
             yield* Effect.sleep("1 second")
@@ -1099,10 +1312,13 @@ export const runPrompt = (input: RunInput) =>
       // ---- Phase 1: preparation (bounded, never interrupts the session) ----
       let dispatchable = false
       if (input.reconnect === true) {
+        yield* debug("Telegram stream reconnect preparation started")
         yield* registry.setSessionRoute(input.sessionID, input.controllerRoute)
         yield* questionRegistry.setSessionRoute(input.sessionID, input.controllerRoute)
         dispatchable = true
+        yield* debug("Telegram stream reconnect preparation finished")
       } else {
+        yield* debug("Telegram stream dispatch preparation started")
         const prepared = yield* Effect.timeoutOption(
           Effect.gen(function* () {
             const idle = yield* waitUntilIdle("wait before prompt failed")
@@ -1114,12 +1330,14 @@ export const runPrompt = (input: RunInput) =>
           PRE_DISPATCH_WAIT,
         )
         if (Option.isNone(prepared)) {
+          yield* debug("Telegram stream dispatch preparation timed out")
           yield* Ref.update(state, (current) => ({
             ...current,
             text: "The session stayed busy, so this prompt was not started.",
             dirty: true,
           }))
         } else if (!prepared.value) {
+          yield* debug("Telegram stream dispatch preparation failed")
           yield* Ref.update(state, (current) => ({
             ...current,
             text: "OpenCode could not be reached to start this prompt.",
@@ -1127,11 +1345,13 @@ export const runPrompt = (input: RunInput) =>
           }))
         } else {
           dispatchable = true
+          yield* debug("Telegram stream dispatch preparation finished")
         }
       }
 
       let outcome: RunOutcome = "error"
       if (dispatchable) {
+        yield* debug("Telegram stream run driver started")
         // A timeout interrupts the session only after the durable dispatch
         // fence is set, or while reconnecting a run that already exists.
         const configuredTimeout = config.telegramRunTimeout.trim().toLowerCase()
@@ -1163,6 +1383,7 @@ export const runPrompt = (input: RunInput) =>
           }),
         )
       }
+      yield* debug("Telegram stream run driver finished", { outcome })
       return outcome
     })
     const driveDispatchedRun = (
@@ -1172,10 +1393,14 @@ export const runPrompt = (input: RunInput) =>
       const terminal = yield* Ref.make<Option.Option<RunOutcome>>(Option.none())
       const terminalHandled = yield* Deferred.make<void>()
       const eventReady = yield* Deferred.make<void>()
+      yield* debug("OpenCode event subscription started")
       const eventStream = opencode.events().pipe(
         Stream.tap((event) =>
           event.type === "server.connected"
-            ? Effect.asVoid(Deferred.succeed(eventReady, undefined))
+            ? Deferred.succeed(eventReady, undefined).pipe(
+                Effect.andThen(debug("OpenCode event subscription connected")),
+                Effect.asVoid,
+              )
             : Effect.void,
         ),
         // The global event bus carries events from every session on the
@@ -1209,8 +1434,10 @@ export const runPrompt = (input: RunInput) =>
             terminalHandled,
             registry,
             questionRegistry,
+            debug,
           )
         ),
+        Effect.tapCause(() => debug("OpenCode event stream disconnected")),
         Effect.retry(reconnectSchedule),
       )
       // Start consuming events before prompting. The prompt can complete very
@@ -1218,21 +1445,36 @@ export const runPrompt = (input: RunInput) =>
       const eventFiber = yield* Effect.forkChild(
         eventStream.pipe(Effect.catchCause(logOpenCodeFailure("event stream failed"))),
       )
+      yield* debug("OpenCode event consumer started")
       const connected = yield* Effect.timeoutOption(Deferred.await(eventReady), "5 seconds")
       if (Option.isNone(connected)) {
+        yield* debug("OpenCode event subscription timed out")
         yield* Fiber.interrupt(eventFiber)
+        yield* debug("OpenCode event consumer stopped", { reason: "connection-timeout" })
         return "error" as const
       }
       if (input.reconnect !== true) {
         const inputID = yield* selections.withSession(input.sessionID, Effect.gen(function* () {
+          yield* debug("OpenCode run selection started", {
+            hasAgent: input.agent !== undefined,
+            hasModel: input.model !== undefined,
+          })
           const applied = yield* Effect.timeoutOption(
             // The session permit stays held until OpenCode accepts the prompt.
             applyRunSelectionUsing(opencode, input),
             PRE_DISPATCH_WAIT,
           )
-          if (Option.isNone(applied)) return Option.none<string>()
+          if (Option.isNone(applied)) {
+            yield* debug("OpenCode run selection timed out")
+            return Option.none<string>()
+          }
+          yield* debug("OpenCode run selection finished")
           if (input.onDispatching !== undefined) yield* input.onDispatching()
           yield* Ref.set(dispatchStarted, true)
+          yield* debug("OpenCode prompt dispatch started", {
+            promptTextLength: input.text?.length ?? 0,
+            attachmentCount: attachments.length,
+          })
           const pending = yield* opencode.prompt({
             sessionID: input.sessionID,
             text: input.text ?? "",
@@ -1240,10 +1482,12 @@ export const runPrompt = (input: RunInput) =>
           })
           yield* Ref.set(acceptedInputID, Option.some(pending.id))
           if (input.onAccepted !== undefined) yield* input.onAccepted(pending.id)
+          yield* debug("OpenCode prompt accepted", { inputID: pending.id })
           return Option.some(pending.id)
         }))
         if (Option.isNone(inputID)) {
           yield* Fiber.interrupt(eventFiber)
+          yield* debug("OpenCode event consumer stopped", { reason: "selection-failed" })
           yield* Ref.update(state, (current) => ({
             ...current,
             text: "The agent and model could not be applied before this prompt.",
@@ -1258,18 +1502,31 @@ export const runPrompt = (input: RunInput) =>
       const waitCompleted = yield* waitUntilIdle("wait after prompt failed")
       const terminalState = yield* Ref.get(terminal)
       if (Option.isNone(terminalState)) {
-        yield* Effect.timeoutOption(Deferred.await(terminalHandled), "1 second")
+        yield* debug("OpenCode terminal event grace period started")
+        const handled = yield* Effect.timeoutOption(Deferred.await(terminalHandled), "1 second")
+        yield* debug("OpenCode terminal event grace period finished", {
+          terminalEventReceived: Option.isSome(handled),
+        })
       }
       yield* Fiber.interrupt(eventFiber)
+      yield* debug("OpenCode event consumer stopped", { reason: "run-finished" })
       // `session.wait` completed successfully, so a missed terminal event is
       // still a completed run rather than an error.
-      return (yield* Ref.get(terminal)).pipe(
+      const resolvedTerminal = yield* Ref.get(terminal)
+      const outcome = resolvedTerminal.pipe(
         Option.getOrElse((): RunOutcome => (waitCompleted ? "done" : "error")),
       )
+      yield* debug("OpenCode stream outcome resolved", {
+        outcome,
+        waitCompleted,
+        terminalEventReceived: Option.isSome(resolvedTerminal),
+      })
+      return outcome
     })
     const outcome = yield* run
 
     yield* Fiber.interrupt(flusher)
+    yield* debug("Telegram progress flusher stopped", { outcome })
     const finalState = yield* Ref.get(state)
     const usageLine = Option.match(finalState.usage, {
       onNone: () => "",
@@ -1277,14 +1534,35 @@ export const runPrompt = (input: RunInput) =>
     })
     const inputID = yield* Ref.get(acceptedInputID)
     const canonicalResponse = outcome === "done" && Option.isSome(inputID)
-      ? yield* recoveredResponseFromHistory(input.sessionID, inputID.value)
+      ? yield* recoveredResponseFromHistory(input.sessionID, inputID.value, {
+          enabled: debugEnabled,
+          runID: input.runID,
+        })
       : Option.none()
     const response = Option.isSome(canonicalResponse)
       ? canonicalResponse.value
       : yield* mediaFromResponseText(finalState.text)
+    yield* debug("Telegram final response source selected", {
+      outcome,
+      source: Option.isSome(canonicalResponse) ? "canonical-history" : "event-stream",
+      streamTextLength: finalState.text.length,
+      responseTextLength: response.text.length,
+      reasoningLength: finalState.reasoning.length,
+      streamMediaCount: finalState.media.length,
+      responseMediaCount: response.media.length,
+    })
     const rendered = yield* renderTelegramMermaid(renderFinal(response.text, outcome) + usageLine)
     const finalMedia = limitMedia([...rendered.media, ...finalState.media, ...response.media])
     const finalization: RunFinalization = { text: truncate(rendered.text), media: finalMedia, outcome }
+    yield* debug("Telegram final response prepared", {
+      outcome,
+      finalTextLength: finalization.text.length,
+      finalMediaCount: finalization.media.length,
+    })
     if (input.onFinalizing !== undefined) yield* input.onFinalizing(finalization)
+    yield* debug("Telegram final response callback finished", {
+      outcome,
+      callbackPresent: input.onFinalizing !== undefined,
+    })
     return finalization
   })

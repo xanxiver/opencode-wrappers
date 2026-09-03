@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
-import { Effect, Layer, Option, Ref, Schema, Stream } from "effect"
-import { Permission, Session } from "@opencode-ai/client/effect"
+import { Effect, Layer, Option, Ref, Stream } from "effect"
+import type { PermissionRequest } from "@opencode-ai/client"
 import { FetchHttpClient } from "effect/unstable/http"
 import { OpenCode, OpenCodeError, type OpenCodeService } from "../src/core/opencode.js"
 import { TelegramApi, type TelegramApiClient } from "../src/telegram/api.js"
@@ -9,6 +9,7 @@ import { Live as PermissionRegistryLive, PermissionRegistry } from "../src/teleg
 import { Live as QuestionRegistryLive, QuestionRegistry } from "../src/telegram/questions.js"
 import { reconcilePendingSession } from "../src/telegram/resurface.js"
 import { surfacePermission } from "../src/telegram/run.js"
+import { makeSessionInfo } from "./opencode-fixtures.js"
 
 const openCode: OpenCodeService = {
   createSession: () => Effect.never,
@@ -152,7 +153,7 @@ describe("child session reconciliation", () => {
       tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
       time: { created: 1, updated: 1 },
     }
-    return Schema.decodeUnknownSync(Session.Info)(parentID === undefined ? base : { ...base, parentID })
+    return makeSessionInfo(parentID === undefined ? base : { ...base, parentID })
   }
 
   /** Build a session tree where each key has the listed parent (undefined = root). */
@@ -170,7 +171,7 @@ describe("child session reconciliation", () => {
       return Effect.succeed(sessionInfo(sessionID, parentID))
     },
     listPendingPermissions: () => Effect.succeed(
-      permissions.map((request) => Schema.decodeUnknownSync(Permission.Request)(request)),
+      permissions.map((request): PermissionRequest => ({ ...request, resources: [...request.resources] })),
     ),
     listPendingQuestions: () => Effect.succeed(questions),
   })

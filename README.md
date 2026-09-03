@@ -7,6 +7,7 @@ This project provides user interfaces for OpenCode2.
 | Wrapper | Status | Start command |
 | --- | --- | --- |
 | Telegram | Available | `bun run telegram` |
+| Web UI | Available | `bun run web:build:start` |
 
 ## First setup
 
@@ -25,6 +26,11 @@ Run these commands from the project directory:
 ```sh
 bun install
 ```
+
+The install step creates the SQLite preferences database when it does not
+exist. It keeps an existing database and applies idempotent schema updates.
+Set `WEB_DATABASE_FILE` before installation to use a path other than
+`data/web.sqlite`. You can also run `bun run init:web-database` later.
 
 ### 2. Configure OpenCode2
 
@@ -55,6 +61,25 @@ bun run telegram
 
 The wrapper now accepts commands from allowed users.
 
+To run the web UI in production mode, build the UI and start the Effect server:
+
+```sh
+bun run web:build:start
+```
+
+Open `http://localhost:3001`. The Effect server serves the built UI, the API,
+and the event stream from one port.
+
+For development, use two terminals:
+
+```sh
+bun run web:server
+bun run web:dev
+```
+
+Open `http://localhost:3000`. Vite serves the UI and proxies API requests to
+the Effect server.
+
 ## Configuration
 
 See `.env.example` for the complete list.
@@ -65,11 +90,53 @@ See `.env.example` for the complete list.
 | `TELEGRAM_BOT_POOL` | No | Empty | JSON array of outbound-only delivery bots, for example `[{"id":"delivery-1","token":"..."}]`. The controller remains a delivery candidate. |
 | `TELEGRAM_ALLOWED_USERS` | No | Empty | Comma-separated Telegram user IDs. Empty denies all except `/whoami`. |
 | `TELEGRAM_RUN_TIMEOUT` | No | `10 minutes` | Maximum run time. Use `none` for no limit. |
+| `TELEGRAM_STREAM_DEBUG` | No | `false` | Emit metadata-only diagnostics for Telegram message streaming. |
 | `PROJECT_DIRECTORY` | No | Current directory | Default OpenCode2 project directory. |
 | `STATE_FILE` | No | `data/state.json` | File for session, directory, and model state. |
 | `OPENCODE_BASE_URL` | No | Local service | Remote OpenCode2 service URL. |
 | `OPENCODE_USERNAME` | No | None | Username for a remote OpenCode2 service. |
 | `OPENCODE_PASSWORD` | No | None | Password for a remote OpenCode2 service. |
+| `WEB_PORT` | No | `3001` | Port for the web API and production UI server. |
+| `WEB_DATABASE_FILE` | No | `data/web.sqlite` | SQLite file for web user preferences, including projects and sessions. |
+| `OPENCODE_DATABASE_FILE` | No | None | OpenCode SQLite database used for observability usage. The UI shows a configuration warning when this is not set. |
+| `WEB_HOST` | No | `127.0.0.1` | Bind address for the web API server. Use an explicit reverse proxy before binding publicly. |
+| `WEB_UI_PORT` | No | `3000` | Port for the Vite development UI server. |
+| `WEB_USERNAME` | For web UI | None | Username for local web/API login. |
+| `WEB_PASSWORD_HASH` | For web UI | None | Bun password hash for the web login password. |
+| `WEB_JWT_SECRET` | For web UI | None | Secret of at least 32 bytes used to sign 15-minute HS256 access tokens. Keep it private. |
+| `WEB_TRUSTED_ORIGINS` | No | None | Comma-separated exact origins allowed for cookie-authenticated development requests. The configured `WEB_UI_PORT` origins are trusted automatically on localhost. |
+| `WEB_WORKSPACE_ROOTS` | No | `PROJECT_DIRECTORY` | Comma-separated absolute roots. The workspace picker lists each root and its direct child directories. |
+
+Local image directories are configured in Settings → Workspace. They must be
+existing, readable directories.
+
+The web API requires all three web login variables. Generate a secure password
+and compatible Bun password hash with:
+
+```sh
+bun run password
+bun run password --write-env
+bun run password --write-env --env-file .env.local
+bun run jwt-secret
+bun run jwt-secret --write-env
+```
+
+The command prints a random password and a `WEB_PASSWORD_HASH` value. Use
+`--write-env` to append the hash directly to `.env`. Add `--env-file <path>` to
+select a different file. Add the username separately. Do not commit the
+generated password.
+
+Generate the JWT signing secret separately:
+
+```sh
+bun run jwt-secret --write-env
+```
+
+This appends a 32-byte random `WEB_JWT_SECRET` to `.env`. Keep it stable and
+private; changing it invalidates active web tokens.
+
+The UI uses a secure, same-site HTTP-only cookie. API clients can use the
+`access_token` returned by `POST /api/auth/login` as a Bearer token.
 
 ## Development commands
 

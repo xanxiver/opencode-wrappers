@@ -17,6 +17,7 @@ import {
 import { handleMessage } from "../src/telegram/handlers/message.js"
 import { InteractionStoreMemory } from "../src/telegram/interaction-store.js"
 import { Live as ModelRegistryLive } from "../src/telegram/models.js"
+import { Live as AgentTemplatesLive } from "../src/telegram/agent-templates.js"
 import { Live as PermissionRegistryLive } from "../src/telegram/permissions.js"
 import { Live as PickersLive } from "../src/telegram/pickers.js"
 import { Live as QuestionRegistryLive, QuestionRegistry } from "../src/telegram/questions.js"
@@ -122,6 +123,7 @@ describe("loose prompt mode", () => {
         Effect.provide(Layer.succeed(Store, store)),
         Effect.provide(Layer.succeed(GitChanges, gitChangesStub)),
         Effect.provide(ModelRegistryLive),
+        Effect.provide(AgentTemplatesLive),
         Effect.provide(PickersLive),
         Effect.provide(AgentRegistryLive),
         Effect.provide(SessionSelectionLive),
@@ -233,6 +235,7 @@ describe("loose prompt mode", () => {
       Effect.provide(Layer.succeed(Store, store)),
       Effect.provide(Layer.succeed(GitChanges, gitChangesStub)),
       Effect.provide(ModelRegistryLive),
+      Effect.provide(AgentTemplatesLive),
       Effect.provide(PickersLive),
       Effect.provide(AgentRegistryLive),
       Effect.provide(SessionSelectionLive),

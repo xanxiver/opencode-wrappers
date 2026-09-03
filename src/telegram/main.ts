@@ -17,6 +17,7 @@ import {
 import { TelegramDurableExecutorLive } from "./durable-executor.js"
 import { InteractionStoreLive } from "./interaction-store.js"
 import { Live as ModelRegistryLive } from "./models.js"
+import { Live as AgentTemplatesLive } from "./agent-templates.js"
 import { Live as PermissionsLive } from "./permissions.js"
 import { Live as PickersLive } from "./pickers.js"
 import { Live as QuestionRegistryLive } from "./questions.js"
@@ -53,7 +54,7 @@ const app = program.pipe(
   Effect.provide(SessionsLive),
   Effect.provide(TelegramDeliveryLive),
   Effect.provide(AccessLive),
-  Effect.provide(ModelRegistryLive),
+  Effect.provide(Layer.mergeAll(ModelRegistryLive, AgentTemplatesLive)),
   Effect.provide(PermissionsLive),
   Effect.provide(QuestionRegistryLive),
   Effect.provide(Layer.merge(AgentRegistryLive, SessionSelectionLive)),

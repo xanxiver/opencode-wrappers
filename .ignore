@@ -2,3 +2,7 @@
 !/.agents/
 !/.agents/**
 !/AGENTS.md
+!/dist/
+!/.playwright-cli
+!/.ui-chat-dummy/
+!/recordings/
