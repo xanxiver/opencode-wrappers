@@ -9,6 +9,14 @@ import { runWithFiles } from "./run.js"
 import { selectExactModel, showModels } from "./model.js"
 import { showProjects, showSessions } from "./picker.js"
 import { promptWithAgent, showAgents } from "./agent.js"
+import { handleAgentModel } from "./agent-model.js"
+import {
+  addAgentTemplatePairing,
+  removeAgentTemplate,
+  replaceAgentTemplatePairing,
+  showAgentTemplates,
+  useAgentTemplate,
+} from "./agent-templates.js"
 import { clearRunQueue, compactSession, deleteRunQueue, listDurableReviews, listRunQueue, moveRunQueue, reconnectRun, resetSession, resolveDurableReview, setAutoContinue, setLoosePrompts, setProjectDirectory, setSessionById, setStreamVerbosity, showStatus, stopRun } from "./run.js"
 
 type ParsedCommand = {
@@ -125,6 +133,24 @@ export const handleMessage = (message: Message) =>
       case "/agents":
         if (command.hasArgument) break
         yield* showAgents(chatId, threadId)
+        return
+      case "/agent_model":
+        yield* handleAgentModel(chatId, command.argument, threadId)
+        return
+      case "/agent_templates":
+        yield* showAgentTemplates(chatId, command.argument, threadId)
+        return
+      case "/agent_template_add":
+        yield* addAgentTemplatePairing(chatId, command.argument, threadId)
+        return
+      case "/agent_template_replace":
+        yield* replaceAgentTemplatePairing(chatId, command.argument, threadId)
+        return
+      case "/agent_template_remove":
+        yield* removeAgentTemplate(chatId, command.argument, threadId)
+        return
+      case "/agent_template_use":
+        yield* useAgentTemplate(chatId, command.argument, threadId)
         return
       case "/pwa": {
         const parsed = parseAgentPromptCommand(text)

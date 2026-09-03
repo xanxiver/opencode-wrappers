@@ -21,6 +21,12 @@ import {
   parseModelProviderCallback,
   parseModelVariantCallback,
   parseDirectoryPageCallback,
+  parseExactModelReference,
+  parseAgentModelInput,
+  parseAgentTemplatePairingInput,
+  parseAgentTemplateRemoveInput,
+  parseAgentTemplateUseInput,
+  parseAgentTemplatesListInput,
   parsePermissionCallback,
   parsePromptCommand,
   promptWithReply,
@@ -378,6 +384,94 @@ describe("parseQuestionCallback", () => {
     expect(parseQuestionCallback("q:1:0")).toEqual(Option.none())
     expect(parseQuestionCallback("other:1:0:1")).toEqual(Option.none())
     expect(parseQuestionCallback("")).toEqual(Option.none())
+  })
+})
+
+describe("parseExactModelReference", () => {
+  test("parses a model without a variant", () => {
+    expect(parseExactModelReference("provider/model")).toEqual(Option.some({ model: "provider/model" }))
+    expect(parseExactModelReference("  provider/model  ")).toEqual(Option.some({ model: "provider/model" }))
+  })
+
+  test("parses a model with a bracketed variant", () => {
+    expect(parseExactModelReference("opencode-go/muse-spark-1.3-contributor [xhigh]")).toEqual(
+      Option.some({ model: "opencode-go/muse-spark-1.3-contributor", variant: "xhigh" }),
+    )
+    expect(parseExactModelReference("provider/model[xhigh]")).toEqual(
+      Option.some({ model: "provider/model", variant: "xhigh" }),
+    )
+  })
+
+  test("parses a model with a bare variant", () => {
+    expect(parseExactModelReference("provider/model xhigh")).toEqual(
+      Option.some({ model: "provider/model", variant: "xhigh" }),
+    )
+  })
+
+  test("rejects empty and ambiguous input", () => {
+    expect(parseExactModelReference("")).toEqual(Option.none())
+    expect(parseExactModelReference("   ")).toEqual(Option.none())
+    expect(parseExactModelReference("a b c")).toEqual(Option.none())
+    expect(parseExactModelReference("[xhigh]")).toEqual(Option.none())
+    expect(parseExactModelReference("provider/model []")).toEqual(Option.none())
+  })
+})
+
+describe("parseAgentModelInput", () => {
+  test("parses empty input as a current-pairing request", () => {
+    expect(parseAgentModelInput("")).toEqual(Option.some({}))
+    expect(parseAgentModelInput("   ")).toEqual(Option.some({}))
+  })
+
+  test("parses an agent without a model", () => {
+    expect(parseAgentModelInput("build")).toEqual(Option.some({ agent: "build" }))
+  })
+
+  test("parses an agent with a model and an optional variant", () => {
+    expect(parseAgentModelInput("build provider/model")).toEqual(
+      Option.some({ agent: "build", model: "provider/model", variant: undefined }),
+    )
+    expect(parseAgentModelInput("build provider/model [xhigh]")).toEqual(
+      Option.some({ agent: "build", model: "provider/model", variant: "xhigh" }),
+    )
+    expect(parseAgentModelInput("plan provider/model low")).toEqual(
+      Option.some({ agent: "plan", model: "provider/model", variant: "low" }),
+    )
+  })
+
+  test("rejects a model reference with too many parts", () => {
+    expect(parseAgentModelInput("build a b c")).toEqual(Option.none())
+  })
+})
+
+describe("agent template command parsing", () => {
+  test("parses template pairing input for add and replace", () => {
+    expect(parseAgentTemplatePairingInput("work build provider/model")).toEqual(
+      Option.some({ template: "work", agent: "build", model: "provider/model", variant: undefined }),
+    )
+    expect(parseAgentTemplatePairingInput("work plan provider/model [xhigh]")).toEqual(
+      Option.some({ template: "work", agent: "plan", model: "provider/model", variant: "xhigh" }),
+    )
+    expect(parseAgentTemplatePairingInput("work build")).toEqual(Option.none())
+    expect(parseAgentTemplatePairingInput("")).toEqual(Option.none())
+  })
+
+  test("parses template remove input with an optional agent", () => {
+    expect(parseAgentTemplateRemoveInput("work")).toEqual(Option.some({ template: "work" }))
+    expect(parseAgentTemplateRemoveInput("work build")).toEqual(
+      Option.some({ template: "work", agent: "build" }),
+    )
+    expect(parseAgentTemplateRemoveInput("a b c")).toEqual(Option.none())
+    expect(parseAgentTemplateRemoveInput("")).toEqual(Option.none())
+  })
+
+  test("parses template use and list input", () => {
+    expect(parseAgentTemplateUseInput("work")).toEqual(Option.some({ template: "work" }))
+    expect(parseAgentTemplateUseInput("")).toEqual(Option.none())
+    expect(parseAgentTemplateUseInput("a b")).toEqual(Option.none())
+    expect(parseAgentTemplatesListInput("")).toEqual(Option.some({}))
+    expect(parseAgentTemplatesListInput("work")).toEqual(Option.some({ name: "work" }))
+    expect(parseAgentTemplatesListInput("a b")).toEqual(Option.none())
   })
 })
 

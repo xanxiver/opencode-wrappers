@@ -29,12 +29,25 @@ The bot lives in `src/` and `test/` at the repository root. The core
   of the listed changes to one run.
 - `/models`: paginated model picker (10 per page, Previous/Next). A model
   choice is saved for the active session and agent.
-- `/model <exact-model>`: switch directly to an exact model. The choice uses
+- `/model <provider/model> [variant]`: switch directly to an exact model. The choice uses
   the same active session-agent preference as the picker.
 - `/agents`: list and select a primary agent for the current session. The bot
   restores the model saved for that session-agent pair. If the pair has no
   saved model, the bot uses the agent model, the session model, or the old
   directory fallback, in that order.
+- `/agent_model [agent] [provider/model] [variant]`: show one stored pairing,
+  or switch the session to the agent and the model. The switch stores the
+  pairing for the session-agent pair.
+- `/agent_templates [name]`: list global agent model templates, or show one
+  template. Templates live in SQLite and each template holds a set of pairings.
+- `/agent_template_add <template> <agent> <provider/model> [variant]`: add one
+  pairing to a template. The command creates the template when missing.
+- `/agent_template_replace <template> <agent> <provider/model> [variant]`:
+  replace one pairing in a template.
+- `/agent_template_remove <template> [agent]`: remove one pairing, or remove
+  the whole template when no agent is given.
+- `/agent_template_use <template>`: store all template pairings into the
+  current session. The bot applies the live model only for the active agent.
 - `/pwa <agent> <prompt>`: run a prompt with an exact agent ID or name. The
   durable job stores that agent and its effective model when the bot accepts
   the prompt.
@@ -75,7 +88,9 @@ The bot lives in `src/` and `test/` at the repository root. The core
   the working message. The setting is stored per conversation. Each durable
   job keeps the level that was active when the bot accepted that job.
 - Commands: `/start`, `/help`, `/prompt`, `/new`, `/stop`, `/reconnect`, `/forceReconnect`,
-  `/compact`, `/review`, `/models`, `/model`, `/agents`, `/pwa <agent> <prompt>`, `/status`, `/whoami`, `/projects`, `/project <path>`,
+  `/compact`, `/review`, `/models`, `/model`, `/agents`, `/agent_model`, `/agent_templates`,
+  `/agent_template_add`, `/agent_template_replace`, `/agent_template_remove`, `/agent_template_use`,
+  `/pwa <agent> <prompt>`, `/status`, `/whoami`, `/projects`, `/project <path>`,
   `/sessions`, `/queue`, `/move <from> <to>`, `/queue_delete <pos>`, `/queue_clear`,
   `/loose on|off`, `/continue on|off`, `/verbosity quiet|normal|detailed`.
 - User whitelist via `TELEGRAM_ALLOWED_USERS` (empty = deny all).
