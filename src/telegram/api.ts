@@ -33,15 +33,13 @@ export const recordDefinitiveSendFailure = <A, E, R, R2>(
     : Effect.fail(error)))
 
 /** Minimum interval between message edits for the same chat (ms). */
-export const EDIT_MIN_INTERVAL_MS = 1000
+export const EDIT_MIN_INTERVAL_MS = 0
 
 /**
- * Telegram caps group traffic near 20 messages per minute. Streaming runs
- * share that budget with replies, questions, notifications, and button
- * feedback, so group chats start from a thrifty 6s interval and let flood
- * feedback widen or tighten it around the real budget.
+ * Group chats start with no artificial pacing; flood feedback widens the
+ * interval only after Telegram returns 429.
  */
-export const EDIT_MIN_INTERVAL_GROUP_MS = 6000
+export const EDIT_MIN_INTERVAL_GROUP_MS = 0
 
 /** Upper bound for the adaptive per-chat edit interval. */
 export const EDIT_MAX_INTERVAL_MS = 20_000

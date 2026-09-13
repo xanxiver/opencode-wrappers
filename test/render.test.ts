@@ -588,15 +588,16 @@ describe("editDelay", () => {
     expect(editDelay(DM_CHAT, 0, Date.now())).toBe(0)
   })
 
-  test("waits for the remaining interval", () => {
+  test("does not pace back-to-back edits at the start", () => {
     const now = Date.now()
-    expect(editDelay(DM_CHAT, now - 400, now)).toBe(EDIT_MIN_INTERVAL_MS - 400)
+    expect(editDelay(DM_CHAT, now - 400, now)).toBe(0)
   })
 
-  test("paces group chats with the wider interval", () => {
+  test("starts DM and group chats without artificial pacing", () => {
     const now = Date.now()
-    expect(editDelay(GROUP_CHAT, now - 400, now)).toBe(EDIT_MIN_INTERVAL_GROUP_MS - 400)
-    expect(editBaseInterval(GROUP_CHAT)).toBeGreaterThan(editBaseInterval(DM_CHAT))
+    expect(editDelay(GROUP_CHAT, now - 400, now)).toBe(0)
+    expect(editBaseInterval(GROUP_CHAT)).toBe(editBaseInterval(DM_CHAT))
+    expect(editBaseInterval(DM_CHAT)).toBe(0)
   })
 
   test("allows edits after the interval has passed", () => {
@@ -604,26 +605,26 @@ describe("editDelay", () => {
     expect(editDelay(DM_CHAT, now - EDIT_MIN_INTERVAL_MS - 100, now)).toBe(0)
   })
 
-  test("waits for both the edit interval and a flood quiet period", () => {
+  test("waits for a flood quiet period", () => {
     const now = 100_000
     expect(editThrottleDelay(undefined, now, EDIT_MIN_INTERVAL_GROUP_MS)).toBe(0)
     expect(editThrottleDelay({
       lastEditAt: now - 1000,
       quietUntil: 0,
-      intervalMs: EDIT_MIN_INTERVAL_GROUP_MS,
-    }, now, EDIT_MIN_INTERVAL_GROUP_MS)).toBe(EDIT_MIN_INTERVAL_GROUP_MS - 1000)
+      intervalMs: 5000,
+    }, now, EDIT_MIN_INTERVAL_GROUP_MS)).toBe(4000)
     expect(editThrottleDelay({
-      lastEditAt: now - EDIT_MIN_INTERVAL_GROUP_MS,
+      lastEditAt: now - 5000,
       quietUntil: now + 9000,
-      intervalMs: EDIT_MIN_INTERVAL_GROUP_MS,
+      intervalMs: 5000,
     }, now, EDIT_MIN_INTERVAL_GROUP_MS)).toBe(9000)
   })
 
   test("widens the interval on flood and caps it", () => {
     const base = EDIT_MIN_INTERVAL_GROUP_MS
-    // Takes whichever is longer: doubled interval or Telegram's ask.
-    expect(penalizeEditInterval(base, base, undefined)).toBe(base * 2)
-    expect(penalizeEditInterval(base, base, 9000)).toBe(base * 2)
+    // No artificial pacing: first flood bumps to the fallback wait.
+    expect(penalizeEditInterval(base, base, undefined)).toBe(500)
+    expect(penalizeEditInterval(base, base, 9000)).toBe(9000)
     expect(penalizeEditInterval(base, base, 15000)).toBe(15000)
     expect(penalizeEditInterval(base, 12000, 500)).toBe(EDIT_MAX_INTERVAL_MS)
   })
@@ -631,7 +632,8 @@ describe("editDelay", () => {
   test("relaxes the interval halfway back after clean edits", () => {
     const base = EDIT_MIN_INTERVAL_GROUP_MS
     expect(relaxEditInterval(base, 16000)).toBe(8000)
-    expect(relaxEditInterval(base, 4000)).toBe(base)
+    expect(relaxEditInterval(base, 4000)).toBe(2000)
+    expect(relaxEditInterval(base, 500)).toBe(250)
   })
 })
 
