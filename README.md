@@ -16,7 +16,7 @@ This project provides user interfaces for OpenCode2.
 Install these tools:
 
 - [Bun](https://bun.sh/)
-- [OpenCode2](https://opencode.ai/v2/docs/) installed and available as `opencode2`
+- [OpenCode v2](https://opencode.ai/v2/docs/) `2.0.3` installed and available as `opencode`
 - A token for each wrapper that you use
 
 ### 1. Install the project
@@ -43,7 +43,7 @@ cp .env.example .env
 Set `PROJECT_DIRECTORY` to the directory where OpenCode2 must run. Use an
 absolute path when possible.
 
-If `OPENCODE_BASE_URL` is empty, the project starts the local `opencode2`
+If `OPENCODE_BASE_URL` is empty, the project starts the local `opencode`
 service when needed. To use a remote service, set `OPENCODE_BASE_URL` and its
 credentials.
 
@@ -193,7 +193,8 @@ These OpenCode2 features are not exposed by the current wrapper:
 | Integrations | Not exposed | Manage providers, credentials, and OAuth connections. |
 | Server and debug | Not exposed | Read server data, health, locations, and debug state. |
 
-The OpenCode2 API is in beta. API names and behavior can change.
+The OpenCode v2 API changes between releases. Keep `@opencode/client` and the
+installed `opencode` server on the same version.
 
 ## License
 

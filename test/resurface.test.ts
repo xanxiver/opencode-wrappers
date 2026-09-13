@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { Effect, Layer, Option, Ref, Stream } from "effect"
-import type { PermissionRequest } from "@opencode-ai/client"
+import type { PermissionRequest } from "@opencode/client"
 import { FetchHttpClient } from "effect/unstable/http"
 import { OpenCode, OpenCodeError, type OpenCodeService } from "../src/core/opencode.js"
 import { TelegramApi, type TelegramApiClient } from "../src/telegram/api.js"

@@ -1,7 +1,7 @@
 import { Cause, Data, Deferred, Duration, Effect, Exit, FileSystem, Fiber, Option, Path, Ref, Schedule, Schema, Stream } from "effect"
 import { Buffer } from "node:buffer"
 import type { HttpClient } from "effect/unstable/http"
-import type { OpenCodeEvent } from "@opencode-ai/client"
+import type { OpenCodeEvent } from "@opencode/client"
 import type { Attachment } from "../core/attachments.js"
 import { toFileAttachment } from "../core/attachments.js"
 import type { DurableExecutorError, DurableLeaseLost } from "../core/durable-executor.js"

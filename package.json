@@ -23,16 +23,16 @@
     "web:preview": "vite preview --config vite.web.config.ts",
     "test:bot": "bun test test/",
     "test:e2e": "playwright test",
-    "opencode": "opencode2 serve --service",
-    "opencode:status": "opencode2 service status",
-    "opencode:restart": "opencode2 service restart"
+    "opencode": "opencode serve --service",
+    "opencode:status": "opencode service status",
+    "opencode:restart": "opencode service restart"
   },
   "dependencies": {
     "@ark-ui/solid": "^5.38.0",
     "@effect/platform-bun": "4.0.0-beta.107",
     "@fontsource-variable/geist": "5.3.0",
     "@fontsource-variable/geist-mono": "5.3.0",
-    "@opencode-ai/client": "0.0.0-beta-18600",
+    "@opencode/client": "2.0.3",
     "@resvg/resvg-js": "2.6.2",
     "@tanstack/solid-virtual": "^3.13.36",
     "@vercel/beautiful-mermaid": "0.1.5",

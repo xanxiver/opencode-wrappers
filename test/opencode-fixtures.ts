@@ -1,4 +1,4 @@
-import type { AgentInfo, ModelInfo, SessionInfo } from "@opencode-ai/client"
+import type { AgentInfo, ModelInfo, SessionInfo } from "@opencode/client"
 
 export const makeSessionInfo = (
   input: Pick<SessionInfo, "id"> & Partial<Omit<SessionInfo, "id">>,

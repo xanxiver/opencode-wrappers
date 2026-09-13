@@ -15,8 +15,8 @@ import {
   type SessionInboxUser,
   type SessionInfo,
   type SessionMessageInfo,
-} from "@opencode-ai/client"
-import { Service, type Endpoint } from "@opencode-ai/client/service"
+} from "@opencode/client"
+import { Service, type Endpoint } from "@opencode/client/service"
 import { AppConfigTag, type AppConfig } from "../config.js"
 import type { PromptFileInput } from "./attachments.js"
 import { logBoundary } from "./logging.js"
@@ -246,7 +246,10 @@ const resolveEndpoint = (): Effect.Effect<ResolvedEndpoint, OpenCodeError, AppCo
     if (shouldDiscoverOpenCodeService(config.opencodeBaseUrl)) {
       discovered = yield* fromPromise(
         "service.ensure",
-        () => Service.ensure({ command: ["opencode2", "serve", "--service"] }),
+        () => Service.ensure({
+          command: ["opencode", "serve", "--service"],
+          version: (version) => version.startsWith("2."),
+        }),
       )
     } else if (!hasConfiguredAuth) {
       discovered = yield* fromPromise("service.discover", () => Service.discover())
