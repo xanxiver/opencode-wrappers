@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { Deferred, Effect, Fiber, Layer, Stream } from "effect"
-import type { FormInfo, OpenCodeEvent } from "@opencode-ai/client"
+import type { FormInfo, OpenCodeEvent } from "@opencode/client"
 import { AppConfig, AppConfigTag } from "../src/config.js"
 import {
   Live as OpenCodeLive,

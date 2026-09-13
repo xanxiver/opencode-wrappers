@@ -144,8 +144,8 @@ The bot lives in `src/` and `test/` at the repository root. The core
 
 - Bun (package manager, runner, tests)
 - TypeScript 7 (tsgo via `@typescript/native-preview`)
-- Effect 4.0.0-beta.101 (pinned to match `@opencode-ai/client` peer)
-- `@opencode-ai/client@next` (Effect entrypoint)
+- Effect 4.0.0-beta.107 (application runtime)
+- `@opencode/client@2.0.3` (promise entrypoint)
 
 ## Setup
 
@@ -156,7 +156,7 @@ cp .env.example .env
 # TELEGRAM_BOT_POOL = optional JSON array of outbound-only delivery bots
 # TELEGRAM_ALLOWED_USERS = your Telegram user id (empty = deny all)
 # PROJECT_DIRECTORY = where OpenCode sessions run
-# OPENCODE_BASE_URL = optional; empty = discover the local opencode2 service
+# OPENCODE_BASE_URL = optional; empty = discover the local OpenCode service
 ```
 
 ### Controller and delivery workers
@@ -235,7 +235,7 @@ bun run telegram    # run the Telegram UI
 bun run dev         # watch mode (Telegram UI)
 bun run typecheck   # tsgo
 bun run test:bot    # bun test, bot tests only
-bun run opencode    # spawn the opencode2 background service (serve --service)
+bun run opencode    # spawn the OpenCode background service (opencode serve --service)
 bun run opencode:status    # show the service URL
 bun run opencode:restart   # restart the background service
 ```

@@ -1,5 +1,5 @@
 import { Buffer } from "node:buffer"
-import type { SessionPromptInput } from "@opencode-ai/client"
+import type { SessionPromptInput } from "@opencode/client"
 
 export type PromptFileInput = NonNullable<SessionPromptInput["files"]>[number]
 

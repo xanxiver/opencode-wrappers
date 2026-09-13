@@ -1,5 +1,5 @@
 import { Clock, Context, Effect, Layer, Option, Ref } from "effect"
-import type { AgentInfo } from "@opencode-ai/client"
+import type { AgentInfo } from "@opencode/client"
 import type { StoredModel } from "../core/store.js"
 
 export const AGENT_PICKER_TTL_MS = 60 * 60 * 1000
