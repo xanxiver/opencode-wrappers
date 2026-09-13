@@ -105,7 +105,7 @@ export const handleMessage = (message: Message) =>
       case "/start":
       case "/help":
         if (command.hasArgument) break
-        yield* sendText(chatId, HELP_TEXT, threadId)
+        yield* sendText(chatId, HELP_TEXT, threadId, "HTML")
         return
       case "/new":
         if (command.hasArgument) break
