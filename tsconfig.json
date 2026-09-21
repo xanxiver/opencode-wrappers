@@ -6,10 +6,12 @@
     "allowImportingTsExtensions": true,
     "verbatimModuleSyntax": true,
     "erasableSyntaxOnly": true,
+    "jsx": "preserve",
+    "jsxImportSource": "solid-js",
     "strict": true,
     "noEmit": true,
     "skipLibCheck": true,
-    "types": ["bun"]
+    "types": ["bun", "vite/client"]
   },
-  "include": ["src", "test"]
+  "include": ["src", "test", "panda.config.ts", "vite.web.config.ts"]
 }

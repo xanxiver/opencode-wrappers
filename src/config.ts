@@ -90,6 +90,8 @@ export class AppConfig extends Schema.Class<AppConfig>("AppConfig")({
   telegramAllowedUsers: Schema.optional(Schema.String),
   /** Run limit. Use `none` to disable the limit. */
   telegramRunTimeout: Schema.String,
+  /** Emit metadata-only diagnostics for Telegram message streaming. */
+  telegramStreamDebug: Schema.optional(Schema.Boolean),
   /** Port for the web API server. */
   webPort: Schema.Int,
   /** Port for the Vite development UI, used for local cookie CSRF checks. */
@@ -137,6 +139,7 @@ const raw = Config.all({
   opencodeDatabaseFile: Config.option(Config.string("OPENCODE_DATABASE_FILE")),
   telegramAllowedUsers: Config.option(Config.string("TELEGRAM_ALLOWED_USERS")),
   telegramRunTimeout: Config.string("TELEGRAM_RUN_TIMEOUT").pipe(Config.withDefault("10 minutes")),
+  telegramStreamDebug: Config.boolean("TELEGRAM_STREAM_DEBUG").pipe(Config.withDefault(false)),
   webPort: Config.port("WEB_PORT").pipe(Config.withDefault(3001)),
   webUiPort: Config.option(Config.port("WEB_UI_PORT")),
   webHost: Config.string("WEB_HOST").pipe(Config.withDefault("127.0.0.1")),

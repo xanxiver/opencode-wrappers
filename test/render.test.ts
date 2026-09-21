@@ -21,6 +21,12 @@ import {
   parseModelProviderCallback,
   parseModelVariantCallback,
   parseDirectoryPageCallback,
+  parseExactModelReference,
+  parseAgentModelInput,
+  parseAgentTemplatePairingInput,
+  parseAgentTemplateRemoveInput,
+  parseAgentTemplateUseInput,
+  parseAgentTemplatesListInput,
   parsePermissionCallback,
   parsePromptCommand,
   promptWithReply,
@@ -381,6 +387,94 @@ describe("parseQuestionCallback", () => {
   })
 })
 
+describe("parseExactModelReference", () => {
+  test("parses a model without a variant", () => {
+    expect(parseExactModelReference("provider/model")).toEqual(Option.some({ model: "provider/model" }))
+    expect(parseExactModelReference("  provider/model  ")).toEqual(Option.some({ model: "provider/model" }))
+  })
+
+  test("parses a model with a bracketed variant", () => {
+    expect(parseExactModelReference("opencode-go/muse-spark-1.3-contributor [xhigh]")).toEqual(
+      Option.some({ model: "opencode-go/muse-spark-1.3-contributor", variant: "xhigh" }),
+    )
+    expect(parseExactModelReference("provider/model[xhigh]")).toEqual(
+      Option.some({ model: "provider/model", variant: "xhigh" }),
+    )
+  })
+
+  test("parses a model with a bare variant", () => {
+    expect(parseExactModelReference("provider/model xhigh")).toEqual(
+      Option.some({ model: "provider/model", variant: "xhigh" }),
+    )
+  })
+
+  test("rejects empty and ambiguous input", () => {
+    expect(parseExactModelReference("")).toEqual(Option.none())
+    expect(parseExactModelReference("   ")).toEqual(Option.none())
+    expect(parseExactModelReference("a b c")).toEqual(Option.none())
+    expect(parseExactModelReference("[xhigh]")).toEqual(Option.none())
+    expect(parseExactModelReference("provider/model []")).toEqual(Option.none())
+  })
+})
+
+describe("parseAgentModelInput", () => {
+  test("parses empty input as a current-pairing request", () => {
+    expect(parseAgentModelInput("")).toEqual(Option.some({}))
+    expect(parseAgentModelInput("   ")).toEqual(Option.some({}))
+  })
+
+  test("parses an agent without a model", () => {
+    expect(parseAgentModelInput("build")).toEqual(Option.some({ agent: "build" }))
+  })
+
+  test("parses an agent with a model and an optional variant", () => {
+    expect(parseAgentModelInput("build provider/model")).toEqual(
+      Option.some({ agent: "build", model: "provider/model", variant: undefined }),
+    )
+    expect(parseAgentModelInput("build provider/model [xhigh]")).toEqual(
+      Option.some({ agent: "build", model: "provider/model", variant: "xhigh" }),
+    )
+    expect(parseAgentModelInput("plan provider/model low")).toEqual(
+      Option.some({ agent: "plan", model: "provider/model", variant: "low" }),
+    )
+  })
+
+  test("rejects a model reference with too many parts", () => {
+    expect(parseAgentModelInput("build a b c")).toEqual(Option.none())
+  })
+})
+
+describe("agent template command parsing", () => {
+  test("parses template pairing input for add and replace", () => {
+    expect(parseAgentTemplatePairingInput("work build provider/model")).toEqual(
+      Option.some({ template: "work", agent: "build", model: "provider/model", variant: undefined }),
+    )
+    expect(parseAgentTemplatePairingInput("work plan provider/model [xhigh]")).toEqual(
+      Option.some({ template: "work", agent: "plan", model: "provider/model", variant: "xhigh" }),
+    )
+    expect(parseAgentTemplatePairingInput("work build")).toEqual(Option.none())
+    expect(parseAgentTemplatePairingInput("")).toEqual(Option.none())
+  })
+
+  test("parses template remove input with an optional agent", () => {
+    expect(parseAgentTemplateRemoveInput("work")).toEqual(Option.some({ template: "work" }))
+    expect(parseAgentTemplateRemoveInput("work build")).toEqual(
+      Option.some({ template: "work", agent: "build" }),
+    )
+    expect(parseAgentTemplateRemoveInput("a b c")).toEqual(Option.none())
+    expect(parseAgentTemplateRemoveInput("")).toEqual(Option.none())
+  })
+
+  test("parses template use and list input", () => {
+    expect(parseAgentTemplateUseInput("work")).toEqual(Option.some({ template: "work" }))
+    expect(parseAgentTemplateUseInput("")).toEqual(Option.none())
+    expect(parseAgentTemplateUseInput("a b")).toEqual(Option.none())
+    expect(parseAgentTemplatesListInput("")).toEqual(Option.some({}))
+    expect(parseAgentTemplatesListInput("work")).toEqual(Option.some({ name: "work" }))
+    expect(parseAgentTemplatesListInput("a b")).toEqual(Option.none())
+  })
+})
+
 describe("renderModelLabel", () => {
   test("includes model and provider", () => {
     expect(renderModelLabel("claude-3-5", "anthropic")).toBe("claude-3-5 (anthropic)")
@@ -494,15 +588,16 @@ describe("editDelay", () => {
     expect(editDelay(DM_CHAT, 0, Date.now())).toBe(0)
   })
 
-  test("waits for the remaining interval", () => {
+  test("does not pace back-to-back edits at the start", () => {
     const now = Date.now()
-    expect(editDelay(DM_CHAT, now - 400, now)).toBe(EDIT_MIN_INTERVAL_MS - 400)
+    expect(editDelay(DM_CHAT, now - 400, now)).toBe(0)
   })
 
-  test("paces group chats with the wider interval", () => {
+  test("starts DM and group chats without artificial pacing", () => {
     const now = Date.now()
-    expect(editDelay(GROUP_CHAT, now - 400, now)).toBe(EDIT_MIN_INTERVAL_GROUP_MS - 400)
-    expect(editBaseInterval(GROUP_CHAT)).toBeGreaterThan(editBaseInterval(DM_CHAT))
+    expect(editDelay(GROUP_CHAT, now - 400, now)).toBe(0)
+    expect(editBaseInterval(GROUP_CHAT)).toBe(editBaseInterval(DM_CHAT))
+    expect(editBaseInterval(DM_CHAT)).toBe(0)
   })
 
   test("allows edits after the interval has passed", () => {
@@ -510,26 +605,26 @@ describe("editDelay", () => {
     expect(editDelay(DM_CHAT, now - EDIT_MIN_INTERVAL_MS - 100, now)).toBe(0)
   })
 
-  test("waits for both the edit interval and a flood quiet period", () => {
+  test("waits for a flood quiet period", () => {
     const now = 100_000
     expect(editThrottleDelay(undefined, now, EDIT_MIN_INTERVAL_GROUP_MS)).toBe(0)
     expect(editThrottleDelay({
       lastEditAt: now - 1000,
       quietUntil: 0,
-      intervalMs: EDIT_MIN_INTERVAL_GROUP_MS,
-    }, now, EDIT_MIN_INTERVAL_GROUP_MS)).toBe(EDIT_MIN_INTERVAL_GROUP_MS - 1000)
+      intervalMs: 5000,
+    }, now, EDIT_MIN_INTERVAL_GROUP_MS)).toBe(4000)
     expect(editThrottleDelay({
-      lastEditAt: now - EDIT_MIN_INTERVAL_GROUP_MS,
+      lastEditAt: now - 5000,
       quietUntil: now + 9000,
-      intervalMs: EDIT_MIN_INTERVAL_GROUP_MS,
+      intervalMs: 5000,
     }, now, EDIT_MIN_INTERVAL_GROUP_MS)).toBe(9000)
   })
 
   test("widens the interval on flood and caps it", () => {
     const base = EDIT_MIN_INTERVAL_GROUP_MS
-    // Takes whichever is longer: doubled interval or Telegram's ask.
-    expect(penalizeEditInterval(base, base, undefined)).toBe(base * 2)
-    expect(penalizeEditInterval(base, base, 9000)).toBe(base * 2)
+    // No artificial pacing: first flood bumps to the fallback wait.
+    expect(penalizeEditInterval(base, base, undefined)).toBe(500)
+    expect(penalizeEditInterval(base, base, 9000)).toBe(9000)
     expect(penalizeEditInterval(base, base, 15000)).toBe(15000)
     expect(penalizeEditInterval(base, 12000, 500)).toBe(EDIT_MAX_INTERVAL_MS)
   })
@@ -537,7 +632,8 @@ describe("editDelay", () => {
   test("relaxes the interval halfway back after clean edits", () => {
     const base = EDIT_MIN_INTERVAL_GROUP_MS
     expect(relaxEditInterval(base, 16000)).toBe(8000)
-    expect(relaxEditInterval(base, 4000)).toBe(base)
+    expect(relaxEditInterval(base, 4000)).toBe(2000)
+    expect(relaxEditInterval(base, 500)).toBe(250)
   })
 })
 

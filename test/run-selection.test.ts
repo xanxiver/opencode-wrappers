@@ -22,6 +22,20 @@ describe("applyRunSelectionUsing", () => {
     ])
   })
 
+  test("applies only the model when no explicit agent was queued", async () => {
+    const order = await Effect.runPromise(Ref.make<string[]>([]))
+
+    await Effect.runPromise(applyRunSelectionUsing({
+      switchAgent: ({ agent }) => Ref.update(order, (current) => [...current, `agent:${agent}`]),
+      switchModel: ({ model }) => Ref.update(order, (current) => [...current, `model:${model.id}`]),
+    }, {
+      sessionID: "ses_1",
+      model: { id: "accepted-model", providerID: "provider" },
+    }))
+
+    expect(await Effect.runPromise(Ref.get(order))).toEqual(["model:accepted-model"])
+  })
+
   test("fails with a typed error when the model snapshot cannot be applied", async () => {
     const exit = await Effect.runPromiseExit(applyRunSelectionUsing({
       switchAgent: () => Effect.void,

@@ -14,7 +14,9 @@ node_modules/
 data/
 
 # scripts
-scripts/
+scripts/*
+!scripts/prepare-park-ui.sh
+!scripts/prepare-effect.sh
 
 # Local OpenCode configuration and tools
 .opencode/
@@ -31,3 +33,13 @@ scripts/
 *.swp
 
 .codegraph/
+
+/dist/
+
+/.playwright-cli/
+
+/.ui-chat-dummy/
+
+/recordings/
+/test-results/
+/playwright-report/

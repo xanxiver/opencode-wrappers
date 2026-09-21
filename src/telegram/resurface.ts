@@ -52,6 +52,9 @@ const surfacePermission = (
     sessionID: request.sessionID,
     requestID: request.id,
     chatId: route.chatId,
+    threadId: route.threadId,
+    action: request.action,
+    resources: request.resources,
   })
   if (Option.isNone(tokenOption)) return false
   const token = tokenOption.value

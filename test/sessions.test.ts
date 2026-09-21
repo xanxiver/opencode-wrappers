@@ -1,17 +1,17 @@
 import { describe, expect, test } from "bun:test"
-import { Effect, Layer, Ref, Schema, Stream } from "effect"
+import { Effect, Layer, Ref, Stream } from "effect"
 import { BunFileSystem } from "@effect/platform-bun"
 import { OpenCode } from "../src/core/opencode.js"
 import { Live as SessionsLive, Sessions } from "../src/core/sessions.js"
 import { Live as StoreLive } from "../src/core/store.js"
 import { AppConfig, AppConfigTag } from "../src/config.js"
-import { Session } from "@opencode-ai/client/effect"
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { makeSessionInfo } from "./opencode-fixtures.js"
 
-const fakeInfo = (id: string): Session.Info =>
-  Schema.decodeUnknownSync(Session.Info)({
+const fakeInfo = (id: string) =>
+  makeSessionInfo({
     id,
     projectID: "proj_test",
     location: { directory: "/tmp" },

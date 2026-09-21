@@ -1,7 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { Effect, Layer, Option, Ref, Schema, Stream } from "effect"
-import * as Agent from "@opencode-ai/schema/agent"
-import { Session } from "@opencode-ai/client/effect"
+import { Effect, Layer, Option, Ref, Stream } from "effect"
 import { FetchHttpClient } from "effect/unstable/http"
 import { OpenCode, OpenCodeError, type OpenCodeService } from "../src/core/opencode.js"
 import { Sessions, type SessionsService } from "../src/core/sessions.js"
@@ -11,6 +9,7 @@ import { Live as SessionSelectionLive } from "../src/telegram/session-selection.
 import { TelegramDurableExecutor, type TelegramDurableExecutorService } from "../src/telegram/durable-executor.js"
 import { TelegramApi, type TelegramApiClient } from "../src/telegram/api.js"
 import { handleAgentCallback, promptWithAgent, resolveAgent, selectableAgents } from "../src/telegram/handlers/agent.js"
+import { makeAgentInfo, makeSessionInfo } from "./opencode-fixtures.js"
 
 const agent = (
   id: string,
@@ -19,8 +18,7 @@ const agent = (
   hidden = false,
   model?: { readonly id: string; readonly providerID: string; readonly variant?: string },
 ) => {
-  const base = { ...Agent.Info.default(Agent.ID.make(id)), name, mode, hidden }
-  return Schema.decodeUnknownSync(Agent.Info)(model === undefined ? base : { ...base, model })
+  return makeAgentInfo({ id, name, mode, hidden, model })
 }
 
 const agents = [
@@ -34,15 +32,15 @@ const sessionInfo = (input: {
   readonly agent?: string
   readonly model?: { readonly id: string; readonly providerID: string; readonly variant?: string }
 } = {}) => {
-  const base = {
+  return makeSessionInfo({
     id: "ses_1",
     projectID: "project",
     location: { directory: "/work" },
     cost: 0,
     tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
     time: { created: 1, updated: 1 },
-  }
-  return Schema.decodeUnknownSync(Session.Info)({ ...base, ...input })
+    ...input,
+  })
 }
 
 const openCode: OpenCodeService = {

@@ -208,6 +208,124 @@ describe("PermissionRegistry", () => {
     expect(Option.isNone(result.second)).toBe(true)
   })
 
+  test("absorbs an equivalent request into a delivered prompt", async () => {
+    const result = await run(Effect.gen(function* () {
+      const registry = yield* PermissionRegistry
+      const first = yield* registry.registerOrResume({
+        sessionID: "ses_a",
+        requestID: "req_a",
+        chatId: 7,
+        threadId: 42,
+        action: "external_directory",
+        resources: ["/tmp/other/*"],
+      })
+      if (Option.isSome(first)) yield* registry.attachMessageId(first.value, 99)
+      const second = yield* registry.registerOrResume({
+        sessionID: "ses_b",
+        requestID: "req_b",
+        chatId: 7,
+        threadId: 42,
+        action: "external_directory",
+        resources: ["/tmp/other/*"],
+      })
+      const entry = Option.isSome(first) ? yield* registry.take(first.value) : Option.none()
+      return { second, entry }
+    }))
+
+    expect(Option.isNone(result.second)).toBe(true)
+    expect(Option.isSome(result.entry) && result.entry.value.requests).toEqual([
+      { sessionID: "ses_b", requestID: "req_b" },
+    ])
+  })
+
+  test("does not absorb requests in another thread or with different resources", async () => {
+    const result = await run(Effect.gen(function* () {
+      const registry = yield* PermissionRegistry
+      const first = yield* registry.registerOrResume({
+        sessionID: "ses_a",
+        requestID: "req_a",
+        chatId: 7,
+        threadId: 42,
+        action: "external_directory",
+        resources: ["/tmp/other/*"],
+      })
+      if (Option.isSome(first)) yield* registry.attachMessageId(first.value, 99)
+      const otherThread = yield* registry.registerOrResume({
+        sessionID: "ses_b",
+        requestID: "req_b",
+        chatId: 7,
+        threadId: 43,
+        action: "external_directory",
+        resources: ["/tmp/other/*"],
+      })
+      const otherResources = yield* registry.registerOrResume({
+        sessionID: "ses_c",
+        requestID: "req_c",
+        chatId: 7,
+        threadId: 42,
+        action: "external_directory",
+        resources: ["/tmp/elsewhere/*"],
+      })
+      return { otherThread, otherResources }
+    }))
+
+    expect(Option.isSome(result.otherThread)).toBe(true)
+    expect(Option.isSome(result.otherResources)).toBe(true)
+  })
+
+  test("backfills request metadata when the same request is seen again", async () => {
+    const result = await run(Effect.gen(function* () {
+      const registry = yield* PermissionRegistry
+      const token = yield* registry.register({ sessionID: "ses_a", requestID: "req_a", chatId: 7, threadId: 42 })
+      yield* registry.attachMessageId(token, 99)
+      const resumed = yield* registry.registerOrResume({
+        sessionID: "ses_a",
+        requestID: "req_a",
+        chatId: 7,
+        threadId: 42,
+        action: "external_directory",
+        resources: ["/tmp/other/*"],
+      })
+      const entry = yield* registry.take(token)
+      return { resumed, entry }
+    }))
+
+    expect(Option.isNone(result.resumed)).toBe(true)
+    expect(Option.isSome(result.entry) && result.entry.value.action).toBe("external_directory")
+  })
+
+  test("lists delivered prompts covering the same action and resources", async () => {
+    const result = await run(Effect.gen(function* () {
+      const registry = yield* PermissionRegistry
+      const first = yield* registry.registerOrResume({
+        sessionID: "ses_a",
+        requestID: "req_a",
+        chatId: 7,
+        threadId: 42,
+        action: "external_directory",
+        resources: ["/tmp/other/*"],
+      })
+      if (Option.isSome(first)) yield* registry.attachMessageId(first.value, 99)
+      const other = yield* registry.registerOrResume({
+        sessionID: "ses_b",
+        requestID: "req_b",
+        chatId: 7,
+        threadId: 42,
+        action: "external_directory",
+        resources: ["/tmp/elsewhere/*"],
+      })
+      if (Option.isSome(other)) yield* registry.attachMessageId(other.value, 100)
+      return yield* registry.listEquivalent({
+        chatId: 7,
+        threadId: 42,
+        action: "external_directory",
+        resources: ["/tmp/other/*"],
+      })
+    }))
+
+    expect(result.map(({ entry }) => entry.requestID)).toEqual(["req_a"])
+  })
+
   test("resumes an incomplete Telegram delivery after a registry restart", async () => {
     const store = persistentStore()
     const first = await Effect.runPromise(Effect.gen(function* () {

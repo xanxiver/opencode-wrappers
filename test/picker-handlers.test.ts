@@ -1,8 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { Effect, Exit, Layer, Option, Ref, Schema, Stream } from "effect"
-import { Session } from "@opencode-ai/client/effect"
-import * as ModelSchema from "@opencode-ai/schema/model"
-import * as Provider from "@opencode-ai/schema/provider"
+import { Effect, Exit, Layer, Option, Ref, Stream } from "effect"
 import { FetchHttpClient } from "effect/unstable/http"
 import { Sessions, type SessionsService } from "../src/core/sessions.js"
 import { Store, type StoreService } from "../src/core/store.js"
@@ -18,6 +15,7 @@ import { handleSessionCallback } from "../src/telegram/handlers/picker.js"
 import { Live as ModelRegistryLive, ModelRegistry } from "../src/telegram/models.js"
 import { Live as SessionSelectionLive } from "../src/telegram/session-selection.js"
 import { Live as PickersLive, Pickers } from "../src/telegram/pickers.js"
+import { makeModelInfo, makeSessionInfo } from "./opencode-fixtures.js"
 
 const storeService = (selected: Ref.Ref<string | undefined>, currentSessionID?: string): StoreService => ({
   getSessionIDForConversation: () => Effect.succeed(Option.fromNullishOr(currentSessionID)),
@@ -59,7 +57,7 @@ const sessionInfo = (id: string, agent?: string) => {
     tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
     time: { created: 1, updated: 1 },
   }
-  return Schema.decodeUnknownSync(Session.Info)(agent === undefined ? base : { ...base, agent })
+  return makeSessionInfo(agent === undefined ? base : { ...base, agent })
 }
 
 const openCodeForAgent = (agent?: string): OpenCodeService => ({
@@ -377,7 +375,7 @@ describe("Telegram picker callbacks", () => {
     const switched = await Effect.runPromise(Ref.make<unknown>(undefined))
     const remembered = await Effect.runPromise(Ref.make<unknown>(undefined))
     const sent = await Effect.runPromise(Ref.make<string[]>([]))
-    const model = ModelSchema.Info.default(Provider.ID.make("provider"), ModelSchema.ID.make("model"))
+    const model = makeModelInfo("provider", "model")
     const client: OpenCodeService = {
       ...openCodeForAgent("build"),
       listModels: () => Effect.succeed([model]),
@@ -422,10 +420,104 @@ describe("Telegram picker callbacks", () => {
     ])
   })
 
+  test("saves an exact model command with a bracketed variant", async () => {
+    const switched = await Effect.runPromise(Ref.make<unknown>(undefined))
+    const sent = await Effect.runPromise(Ref.make<string[]>([]))
+    const model = {
+      ...makeModelInfo("opencode-go", "muse-spark-1.3-contributor"),
+      variants: [{ id: "xhigh" }, { id: "low" }],
+    }
+    const client: OpenCodeService = {
+      ...openCodeForAgent("build"),
+      listModels: () => Effect.succeed([model]),
+      switchModel: ({ model: selected }) => Ref.set(switched, selected),
+    }
+    const currentStore: StoreService = {
+      ...storeService(await Effect.runPromise(Ref.make<string | undefined>(undefined)), "ses_current"),
+      setSessionAgentModel: () => Effect.void,
+    }
+    const telegram: TelegramApiClient = {
+      getUpdates: () => Effect.never,
+      sendMessage: (input) => Ref.update(sent, (values) => [...values, input.text]).pipe(
+        Effect.as({ message_id: 1, chat: { id: input.chatId } }),
+      ),
+      sendPhoto: () => Effect.never,
+      sendVideo: () => Effect.never,
+      sendDocument: () => Effect.never,
+      editMessageText: () => Effect.never,
+      answerCallbackQuery: () => Effect.succeed(true),
+      getFile: () => Effect.never,
+      downloadFile: () => Effect.never,
+    }
+
+    await Effect.runPromise(selectExactModel(7, "opencode-go/muse-spark-1.3-contributor [xhigh]", 42).pipe(
+      Effect.provide(Layer.succeed(Sessions, sessionsService("/project"))),
+      Effect.provide(Layer.succeed(Store, currentStore)),
+      Effect.provide(Layer.succeed(OpenCode, client)),
+      Effect.provide(Layer.succeed(TelegramApi, telegram)),
+      Effect.provide(FetchHttpClient.layer),
+      Effect.provide(SessionSelectionLive),
+    ))
+
+    expect(await Effect.runPromise(Ref.get(switched))).toEqual({
+      id: "muse-spark-1.3-contributor",
+      providerID: "opencode-go",
+      variant: "xhigh",
+    })
+    expect(await Effect.runPromise(Ref.get(sent))).toEqual([
+      "Model for build switched to opencode-go/muse-spark-1.3-contributor [xhigh].",
+    ])
+  })
+
+  test("rejects an unknown variant with the available list", async () => {
+    const switched = await Effect.runPromise(Ref.make<unknown>(undefined))
+    const sent = await Effect.runPromise(Ref.make<string[]>([]))
+    const model = {
+      ...makeModelInfo("provider", "model"),
+      variants: [{ id: "high" }, { id: "low" }],
+    }
+    const client: OpenCodeService = {
+      ...openCodeForAgent("build"),
+      listModels: () => Effect.succeed([model]),
+      switchModel: ({ model: selected }) => Ref.set(switched, selected),
+    }
+    const currentStore: StoreService = {
+      ...storeService(await Effect.runPromise(Ref.make<string | undefined>(undefined)), "ses_current"),
+      setSessionAgentModel: () => Effect.void,
+    }
+    const telegram: TelegramApiClient = {
+      getUpdates: () => Effect.never,
+      sendMessage: (input) => Ref.update(sent, (values) => [...values, input.text]).pipe(
+        Effect.as({ message_id: 1, chat: { id: input.chatId } }),
+      ),
+      sendPhoto: () => Effect.never,
+      sendVideo: () => Effect.never,
+      sendDocument: () => Effect.never,
+      editMessageText: () => Effect.never,
+      answerCallbackQuery: () => Effect.succeed(true),
+      getFile: () => Effect.never,
+      downloadFile: () => Effect.never,
+    }
+
+    await Effect.runPromise(selectExactModel(7, "provider/model [unknown]", 42).pipe(
+      Effect.provide(Layer.succeed(Sessions, sessionsService("/project"))),
+      Effect.provide(Layer.succeed(Store, currentStore)),
+      Effect.provide(Layer.succeed(OpenCode, client)),
+      Effect.provide(Layer.succeed(TelegramApi, telegram)),
+      Effect.provide(FetchHttpClient.layer),
+      Effect.provide(SessionSelectionLive),
+    ))
+
+    expect(await Effect.runPromise(Ref.get(switched))).toBeUndefined()
+    expect(await Effect.runPromise(Ref.get(sent))).toEqual([
+      'Unknown variant "unknown" for provider/model. Available: high, low',
+    ])
+  })
+
   test("switches the session model without saving a sentinel agent preference", async () => {
     const saved = await Effect.runPromise(Ref.make(false))
     const sent = await Effect.runPromise(Ref.make<string[]>([]))
-    const model = ModelSchema.Info.default(Provider.ID.make("provider"), ModelSchema.ID.make("model"))
+    const model = makeModelInfo("provider", "model")
     const client: OpenCodeService = {
       ...openCodeForAgent(),
       listModels: () => Effect.succeed([model]),
@@ -465,7 +557,7 @@ describe("Telegram picker callbacks", () => {
 
   test("does not save an exact model when the OpenCode switch fails", async () => {
     const saved = await Effect.runPromise(Ref.make(false))
-    const model = ModelSchema.Info.default(Provider.ID.make("provider"), ModelSchema.ID.make("model"))
+    const model = makeModelInfo("provider", "model")
     const client: OpenCodeService = {
       ...openCodeForAgent("build"),
       listModels: () => Effect.succeed([model]),

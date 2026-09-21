@@ -36,6 +36,120 @@ export const parseAgentPromptCommand = (
   return agent.length === 0 || prompt.length === 0 ? Option.none() : Option.some({ agent, prompt })
 }
 
+/** Check for a space or tab in a model reference part. */
+const hasModelReferenceWhitespace = (value: string): boolean =>
+  value.includes(" ") || value.includes("\t")
+
+/** Parse a `model [variant]` reference with brackets. */
+const parseBracketedModelReference = (
+  trimmed: string,
+): Option.Option<{ readonly model: string; readonly variant: string }> | undefined => {
+  const bracketed = trimmed.match(/^(.*?)\s*\[([^[\]]+)\]\s*$/)
+  if (bracketed === null) return undefined
+  const model = (bracketed[1] ?? "").trim()
+  const variant = (bracketed[2] ?? "").trim()
+  if (model.length === 0 || variant.length === 0) return Option.none()
+  if (hasModelReferenceWhitespace(model) || hasModelReferenceWhitespace(variant)) return Option.none()
+  return Option.some({ model, variant })
+}
+
+/** Parse a `model variant` reference with a space separator. */
+const parseSpacedModelReference = (
+  trimmed: string,
+): Option.Option<{ readonly model: string; readonly variant?: string }> => {
+  const parts = trimmed.split(/\s+/)
+  if (parts.length === 1) {
+    const model = parts[0]?.trim() ?? ""
+    if (model.length === 0) return Option.none()
+    return Option.some({ model })
+  }
+  if (parts.length !== 2) return Option.none()
+  const model = parts[0]?.trim() ?? ""
+  const rawVariant = parts[1]?.trim() ?? ""
+  const variant = rawVariant.startsWith("[") && rawVariant.endsWith("]")
+    ? rawVariant.slice(1, -1).trim()
+    : rawVariant
+  if (model.length === 0 || variant.length === 0) return Option.none()
+  if (variant.includes("[") || variant.includes("]")) return Option.none()
+  return Option.some({ model, variant })
+}
+
+/** Parse an exact model reference with an optional variant. */
+export const parseExactModelReference = (
+  text: string,
+): Option.Option<{ readonly model: string; readonly variant?: string }> => {
+  const trimmed = text.trim()
+  if (trimmed.length === 0) return Option.none()
+  const bracketed = parseBracketedModelReference(trimmed)
+  if (bracketed !== undefined) return bracketed
+  return parseSpacedModelReference(trimmed)
+}
+
+export interface AgentModelInput {
+  readonly agent?: string
+  readonly model?: string
+  readonly variant?: string
+}
+
+/** Parse `/agent_model` input into an agent and an optional model reference. */
+export const parseAgentModelInput = (text: string): Option.Option<AgentModelInput> => {
+  const trimmed = text.trim()
+  if (trimmed.length === 0) return Option.some({})
+  const parts = trimmed.split(/\s+/)
+  if (parts.length === 1) return Option.some({ agent: parts[0] })
+  const agent = parts[0] ?? ""
+  const reference = parseExactModelReference(parts.slice(1).join(" "))
+  if (agent.length === 0 || Option.isNone(reference)) return Option.none()
+  return Option.some({ agent, model: reference.value.model, variant: reference.value.variant })
+}
+
+export interface AgentTemplatePairingInput {
+  readonly template: string
+  readonly agent: string
+  readonly model: string
+  readonly variant?: string
+}
+
+/** Parse template add and replace input into a template, agent, and model. */
+export const parseAgentTemplatePairingInput = (text: string): Option.Option<AgentTemplatePairingInput> => {
+  const parts = text.trim().split(/\s+/)
+  if (parts.length < 3) return Option.none()
+  const template = parts[0] ?? ""
+  const agent = parts[1] ?? ""
+  const reference = parseExactModelReference(parts.slice(2).join(" "))
+  if (template.length === 0 || agent.length === 0 || Option.isNone(reference)) return Option.none()
+  return Option.some({ template, agent, model: reference.value.model, variant: reference.value.variant })
+}
+
+export interface AgentTemplateRemoveInput {
+  readonly template: string
+  readonly agent?: string
+}
+
+/** Parse template remove input into a template and an optional agent. */
+export const parseAgentTemplateRemoveInput = (text: string): Option.Option<AgentTemplateRemoveInput> => {
+  const parts = text.trim().split(/\s+/).filter((part) => part.length > 0)
+  if (parts.length === 1) return Option.some({ template: parts[0] ?? "" })
+  if (parts.length === 2) return Option.some({ template: parts[0] ?? "", agent: parts[1] })
+  return Option.none()
+}
+
+/** Parse `/agent_template_use` input into one template name. */
+export const parseAgentTemplateUseInput = (text: string): Option.Option<{ readonly template: string }> => {
+  const parts = text.trim().split(/\s+/).filter((part) => part.length > 0)
+  if (parts.length !== 1) return Option.none()
+  return Option.some({ template: parts[0] ?? "" })
+}
+
+/** Parse `/agent_templates` input into an optional template name. */
+export const parseAgentTemplatesListInput = (text: string): Option.Option<{ readonly name?: string }> => {
+  const trimmed = text.trim()
+  if (trimmed.length === 0) return Option.some({})
+  const parts = trimmed.split(/\s+/)
+  if (parts.length !== 1) return Option.none()
+  return Option.some({ name: parts[0] })
+}
+
 /** Include the replied message as context for a prompt reply. */
 export const promptWithReply = (prompt: string, repliedText: string | undefined): string => {
   const context = repliedText?.trim() ?? ""
