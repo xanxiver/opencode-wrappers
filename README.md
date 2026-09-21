@@ -16,7 +16,7 @@ This project provides user interfaces for OpenCode2.
 Install these tools:
 
 - [Bun](https://bun.sh/)
-- [OpenCode v2](https://opencode.ai/v2/docs/) `2.0.3` installed and available as `opencode`
+- [OpenCode v2](https://opencode.ai/v2/docs/) `2.0.11` installed and available as `opencode`
 - A token for each wrapper that you use
 
 ### 1. Install the project

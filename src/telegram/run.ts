@@ -43,9 +43,9 @@ export interface RunInput {
   readonly controllerRoute: TelegramDeliveryRoute
   /** Immutable destination owned by the selected run-delivery bot. */
   readonly runDeliveryRoute: TelegramDeliveryRoute
-  /** The accepted effective-model snapshot to apply before prompting. */
+  /** Model queued with an explicit prompt agent; applied immediately before this prompt. */
   readonly model?: { readonly id: string; readonly providerID: string; readonly variant?: string }
-  /** The agent to apply immediately before this prompt. */
+  /** Explicit prompt agent queued with this run; applied immediately before this prompt. */
   readonly agent?: string
   /** Accepted live-content level for this run. */
   readonly verbosity: StreamVerbosity
@@ -782,6 +782,9 @@ export const surfacePermission = (
       sessionID: request.sessionID,
       requestID: request.id,
       chatId,
+      threadId: route.threadId,
+      action: request.action,
+      resources: request.resources,
     })
     if (Option.isNone(tokenOption)) return
     const token = tokenOption.value

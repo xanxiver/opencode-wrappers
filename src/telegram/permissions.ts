@@ -9,18 +9,46 @@ export const DELIVERY_REJECTED_MESSAGE_ID = -2
 export const DELIVERY_IN_FLIGHT_MESSAGE_ID = -3
 export type PromptDeliveryFailure = "uncertain" | "rejected"
 
+/** One OpenCode permission request covered by a Telegram prompt. */
+export interface PendingPermissionTarget {
+  readonly sessionID: string
+  readonly requestID: string
+}
+
+/** Registration input for one OpenCode permission request. */
+export interface PendingPermissionInput {
+  readonly sessionID: string
+  readonly requestID: string
+  readonly chatId: number
+  readonly threadId?: number
+  readonly action?: string
+  readonly resources?: readonly string[]
+}
+
 export interface PendingPermission {
   readonly sessionID: string
   readonly requestID: string
   readonly chatId: number
   readonly messageId: number
   readonly timeCreated: number
+  readonly threadId?: number
+  /** Permission action and resources; set when the prompt is registered. */
+  readonly action?: string
+  readonly resources?: readonly string[]
+  /** Equivalent requests absorbed into this prompt while it is delivered. */
+  readonly requests?: readonly PendingPermissionTarget[]
   readonly replyingSince?: number
   readonly replyLeaseExpiresAt?: number
   readonly replyGeneration?: number
   readonly deliveryClaimedAt?: number
   readonly deliveryGeneration?: number
 }
+
+/** Every OpenCode request one Telegram permission prompt answers. */
+export const permissionTargets = (entry: PendingPermission): readonly PendingPermissionTarget[] => [
+  { sessionID: entry.sessionID, requestID: entry.requestID },
+  ...(entry.requests ?? []),
+]
 
 export interface PermissionReplyClaim {
   readonly entry: PendingPermission
@@ -44,23 +72,18 @@ export interface PermissionRegistryService {
   readonly getSessionRoute: (sessionID: string) => Effect.Effect<Option.Option<SessionRoute>, InteractionStoreError>
   /** Move unresolved prompts to a replacement session destination. */
   readonly rerouteSession: (sessionID: string, route: SessionRoute) => Effect.Effect<boolean, InteractionStoreError>
-  readonly register: (input: {
-    readonly sessionID: string
-    readonly requestID: string
-    readonly chatId: number
-  }) => Effect.Effect<number, InteractionStoreError>
+  readonly register: (input: PendingPermissionInput) => Effect.Effect<number, InteractionStoreError>
   /** Register only when the OpenCode request is not already surfaced. */
-  readonly registerIfAbsent: (input: {
-    readonly sessionID: string
-    readonly requestID: string
-    readonly chatId: number
-  }) => Effect.Effect<Option.Option<number>, InteractionStoreError>
+  readonly registerIfAbsent: (input: PendingPermissionInput) => Effect.Effect<Option.Option<number>, InteractionStoreError>
   /** Register a request, or resume one whose Telegram message was not persisted. */
-  readonly registerOrResume: (input: {
-    readonly sessionID: string
-    readonly requestID: string
+  readonly registerOrResume: (input: PendingPermissionInput) => Effect.Effect<Option.Option<number>, InteractionStoreError>
+  /** Delivered prompts in one destination that already cover the same action and resources. */
+  readonly listEquivalent: (input: {
     readonly chatId: number
-  }) => Effect.Effect<Option.Option<number>, InteractionStoreError>
+    readonly threadId?: number
+    readonly action: string
+    readonly resources: readonly string[]
+  }) => Effect.Effect<readonly { readonly token: number; readonly entry: PendingPermission }[], InteractionStoreError>
   /** Atomically claim an unsent Telegram prompt before crossing the API boundary. */
   readonly claimDelivery: (token: number, chatId: number) => Effect.Effect<boolean, InteractionStoreError>
   readonly claimDeliveryWithGeneration: (token: number, chatId: number) => Effect.Effect<Option.Option<number>, InteractionStoreError>
@@ -102,12 +125,20 @@ interface RegistryState {
 }
 
 const STORE_KEY = "permissions"
+const PendingPermissionTargetSchema = Schema.Struct({
+  sessionID: Schema.String,
+  requestID: Schema.String,
+})
 const PendingPermissionSchema = Schema.Struct({
   sessionID: Schema.String,
   requestID: Schema.String,
   chatId: Schema.Number,
   messageId: Schema.Number,
   timeCreated: Schema.Number,
+  threadId: Schema.optional(Schema.Number),
+  action: Schema.optional(Schema.String),
+  resources: Schema.optional(Schema.Array(Schema.String)),
+  requests: Schema.optional(Schema.Array(PendingPermissionTargetSchema)),
   replyingSince: Schema.optional(Schema.Number),
   replyLeaseExpiresAt: Schema.optional(Schema.Number),
   replyGeneration: Schema.optional(Schema.Number),
@@ -128,6 +159,55 @@ const encodeState = (state: RegistryState) => ({
   entries: [...state.entries].map(([token, entry]) => ({ token, entry })),
   routes: [...state.routes].map(([sessionID, route]) => ({ sessionID, route })),
 })
+
+const sameResources = (left: readonly string[] | undefined, right: readonly string[] | undefined): boolean =>
+  left !== undefined &&
+  right !== undefined &&
+  left.length === right.length &&
+  left.every((value, index) => value === right[index])
+
+const sameDestination = (entry: PendingPermission, input: PendingPermissionInput): boolean =>
+  entry.chatId === input.chatId && entry.threadId === input.threadId
+
+const newPendingPermission = (input: PendingPermissionInput, now: number): PendingPermission => ({
+  sessionID: input.sessionID,
+  requestID: input.requestID,
+  chatId: input.chatId,
+  messageId: 0,
+  timeCreated: now,
+  ...(input.threadId !== undefined ? { threadId: input.threadId } : {}),
+  ...(input.action !== undefined ? { action: input.action } : {}),
+  ...(input.resources !== undefined ? { resources: input.resources } : {}),
+  requests: [],
+})
+
+/** Add request metadata to a stored entry without discarding newer routing state. */
+const backfillPermission = (entry: PendingPermission, input: PendingPermissionInput): PendingPermission => {
+  const threadId = entry.threadId ?? input.threadId
+  const action = entry.action ?? input.action
+  const resources = entry.resources ?? input.resources
+  if (threadId === entry.threadId && action === entry.action && resources === entry.resources) return entry
+  return {
+    ...entry,
+    ...(threadId !== undefined ? { threadId } : {}),
+    ...(action !== undefined ? { action } : {}),
+    ...(resources !== undefined ? { resources } : {}),
+  }
+}
+
+/**
+ * A delivered prompt can absorb an equivalent request: same destination,
+ * action, and resources. Prompts whose Telegram outcome is uncertain or
+ * rejected register separately so the new request still gets a prompt.
+ */
+const canAbsorbRequest = (entry: PendingPermission, input: PendingPermissionInput): boolean =>
+  sameDestination(entry, input) &&
+  input.action !== undefined &&
+  input.resources !== undefined &&
+  entry.action === input.action &&
+  sameResources(entry.resources, input.resources) &&
+  entry.replyingSince === undefined &&
+  (entry.messageId > 0 || entry.messageId === DELIVERY_IN_FLIGHT_MESSAGE_ID)
 
 const stateFromStored = (stored: Option.Option<unknown>): RegistryState => Option.match(stored, {
   onNone: () => ({ next: 1, nextClaim: 1, entries: new Map(), routes: new Map() }),
@@ -239,13 +319,7 @@ export const Live: Layer.Layer<PermissionRegistry, InteractionStoreError, Intera
         Effect.flatMap((now) => modify((state) => {
           const clean = cleanState(state, now)
           const token = clean.next
-          const entry: PendingPermission = {
-            sessionID: input.sessionID,
-            requestID: input.requestID,
-            chatId: input.chatId,
-            messageId: 0,
-            timeCreated: now,
-          }
+          const entry = newPendingPermission(input, now)
           const entries = new Map(clean.entries).set(token, entry)
           return [token, { ...clean, next: token + 1, entries }]
         })),
@@ -254,24 +328,55 @@ export const Live: Layer.Layer<PermissionRegistry, InteractionStoreError, Intera
         Effect.flatMap((now) => modify((state) => {
           const clean = cleanState(state, now)
           for (const entry of clean.entries.values()) {
-            if (entry.chatId === input.chatId && entry.sessionID === input.sessionID && entry.requestID === input.requestID) return [Option.none(), clean]
+            if (entry.chatId !== input.chatId) continue
+            if (permissionTargets(entry).some((target) => target.sessionID === input.sessionID && target.requestID === input.requestID)) {
+              return [Option.none(), clean]
+            }
           }
           const token = clean.next
-          const entry: PendingPermission = { ...input, messageId: 0, timeCreated: now }
+          const entry = newPendingPermission(input, now)
           return [Option.some(token), { ...clean, next: token + 1, entries: new Map(clean.entries).set(token, entry) }]
         })),
       ),
       registerOrResume: (input) => Clock.currentTimeMillis.pipe(
         Effect.flatMap((now) => modify((state) => {
           const clean = cleanState(state, now)
+          // Replays and resurface scans of a known request update its metadata.
           for (const [token, entry] of clean.entries) {
-            if (entry.chatId === input.chatId && entry.sessionID === input.sessionID && entry.requestID === input.requestID) {
-              return [entry.messageId === 0 ? Option.some(token) : Option.none(), clean]
-            }
+            if (entry.chatId !== input.chatId) continue
+            if (!permissionTargets(entry).some((target) => target.sessionID === input.sessionID && target.requestID === input.requestID)) continue
+            const updated = backfillPermission(entry, input)
+            const entries = updated === entry ? clean.entries : new Map(clean.entries).set(token, updated)
+            return [updated.messageId === 0 ? Option.some(token) : Option.none(), { ...clean, entries }]
+          }
+          // A delivered prompt already covering this action and resources
+          // absorbs the request instead of sending a second Telegram message.
+          for (const [token, entry] of clean.entries) {
+            if (!canAbsorbRequest(entry, input)) continue
+            return [Option.none(), {
+              ...clean,
+              entries: new Map(clean.entries).set(token, {
+                ...entry,
+                requests: [...(entry.requests ?? []), { sessionID: input.sessionID, requestID: input.requestID }],
+              }),
+            }]
           }
           const token = clean.next
-          const entry: PendingPermission = { ...input, messageId: 0, timeCreated: now }
+          const entry = newPendingPermission(input, now)
           return [Option.some(token), { ...clean, next: token + 1, entries: new Map(clean.entries).set(token, entry) }]
+        })),
+      ),
+      listEquivalent: (input) => Clock.currentTimeMillis.pipe(
+        Effect.flatMap((now) => modify((state) => {
+          const clean = cleanState(state, now)
+          const matches: Array<{ readonly token: number; readonly entry: PendingPermission }> = []
+          for (const [token, entry] of clean.entries) {
+            if (entry.chatId !== input.chatId || entry.threadId !== input.threadId) continue
+            if (entry.messageId <= 0 || entry.replyingSince !== undefined) continue
+            if (entry.action !== input.action || !sameResources(entry.resources, input.resources)) continue
+            matches.push({ token, entry })
+          }
+          return [matches, clean]
         })),
       ),
       claimDeliveryWithGeneration: (token, chatId) => Clock.currentTimeMillis.pipe(Effect.flatMap((now) => modify((state) => {
@@ -301,7 +406,8 @@ export const Live: Layer.Layer<PermissionRegistry, InteractionStoreError, Intera
         Effect.flatMap((now) => modify((state) => {
             const clean = cleanState(state, now)
             for (const entry of clean.entries.values()) {
-              if (!hasExpired(entry.timeCreated, now) && entry.chatId === chatId && entry.sessionID === sessionID && entry.requestID === requestID) {
+              if (!hasExpired(entry.timeCreated, now) && entry.chatId === chatId &&
+                permissionTargets(entry).some((target) => target.sessionID === sessionID && target.requestID === requestID)) {
                 return [Option.some(entry), clean]
               }
             }

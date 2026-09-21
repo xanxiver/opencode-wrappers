@@ -281,7 +281,7 @@ export const runSnapshotFields = (
   verbosity: verbosity ?? DEFAULT_STREAM_VERBOSITY,
 })
 
-/** Snapshot the agent and model before a durable Telegram job is accepted. */
+/** Resolve the selection queued by an explicit prompt agent; plain prompts queue none. */
 export const resolveRunSelectionUsing = (
   store: Pick<StoreService, "getDirectoryModelFallback" | "getSessionAgentModel">,
   opencode: Pick<OpenCodeService, "getSession" | "listAgents">,
@@ -292,23 +292,24 @@ export const resolveRunSelectionUsing = (
   },
 ): Effect.Effect<RunSelection, OpenCodeError> =>
   Effect.gen(function* () {
+    // Only an explicit prompt agent queues an agent and model switch. Plain
+    // prompts apply nothing, so they follow the session selection current at
+    // execution, including a /pwa switch queued ahead of them.
+    const requestedAgent = input.agent
+    if (requestedAgent === undefined) return {}
     const session = yield* opencode.getSession(input.sessionID)
-    const agent = input.agent ?? session.agent
-    const sessionAgentModel = agent === undefined
-      ? Option.none<StoredModel>()
-      : yield* store.getSessionAgentModel(input.sessionID, agent)
+    const sessionAgentModel = yield* store.getSessionAgentModel(input.sessionID, requestedAgent)
     const directoryFallback = yield* store.getDirectoryModelFallback(input.directory)
-    const agentConfig = agent === undefined || Option.isSome(sessionAgentModel)
+    const agentConfig = Option.isSome(sessionAgentModel)
       ? undefined
-      : (yield* opencode.listAgents(input.directory)).find((candidate) => candidate.id === agent)?.model
+      : (yield* opencode.listAgents(input.directory)).find((candidate) => candidate.id === requestedAgent)?.model
     const effectiveModel = resolveEffectiveModel({
       sessionAgent: Option.getOrUndefined(sessionAgentModel),
       agentConfig,
       session: session.model,
       directory: Option.getOrUndefined(directoryFallback),
     })
-    const selection: RunSelection = {}
-    if (agent !== undefined) Object.assign(selection, { agent })
+    const selection: RunSelection = { agent: requestedAgent }
     if (Option.isSome(effectiveModel)) Object.assign(selection, { model: effectiveModel.value.model })
     return selection
   })
