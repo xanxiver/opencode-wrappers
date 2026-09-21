@@ -192,6 +192,57 @@ describe("interaction callback claim fencing", () => {
     expect(calls).toBe(0)
   })
 
+  test("answers every equivalent pending permission with one tap", async () => {
+    const edits = await Effect.runPromise(Ref.make<readonly number[]>([]))
+    const permissionCalls = await Effect.runPromise(Ref.make(0))
+    const questionCalls = await Effect.runPromise(Ref.make(0))
+    const api: TelegramApiClient = {
+      ...telegramApi,
+      editMessageText: (input) => Ref.update(edits, (ids) => [...ids, input.messageId]).pipe(
+        Effect.as({ message_id: input.messageId, chat: { id: input.chatId } }),
+      ),
+    }
+    const result = await Effect.runPromise(Effect.gen(function* () {
+      const registry = yield* PermissionRegistry
+      const first = yield* registry.register({
+        sessionID: "ses_child_1",
+        requestID: "per_group_1",
+        chatId: 7,
+        threadId: 42,
+        action: "external_directory",
+        resources: ["/tmp/other/*"],
+      })
+      const second = yield* registry.register({
+        sessionID: "ses_child_2",
+        requestID: "per_group_2",
+        chatId: 7,
+        threadId: 42,
+        action: "external_directory",
+        resources: ["/tmp/other/*"],
+      })
+      yield* registry.attachMessageId(first, 10)
+      yield* registry.attachMessageId(second, 11)
+      const query: CallbackQuery = { id: "callback-group", from: { id: 7 }, message: { message_id: 10, chat: { id: 7 } } }
+      yield* handlePermissionCallback(query, `perm:${first}:once`).pipe(
+        Effect.provide(Layer.succeed(TelegramApi, api)),
+        Effect.provide(Layer.succeed(OpenCode, openCode(permissionCalls, questionCalls))),
+        Effect.provide(FetchHttpClient.layer),
+      )
+      return {
+        calls: yield* Ref.get(permissionCalls),
+        edits: yield* Ref.get(edits),
+        remaining: yield* registry.findByRequest(7, "ses_child_2", "per_group_2"),
+      }
+    }).pipe(
+      Effect.provide(PermissionRegistryLive),
+      Effect.provide(InteractionStoreMemory),
+    ))
+
+    expect(result.calls).toBe(2)
+    expect([...result.edits].sort((left, right) => left - right)).toEqual([10, 11])
+    expect(Option.isNone(result.remaining)).toBe(true)
+  })
+
   test("does not send a completed question after initial lease validation is lost", async () => {
     const result = await Effect.runPromise(Effect.gen(function* () {
       const registry = yield* QuestionRegistry

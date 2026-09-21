@@ -29,12 +29,25 @@ The bot lives in `src/` and `test/` at the repository root. The core
   of the listed changes to one run.
 - `/models`: paginated model picker (10 per page, Previous/Next). A model
   choice is saved for the active session and agent.
-- `/model <exact-model>`: switch directly to an exact model. The choice uses
+- `/model <provider/model> [variant]`: switch directly to an exact model. The choice uses
   the same active session-agent preference as the picker.
 - `/agents`: list and select a primary agent for the current session. The bot
   restores the model saved for that session-agent pair. If the pair has no
   saved model, the bot uses the agent model, the session model, or the old
   directory fallback, in that order.
+- `/agent_model [agent] [provider/model] [variant]`: show one stored pairing,
+  or switch the session to the agent and the model. The switch stores the
+  pairing for the session-agent pair.
+- `/agent_templates [name]`: list global agent model templates, or show one
+  template. Templates live in SQLite and each template holds a set of pairings.
+- `/agent_template_add <template> <agent> <provider/model> [variant]`: add one
+  pairing to a template. The command creates the template when missing.
+- `/agent_template_replace <template> <agent> <provider/model> [variant]`:
+  replace one pairing in a template.
+- `/agent_template_remove <template> [agent]`: remove one pairing, or remove
+  the whole template when no agent is given.
+- `/agent_template_use <template>`: store all template pairings into the
+  current session. The bot applies the live model only for the active agent.
 - `/pwa <agent> <prompt>`: run a prompt with an exact agent ID or name. The
   durable job stores that agent and its effective model when the bot accepts
   the prompt.
@@ -75,7 +88,9 @@ The bot lives in `src/` and `test/` at the repository root. The core
   the working message. The setting is stored per conversation. Each durable
   job keeps the level that was active when the bot accepted that job.
 - Commands: `/start`, `/help`, `/prompt`, `/new`, `/stop`, `/reconnect`, `/forceReconnect`,
-  `/compact`, `/review`, `/models`, `/model`, `/agents`, `/pwa <agent> <prompt>`, `/status`, `/whoami`, `/projects`, `/project <path>`,
+  `/compact`, `/review`, `/models`, `/model`, `/agents`, `/agent_model`, `/agent_templates`,
+  `/agent_template_add`, `/agent_template_replace`, `/agent_template_remove`, `/agent_template_use`,
+  `/pwa <agent> <prompt>`, `/status`, `/whoami`, `/projects`, `/project <path>`,
   `/sessions`, `/queue`, `/move <from> <to>`, `/queue_delete <pos>`, `/queue_clear`,
   `/loose on|off`, `/continue on|off`, `/verbosity quiet|normal|detailed`.
 - User whitelist via `TELEGRAM_ALLOWED_USERS` (empty = deny all).
@@ -120,17 +135,18 @@ The bot lives in `src/` and `test/` at the repository root. The core
   durable job.
 - One renewable, generation-fenced lease controls each running job.
 - Waiting prompts run in FIFO order for each OpenCode session.
-- A queued prompt keeps the agent, model, and stream verbosity that the bot
-  selected when it accepted the prompt. Later setting changes do not change
-  that queued prompt.
+- `/pwa` queues its agent and model switch with the prompt; both are applied
+  when that prompt runs and are not reverted by other queued prompts. Plain
+  prompts queue no selection, so they run with the session agent and model
+  current at execution. Stream verbosity is still snapshotted per prompt.
 - Generated media uses container validation and a 10-file, 50 MB total limit.
 
 ## Stack
 
 - Bun (package manager, runner, tests)
 - TypeScript 7 (tsgo via `@typescript/native-preview`)
-- Effect 4.0.0-beta.101 (pinned to match `@opencode-ai/client` peer)
-- `@opencode-ai/client@next` (Effect entrypoint)
+- Effect 4.0.0-beta.107 (application runtime)
+- `@opencode/client@2.0.11` (promise entrypoint)
 
 ## Setup
 
@@ -141,7 +157,7 @@ cp .env.example .env
 # TELEGRAM_BOT_POOL = optional JSON array of outbound-only delivery bots
 # TELEGRAM_ALLOWED_USERS = your Telegram user id (empty = deny all)
 # PROJECT_DIRECTORY = where OpenCode sessions run
-# OPENCODE_BASE_URL = optional; empty = discover the local opencode2 service
+# OPENCODE_BASE_URL = optional; empty = discover the local OpenCode service
 ```
 
 ### Controller and delivery workers
@@ -220,7 +236,7 @@ bun run telegram    # run the Telegram UI
 bun run dev         # watch mode (Telegram UI)
 bun run typecheck   # tsgo
 bun run test:bot    # bun test, bot tests only
-bun run opencode    # spawn the opencode2 background service (serve --service)
+bun run opencode    # spawn the OpenCode background service (opencode serve --service)
 bun run opencode:status    # show the service URL
 bun run opencode:restart   # restart the background service
 ```

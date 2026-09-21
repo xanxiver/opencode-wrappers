@@ -1,9 +1,7 @@
 import { describe, expect, test } from "bun:test"
-import { Cause, Clock, Effect, Option, Ref, Schema, Semaphore } from "effect"
+import { Cause, Clock, Effect, Option, Ref, Semaphore } from "effect"
 import { TestClock } from "effect/testing"
 import { BunCrypto, BunFileSystem, BunPath } from "@effect/platform-bun"
-import { Session } from "@opencode-ai/client/effect"
-import * as Agent from "@opencode-ai/schema/agent"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { AppConfig, AppConfigTag } from "../src/config.js"
@@ -22,6 +20,7 @@ import type { SessionsError } from "../src/core/sessions.js"
 import { AUTO_CONTINUE_BASE_DELAY_MS, AUTO_CONTINUE_MAX_DELAY_MS, agentSwitchRetriesExhausted, decideAutoContinue, decodeAttachmentSnapshots, encodeAttachmentSnapshots, autoContinueDelayMs, finalEditDisposition, finishNotificationWord, forceReconnectPayload, hasRunPipeline, modelSwitchRetriesExhausted, normalizeTelegramJobPayload, redactedReviewEvidence, resetConversationUsing, resolveOwnedDurableReview, resolveRunSelectionUsing, runQueueItems, runSelectionFields, runSnapshotFields, settleFinalEditError, submitForCurrentConversationUsing, whenSubmissionSourceMissingUsing, withChangesSummaryUsing } from "../src/telegram/durable-executor.js"
 import { ApiError } from "../src/telegram/api.js"
 import { AgentSwitchError, ModelSwitchError } from "../src/telegram/run.js"
+import { makeAgentInfo, makeSessionInfo } from "./opencode-fixtures.js"
 
 const config = () => new AppConfig({
   telegramBotToken: "test-token",
@@ -800,45 +799,32 @@ describe("resolveRunSelectionUsing", () => {
     }
     const withAgent = input.agent === undefined ? base : { ...base, agent: input.agent }
     const withModel = input.model === undefined ? withAgent : { ...withAgent, model: input.model }
-    return Schema.decodeUnknownSync(Session.Info)(withModel)
+    return makeSessionInfo(withModel)
   }
 
-  const configuredAgent = Schema.decodeUnknownSync(Agent.Info)({
-    ...Agent.Info.default(Agent.ID.make("build")),
+  const configuredAgent = makeAgentInfo({
+    id: "build",
     name: "Build",
     model: { id: "configured", providerID: "provider" },
   })
 
-  test("snapshots the active session agent and its pair model", async () => {
+  test("queues no selection for a plain prompt", async () => {
     const selection = await Effect.runPromise(resolveRunSelectionUsing(
       {
-        getSessionAgentModel: (_sessionID, agentID) => Effect.succeed(
-          agentID === "build"
-            ? Option.some({ id: "pair", providerID: "provider", variant: "high" })
-            : Option.none(),
-        ),
-        getDirectoryModelFallback: () => Effect.succeed(
-          Option.some({ id: "directory", providerID: "provider" }),
-        ),
+        getSessionAgentModel: () => Effect.die("plain prompts must not resolve a pairing"),
+        getDirectoryModelFallback: () => Effect.die("plain prompts must not resolve a fallback"),
       },
       {
-        getSession: () => Effect.succeed(session({
-          id: "ses_1",
-          agent: "build",
-          model: { id: "session", providerID: "provider" },
-        })),
-        listAgents: () => Effect.succeed([configuredAgent]),
+        getSession: () => Effect.die("plain prompts must not read the session"),
+        listAgents: () => Effect.die("plain prompts must not list agents"),
       },
       { sessionID: "ses_1", directory: "/tmp/project" },
     ))
 
-    expect(selection).toEqual({
-      agent: "build",
-      model: { id: "pair", providerID: "provider", variant: "high" },
-    })
+    expect(selection).toEqual({})
   })
 
-  test("uses an explicit prompt agent instead of the active session agent", async () => {
+  test("queues an explicit prompt agent instead of the active session agent", async () => {
     const selection = await Effect.runPromise(resolveRunSelectionUsing(
       {
         getSessionAgentModel: (_sessionID, agentID) => Effect.succeed(
@@ -877,7 +863,7 @@ describe("resolveRunSelectionUsing", () => {
         })),
         listAgents: () => Effect.succeed([configuredAgent]),
       },
-      { sessionID: "ses_1", directory: "/tmp/project" },
+      { sessionID: "ses_1", directory: "/tmp/project", agent: "build" },
     ))
 
     expect(selection).toEqual({
@@ -886,7 +872,7 @@ describe("resolveRunSelectionUsing", () => {
     })
   })
 
-  test("uses the session model without inventing an agent", async () => {
+  test("uses the session model for an explicit agent without a pairing or config", async () => {
     const selection = await Effect.runPromise(resolveRunSelectionUsing(
       {
         getSessionAgentModel: () => Effect.succeed(Option.none()),
@@ -899,12 +885,13 @@ describe("resolveRunSelectionUsing", () => {
           id: "ses_1",
           model: { id: "session", providerID: "provider" },
         })),
-        listAgents: () => Effect.die("listAgents must not run without an agent"),
+        listAgents: () => Effect.succeed([]),
       },
-      { sessionID: "ses_1", directory: "/tmp/project" },
+      { sessionID: "ses_1", directory: "/tmp/project", agent: "build" },
     ))
 
     expect(selection).toEqual({
+      agent: "build",
       model: { id: "session", providerID: "provider" },
     })
   })
@@ -922,14 +909,14 @@ describe("resolveRunSelectionUsing", () => {
     const first = await Effect.runPromise(resolveRunSelectionUsing(
       store,
       opencode,
-      { sessionID: "ses_1", directory: "/tmp/project" },
+      { sessionID: "ses_1", directory: "/tmp/project", agent: "build" },
     ))
     const acceptedPayload = JSON.stringify({ selection: first })
     await Effect.runPromise(Ref.set(preference, { id: "second", providerID: "provider" }))
     const second = await Effect.runPromise(resolveRunSelectionUsing(
       store,
       opencode,
-      { sessionID: "ses_1", directory: "/tmp/project" },
+      { sessionID: "ses_1", directory: "/tmp/project", agent: "build" },
     ))
 
     expect(JSON.parse(acceptedPayload)).toEqual({

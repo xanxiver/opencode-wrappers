@@ -1,7 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { Effect, Layer, Option, Ref, Schema, Stream } from "effect"
-import { Session } from "@opencode-ai/client/effect"
-import * as Agent from "@opencode-ai/schema/agent"
+import { Effect, Layer, Option, Ref, Stream } from "effect"
 import { FetchHttpClient } from "effect/unstable/http"
 import { OpenCode, OpenCodeError, type OpenCodeService } from "../src/core/opencode.js"
 import { Sessions, type SessionsService } from "../src/core/sessions.js"
@@ -10,8 +8,9 @@ import { GitChanges, type GitChangesService } from "../src/core/git-changes.js"
 import { TelegramApi, type TelegramApiClient } from "../src/telegram/api.js"
 import { TelegramDurableExecutor, type TelegramDurableExecutorService } from "../src/telegram/durable-executor.js"
 import { renderStatusMessage, resetSession, runWithFiles, setSessionById, showStatus } from "../src/telegram/handlers/run.js"
+import { makeAgentInfo, makeSessionInfo } from "./opencode-fixtures.js"
 
-const session = Schema.decodeUnknownSync(Session.Info)({
+const session = makeSessionInfo({
   id: "ses_other",
   projectID: "project-other",
   location: { directory: "/other-project" },
@@ -20,7 +19,7 @@ const session = Schema.decodeUnknownSync(Session.Info)({
   time: { created: 1, updated: 1 },
 })
 
-const activeSession = Schema.decodeUnknownSync(Session.Info)({
+const activeSession = makeSessionInfo({
   id: "ses_topic",
   projectID: "project-topic",
   location: { directory: "/topic-project" },
@@ -38,8 +37,7 @@ const statusAgent = (
   hidden = false,
   model?: { readonly id: string; readonly providerID: string; readonly variant?: string },
 ) => {
-  const base = { ...Agent.Info.default(Agent.ID.make(id)), name, mode, hidden }
-  return Schema.decodeUnknownSync(Agent.Info)(model === undefined ? base : { ...base, model })
+  return makeAgentInfo({ id, name, mode, hidden, model })
 }
 
 const statusAgents = [
