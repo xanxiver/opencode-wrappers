@@ -135,9 +135,10 @@ The bot lives in `src/` and `test/` at the repository root. The core
   durable job.
 - One renewable, generation-fenced lease controls each running job.
 - Waiting prompts run in FIFO order for each OpenCode session.
-- A queued prompt keeps the agent, model, and stream verbosity that the bot
-  selected when it accepted the prompt. Later setting changes do not change
-  that queued prompt.
+- `/pwa` queues its agent and model switch with the prompt; both are applied
+  when that prompt runs and are not reverted by other queued prompts. Plain
+  prompts queue no selection, so they run with the session agent and model
+  current at execution. Stream verbosity is still snapshotted per prompt.
 - Generated media uses container validation and a 10-file, 50 MB total limit.
 
 ## Stack
@@ -145,7 +146,7 @@ The bot lives in `src/` and `test/` at the repository root. The core
 - Bun (package manager, runner, tests)
 - TypeScript 7 (tsgo via `@typescript/native-preview`)
 - Effect 4.0.0-beta.107 (application runtime)
-- `@opencode/client@2.0.3` (promise entrypoint)
+- `@opencode/client@2.0.11` (promise entrypoint)
 
 ## Setup
 

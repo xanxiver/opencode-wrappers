@@ -68,6 +68,7 @@ export const questionRequestFromForm = (form: QuestionForm): PendingQuestionRequ
   if (!isQuestionForm(form)) return undefined
   const questions = form.fields.flatMap((field): readonly AgentQuestion[] => {
     if (field.type !== "string" && field.type !== "multiselect") return []
+    if (field.hidden) return []
     const options = (field.options ?? []).map((option) => ({
       label: option.label,
       description: option.description ?? "",
@@ -102,6 +103,8 @@ export const questionFormAnswer = (
   let answerIndex = 0
   for (const field of form.fields) {
     if (field.type !== "string" && field.type !== "multiselect") continue
+    // Hidden fields use their server-side defaults and consume no UI answer.
+    if (field.hidden) continue
     const selected = answers[answerIndex] ?? []
     const values = selected.map((label) =>
       field.options?.find((option) => option.label === label)?.value ?? label
@@ -374,8 +377,8 @@ export const Live: Layer.Layer<
           Effect.map((output) => output.data),
         ),
       listPendingQuestions: (directory) =>
-        fromPromise("form.request.list", (signal) =>
-          client.form.request.list({ location: { directory } }, { signal })).pipe(
+        fromPromise("form.list", (signal) =>
+          client.form.list({ location: { directory } }, { signal })).pipe(
           Effect.map((output) => output.data.flatMap((form) => {
             const request = questionRequestFromForm(form)
             return request === undefined ? [] : [request]
@@ -385,7 +388,7 @@ export const Live: Layer.Layer<
         fromPromise("permission.reply", (signal) => client.permission.reply({
           sessionID: input.sessionID,
           requestID: input.requestID,
-          reply: input.reply,
+          decision: input.reply,
         }, { signal })),
       listModels: (directory) =>
         fromPromise("model.list", (signal) => client.model.list({
@@ -411,9 +414,9 @@ export const Live: Layer.Layer<
       replyQuestion: (input) => {
         const sessionID = input.sessionID
         const formID = input.requestID
-        return fromPromise("form.get", (signal) =>
-          client.form.get({ sessionID, formID }, { signal })).pipe(
-          Effect.flatMap((form) => fromPromise("form.reply", (signal) => client.form.reply({
+        return fromPromise("session.form.get", (signal) =>
+          client.session.form.get({ sessionID, formID }, { signal })).pipe(
+          Effect.flatMap((form) => fromPromise("session.form.reply", (signal) => client.session.form.reply({
             sessionID,
             formID,
             answer: questionFormAnswer(form, input.answers),

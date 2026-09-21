@@ -808,36 +808,23 @@ describe("resolveRunSelectionUsing", () => {
     model: { id: "configured", providerID: "provider" },
   })
 
-  test("snapshots the active session agent and its pair model", async () => {
+  test("queues no selection for a plain prompt", async () => {
     const selection = await Effect.runPromise(resolveRunSelectionUsing(
       {
-        getSessionAgentModel: (_sessionID, agentID) => Effect.succeed(
-          agentID === "build"
-            ? Option.some({ id: "pair", providerID: "provider", variant: "high" })
-            : Option.none(),
-        ),
-        getDirectoryModelFallback: () => Effect.succeed(
-          Option.some({ id: "directory", providerID: "provider" }),
-        ),
+        getSessionAgentModel: () => Effect.die("plain prompts must not resolve a pairing"),
+        getDirectoryModelFallback: () => Effect.die("plain prompts must not resolve a fallback"),
       },
       {
-        getSession: () => Effect.succeed(session({
-          id: "ses_1",
-          agent: "build",
-          model: { id: "session", providerID: "provider" },
-        })),
-        listAgents: () => Effect.succeed([configuredAgent]),
+        getSession: () => Effect.die("plain prompts must not read the session"),
+        listAgents: () => Effect.die("plain prompts must not list agents"),
       },
       { sessionID: "ses_1", directory: "/tmp/project" },
     ))
 
-    expect(selection).toEqual({
-      agent: "build",
-      model: { id: "pair", providerID: "provider", variant: "high" },
-    })
+    expect(selection).toEqual({})
   })
 
-  test("uses an explicit prompt agent instead of the active session agent", async () => {
+  test("queues an explicit prompt agent instead of the active session agent", async () => {
     const selection = await Effect.runPromise(resolveRunSelectionUsing(
       {
         getSessionAgentModel: (_sessionID, agentID) => Effect.succeed(
@@ -876,7 +863,7 @@ describe("resolveRunSelectionUsing", () => {
         })),
         listAgents: () => Effect.succeed([configuredAgent]),
       },
-      { sessionID: "ses_1", directory: "/tmp/project" },
+      { sessionID: "ses_1", directory: "/tmp/project", agent: "build" },
     ))
 
     expect(selection).toEqual({
@@ -885,7 +872,7 @@ describe("resolveRunSelectionUsing", () => {
     })
   })
 
-  test("uses the session model without inventing an agent", async () => {
+  test("uses the session model for an explicit agent without a pairing or config", async () => {
     const selection = await Effect.runPromise(resolveRunSelectionUsing(
       {
         getSessionAgentModel: () => Effect.succeed(Option.none()),
@@ -898,12 +885,13 @@ describe("resolveRunSelectionUsing", () => {
           id: "ses_1",
           model: { id: "session", providerID: "provider" },
         })),
-        listAgents: () => Effect.die("listAgents must not run without an agent"),
+        listAgents: () => Effect.succeed([]),
       },
-      { sessionID: "ses_1", directory: "/tmp/project" },
+      { sessionID: "ses_1", directory: "/tmp/project", agent: "build" },
     ))
 
     expect(selection).toEqual({
+      agent: "build",
       model: { id: "session", providerID: "provider" },
     })
   })
@@ -921,14 +909,14 @@ describe("resolveRunSelectionUsing", () => {
     const first = await Effect.runPromise(resolveRunSelectionUsing(
       store,
       opencode,
-      { sessionID: "ses_1", directory: "/tmp/project" },
+      { sessionID: "ses_1", directory: "/tmp/project", agent: "build" },
     ))
     const acceptedPayload = JSON.stringify({ selection: first })
     await Effect.runPromise(Ref.set(preference, { id: "second", providerID: "provider" }))
     const second = await Effect.runPromise(resolveRunSelectionUsing(
       store,
       opencode,
-      { sessionID: "ses_1", directory: "/tmp/project" },
+      { sessionID: "ses_1", directory: "/tmp/project", agent: "build" },
     ))
 
     expect(JSON.parse(acceptedPayload)).toEqual({
