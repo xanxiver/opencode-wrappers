@@ -2,10 +2,11 @@ import { describe, expect, test } from "bun:test"
 import { Effect, Exit, Layer, Option, Ref, Stream } from "effect"
 import { FetchHttpClient } from "effect/unstable/http"
 import { Sessions, type SessionsService } from "../src/core/sessions.js"
-import { Store, type StoreService } from "../src/core/store.js"
+import { Store, type StoredModel, type StoreService } from "../src/core/store.js"
 import { TelegramApi, type CallbackQuery, type TelegramApiClient } from "../src/telegram/api.js"
 import { OpenCode, OpenCodeError, type OpenCodeService } from "../src/core/opencode.js"
 import {
+  handleDefaultModel,
   handleModelCallback,
   handleModelProviderCallback,
   handleModelVariantCallback,
@@ -29,6 +30,7 @@ const storeService = (selected: Ref.Ref<string | undefined>, currentSessionID?: 
   setDirectory: () => Effect.void,
   switchConversationDirectory: () => Effect.void,
   getDirectoryModelFallback: () => Effect.succeed(Option.none()),
+  setDirectoryModelFallback: () => Effect.void,
   getSessionAgentModel: () => Effect.succeed(Option.none()),
   setSessionAgentModel: () => Effect.void,
   getLoosePrompts: () => Effect.succeed(false),
@@ -797,5 +799,53 @@ describe("Telegram picker callbacks", () => {
     expect(result.switched).toBeUndefined()
     expect(result.remembered).toBeUndefined()
     expect(result.answers).toEqual(["This model picker is no longer current."])
+  })
+
+  test("sets, shows, and clears the directory default model", async () => {
+    const fallback = await Effect.runPromise(Ref.make<Option.Option<StoredModel>>(Option.none()))
+    const sent = await Effect.runPromise(Ref.make<string[]>([]))
+    const model = { ...makeModelInfo("provider", "model"), variants: [{ id: "high" }] }
+    const client: OpenCodeService = {
+      ...openCodeForAgent("build"),
+      listModels: () => Effect.succeed([model]),
+    }
+    const currentStore: StoreService = {
+      ...storeService(await Effect.runPromise(Ref.make<string | undefined>(undefined)), "ses_current"),
+      getDirectoryModelFallback: () => Ref.get(fallback),
+      setDirectoryModelFallback: (_directory, next) => Ref.set(fallback, next),
+    }
+    const telegram: TelegramApiClient = {
+      getUpdates: () => Effect.never,
+      sendMessage: (input) => Ref.update(sent, (values) => [...values, input.text]).pipe(
+        Effect.as({ message_id: 1, chat: { id: input.chatId } }),
+      ),
+      sendPhoto: () => Effect.never,
+      sendVideo: () => Effect.never,
+      sendDocument: () => Effect.never,
+      editMessageText: () => Effect.never,
+      answerCallbackQuery: () => Effect.succeed(true),
+      getFile: () => Effect.never,
+      downloadFile: () => Effect.never,
+    }
+
+    const result = await Effect.runPromise(Effect.gen(function* () {
+      yield* handleDefaultModel(7, "provider/model [high]", 42)
+      const set = yield* Ref.get(fallback)
+      yield* handleDefaultModel(7, "", 42)
+      const shown = (yield* Ref.get(sent)).at(-1) ?? ""
+      yield* handleDefaultModel(7, "clear", 42)
+      return { set, shown, cleared: yield* Ref.get(fallback), sent: yield* Ref.get(sent) }
+    }).pipe(
+      Effect.provide(Layer.succeed(Sessions, sessionsService("/project"))),
+      Effect.provide(Layer.succeed(Store, currentStore)),
+      Effect.provide(Layer.succeed(OpenCode, client)),
+      Effect.provide(Layer.succeed(TelegramApi, telegram)),
+      Effect.provide(FetchHttpClient.layer),
+    ))
+
+    expect(result.set).toEqual(Option.some({ id: "model", providerID: "provider", variant: "high" }))
+    expect(result.shown).toContain("Default model for /project: provider/model [high].")
+    expect(result.cleared).toEqual(Option.none())
+    expect(result.sent.at(-1)).toBe("Default model cleared for /project. New sessions use the OpenCode default.")
   })
 })

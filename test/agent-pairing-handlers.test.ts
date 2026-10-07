@@ -49,6 +49,7 @@ const memoryStore = (
   setDirectory: () => Effect.void,
   switchConversationDirectory: () => Effect.void,
   getDirectoryModelFallback: () => Effect.succeed(Option.none()),
+  setDirectoryModelFallback: () => Effect.void,
   getSessionAgentModel: (sessionID, agentID) =>
     Ref.get(pairings).pipe(Effect.map((state) => Option.fromNullishOr(state[sessionID]?.[agentID]))),
   setSessionAgentModel: (sessionID, agentID, model) =>
