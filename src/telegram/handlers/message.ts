@@ -6,7 +6,7 @@ import type { Message } from "../api.js"
 import { HELP_TEXT, sendText } from "./shared.js"
 import { answerPendingQuestionText, answerRepliedQuestion } from "./question.js"
 import { runWithFiles } from "./run.js"
-import { selectExactModel, showModels } from "./model.js"
+import { handleDefaultModel, selectExactModel, showModels } from "./model.js"
 import { showProjects, showSessions } from "./picker.js"
 import { promptWithAgent, showAgents } from "./agent.js"
 import { handleAgentModel } from "./agent-model.js"
@@ -129,6 +129,9 @@ export const handleMessage = (message: Message) =>
         return
       case "/model":
         yield* selectExactModel(chatId, command.argument, threadId)
+        return
+      case "/default_model":
+        yield* handleDefaultModel(chatId, command.argument, threadId)
         return
       case "/agents":
         if (command.hasArgument) break

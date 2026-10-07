@@ -1,6 +1,7 @@
 import { Context, Data, Effect, Layer, Option, Semaphore } from "effect"
 import { OpenCode } from "./opencode.js"
 import { Store } from "./store.js"
+import { logBoundary } from "./logging.js"
 import { AppConfigTag, type AppConfig } from "../config.js"
 
 export class SessionsError extends Data.TaggedError("SessionsError")<{
@@ -43,6 +44,16 @@ export const Live: Layer.Layer<Sessions, never, OpenCode | Store | AppConfig> = 
                 const session = yield* opencode.createSession(directory).pipe(
                   Effect.mapError(mapError("create session failed")),
                 )
+                // A configured project default seeds the new session; otherwise
+                // OpenCode resolves its own configured default at prompt time.
+                const fallback = yield* store.getDirectoryModelFallback(directory)
+                if (Option.isSome(fallback)) {
+                  yield* opencode.switchModel({ sessionID: session.id, model: fallback.value }).pipe(
+                    Effect.catchCause((cause) =>
+                      logBoundary("core/sessions", "opencode-client", "apply default model failed")(cause),
+                    ),
+                  )
+                }
                 yield* store.setSessionIDForConversation(clientId, session.id).pipe(
                   Effect.mapError(mapError("persist session failed")),
                 )

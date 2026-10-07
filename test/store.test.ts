@@ -272,6 +272,24 @@ describe("Store", () => {
     }
   })
 
+  test("a directory default model round-trips and clears", async () => {
+    const stateFile = makeStateFile()
+    try {
+      const result = await run(Effect.gen(function* () {
+        const store = yield* Store
+        yield* store.setDirectoryModelFallback("/a", Option.some({ id: "m", providerID: "p", variant: "high" }))
+        const saved = yield* store.getDirectoryModelFallback("/a")
+        yield* store.setDirectoryModelFallback("/a", Option.none())
+        const cleared = yield* store.getDirectoryModelFallback("/a")
+        return { saved, cleared }
+      }), stateFile)
+      expect(result.saved).toEqual(Option.some({ id: "m", providerID: "p", variant: "high" }))
+      expect(result.cleared).toEqual(Option.none())
+    } finally {
+      rmSync(dirname(stateFile), { recursive: true, force: true })
+    }
+  })
+
   test("loose prompt mode round-trips per conversation and persists", async () => {
     const stateFile = makeStateFile()
     try {

@@ -139,6 +139,8 @@ export interface StoreService {
   readonly switchConversationDirectory: (conversationId: string, directory: string) => Effect.Effect<void, StoreError>
   /** Read the old per-directory value only as a compatibility fallback. */
   readonly getDirectoryModelFallback: (directory: string) => Effect.Effect<Option.Option<StoredModel>, never>
+  /** Store or clear the model that new sessions in one directory start with. */
+  readonly setDirectoryModelFallback: (directory: string, model: Option.Option<StoredModel>) => Effect.Effect<void, StoreError>
   readonly getSessionAgentModel: (
     sessionID: string,
     agentID: string,
@@ -274,6 +276,13 @@ export const Live: Layer.Layer<Store, StoreError, FileSystem.FileSystem | AppCon
         }),
       getDirectoryModelFallback: (directory) =>
         Ref.get(ref).pipe(Effect.map((state) => Option.fromNullishOr(state.models[directory]))),
+      setDirectoryModelFallback: (directory, model) =>
+        commit((state) => {
+          const models = { ...state.models }
+          if (Option.isNone(model)) delete models[directory]
+          else models[directory] = model.value
+          return { ...state, models }
+        }),
       getSessionAgentModel: (sessionID, agentID) =>
         Ref.get(ref).pipe(Effect.map((state) =>
           Option.fromNullishOr(state.sessionAgentModels[sessionID]?.[agentID])
