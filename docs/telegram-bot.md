@@ -22,6 +22,11 @@ The bot lives in `src/` and `test/` at the repository root. The core
   reasoning. Existing conversations default to `normal`.
 - Finished runs reply `done`, `fail`, `interrupted`, or `timeout` under the
   run message so the chat notifies on completion.
+- The finish notification carries an **Open in Yomu** button. The link renders
+  the full untruncated message at `https://yomu.reveshu.com` (mermaid diagrams
+  render natively; run media is uploaded when `YOMU_UPLOAD_TOKEN` is set). The
+  payload is encrypted with `YOMU_AES_KEY`, and the message is never stored or
+  logged by this wrapper.
 - Token usage and cost in the final message.
 - Working-tree changes summary in the final message (branch, changed files, and
   tracked diff line totals) when the project directory is inside a Git
@@ -31,6 +36,11 @@ The bot lives in `src/` and `test/` at the repository root. The core
   choice is saved for the active session and agent.
 - `/model <provider/model> [variant]`: switch directly to an exact model. The choice uses
   the same active session-agent preference as the picker.
+- `/default_model [provider/model] [variant] | clear`: show, set, or clear the
+  default model for the current project directory. New sessions in that
+  directory start with this model. It does not change the current session; use
+  `/model` for that. Without a default, new sessions run on OpenCode's
+  configured default.
 - `/agents`: list and select a primary agent for the current session. The bot
   restores the model saved for that session-agent pair. If the pair has no
   saved model, the bot uses the agent model, the session model, or the old
@@ -88,7 +98,7 @@ The bot lives in `src/` and `test/` at the repository root. The core
   the working message. The setting is stored per conversation. Each durable
   job keeps the level that was active when the bot accepted that job.
 - Commands: `/start`, `/help`, `/prompt`, `/new`, `/stop`, `/reconnect`, `/forceReconnect`,
-  `/compact`, `/review`, `/models`, `/model`, `/agents`, `/agent_model`, `/agent_templates`,
+  `/compact`, `/review`, `/models`, `/model`, `/default_model`, `/agents`, `/agent_model`, `/agent_templates`,
   `/agent_template_add`, `/agent_template_replace`, `/agent_template_remove`, `/agent_template_use`,
   `/pwa <agent> <prompt>`, `/status`, `/whoami`, `/projects`, `/project <path>`,
   `/sessions`, `/queue`, `/move <from> <to>`, `/queue_delete <pos>`, `/queue_clear`,

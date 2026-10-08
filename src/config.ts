@@ -1,6 +1,7 @@
 import { Config, ConfigProvider, Context, Data, Duration, Effect, Layer, Option, Schema } from "effect"
 import { homedir } from "node:os"
 import { resolve } from "node:path"
+import { DEFAULT_YOMU_BASE_URL, parseSharedKey } from "./core/yomu.js"
 
 export class ConfigError extends Data.TaggedError("ConfigError")<{
   readonly message: string
@@ -106,6 +107,12 @@ export class AppConfig extends Schema.Class<AppConfig>("AppConfig")({
   webTrustedOrigins: Schema.optional(Schema.String),
   /** Comma-separated filesystem roots whose direct child directories are workspace options. */
   webWorkspaceRoots: Schema.optional(Schema.String),
+  /** Yomu shared message key (64 hex or 43 base64url chars). */
+  yomuAesKey: Schema.optional(Schema.String),
+  /** Bearer token for Yomu media uploads. */
+  yomuUploadToken: Schema.optional(Schema.String),
+  /** Base URL for Yomu links and uploads. */
+  yomuBaseUrl: Schema.optional(Schema.NonEmptyString),
 }) {}
 
 /** Parse a positive timeout such as `10 minutes`. */
@@ -149,6 +156,9 @@ const raw = Config.all({
   webJwtSecret: Config.option(Config.string("WEB_JWT_SECRET")),
   webTrustedOrigins: Config.option(Config.string("WEB_TRUSTED_ORIGINS")),
   webWorkspaceRoots: Config.option(Config.string("WEB_WORKSPACE_ROOTS")),
+  yomuAesKey: Config.option(Config.string("YOMU_AES_KEY")),
+  yomuUploadToken: Config.option(Config.string("YOMU_UPLOAD_TOKEN")),
+  yomuBaseUrl: Config.string("YOMU_BASE_URL").pipe(Config.withDefault(DEFAULT_YOMU_BASE_URL)),
 })
 
 export const Live: Layer.Layer<AppConfig, ConfigError> = Layer.effect(
@@ -173,6 +183,9 @@ export const Live: Layer.Layer<AppConfig, ConfigError> = Layer.effect(
        webJwtSecret: emptyToUndefined(Option.getOrUndefined(env.webJwtSecret)),
         webTrustedOrigins: emptyToUndefined(Option.getOrUndefined(env.webTrustedOrigins)),
         webWorkspaceRoots: emptyToUndefined(Option.getOrUndefined(env.webWorkspaceRoots)),
+        yomuAesKey: emptyToUndefined(Option.getOrUndefined(env.yomuAesKey)),
+        yomuUploadToken: emptyToUndefined(Option.getOrUndefined(env.yomuUploadToken)),
+       yomuBaseUrl: env.yomuBaseUrl,
        webUiPort: Option.getOrUndefined(env.webUiPort),
     })),
     Effect.flatMap((env) => Effect.gen(function* () {
@@ -184,6 +197,9 @@ export const Live: Layer.Layer<AppConfig, ConfigError> = Layer.effect(
       }
       if (env.webSecureCookies !== true && !isLoopbackWebHost(env.webHost ?? "127.0.0.1")) {
         return yield* new ConfigError({ message: "WEB_SECURE_COOKIES must be true when WEB_HOST is not loopback" })
+      }
+      if (env.yomuAesKey !== undefined && Option.isNone(parseSharedKey(env.yomuAesKey))) {
+        return yield* new ConfigError({ message: "YOMU_AES_KEY must be 32 bytes (64 hex or 43 base64url chars)" })
       }
       const telegramBotPool = yield* parseTelegramBotPool(env.telegramBotPoolJson, env.telegramBotToken)
       const { telegramBotPoolJson: _, ...appConfig } = env

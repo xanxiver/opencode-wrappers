@@ -106,6 +106,9 @@ See `.env.example` for the complete list.
 | `WEB_JWT_SECRET` | For web UI | None | Secret of at least 32 bytes used to sign 15-minute HS256 access tokens. Keep it private. |
 | `WEB_TRUSTED_ORIGINS` | No | None | Comma-separated exact origins allowed for cookie-authenticated development requests. The configured `WEB_UI_PORT` origins are trusted automatically on localhost. |
 | `WEB_WORKSPACE_ROOTS` | No | `PROJECT_DIRECTORY` | Comma-separated absolute roots. The workspace picker lists each root and its direct child directories. |
+| `YOMU_AES_KEY` | For Yomu links | None | Shared 32-byte key (64 hex or 43 base64url chars) for encrypted Yomu message links. Keep it backend-only. |
+| `YOMU_UPLOAD_TOKEN` | For Yomu media | None | Bearer token used to upload run media to Yomu. Objects are deleted after 24 hours. Keep it backend-only. |
+| `YOMU_BASE_URL` | No | `https://yomu.reveshu.com` | Base URL for Yomu links and uploads. |
 
 Local image directories are configured in Settings → Workspace. They must be
 existing, readable directories.

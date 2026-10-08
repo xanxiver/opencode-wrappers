@@ -16,7 +16,15 @@ import {
   type KeyboardMarkup,
   type TelegramDeliveryClient,
 } from "./api.js"
-import { AppConfigTag, parseRunTimeout } from "../config.js"
+import { AppConfigTag, parseRunTimeout, type AppConfig } from "../config.js"
+import {
+  DEFAULT_YOMU_BASE_URL,
+  buildYomuUrl,
+  encodeYomuPayload,
+  isYomuMediaMime,
+  parseSharedKey,
+  uploadYomuMedia,
+} from "../core/yomu.js"
 import { renderTelegramMermaid } from "./mermaid.js"
 import { PermissionRegistry, type PermissionRegistryService } from "./permissions.js"
 import { QuestionRegistry, type QuestionRegistryService } from "./questions.js"
@@ -118,9 +126,27 @@ export interface MediaArtifact {
   readonly delivery?: "document"
 }
 
+/** One `<telegram-media>` marker location inside a response body. */
+export interface MediaPlacement {
+  readonly start: number
+  readonly end: number
+  readonly part: ToolFilePart | undefined
+  readonly media: MediaArtifact | undefined
+}
+
+/** A response body with its media markers parsed and located. */
+export interface ParsedResponse {
+  readonly text: string
+  readonly media: readonly MediaArtifact[]
+  readonly rawText: string
+  readonly placements: readonly MediaPlacement[]
+}
+
 export interface RunFinalization {
   readonly text: string
   readonly media: readonly MediaArtifact[]
+  /** Full untruncated Yomu link for the message, when Yomu is configured. */
+  readonly yomu?: string
   /** How the run ended; drives the finish notification reply. */
   readonly outcome: RunOutcome
 }
@@ -452,46 +478,195 @@ const mediaFromToolPartEffect = (part: ToolFilePart, maxBytes: number): Effect.E
         return Option.some(media)
       })
 
-const collectMediaParts = (parts: readonly unknown[]): Effect.Effect<readonly MediaArtifact[], never, FileSystem.FileSystem | Path.Path> =>
+const decodeToolPartCandidate = (part: ToolContentValue): Option.Option<ToolFilePart> => {
+  if (isToolFilePart(part)) return decodeToolFilePart(part)
+  const textPart = Option.getOrUndefined(
+    Schema.decodeUnknownOption(Schema.Struct({ type: Schema.Literal("text"), text: Schema.String }))(part),
+  )
+  return textPart === undefined ? Option.none() : decodeToolFileJson(textPart.text)
+}
+
+interface CollectedMedia {
+  readonly items: readonly MediaArtifact[]
+  /** One artifact (or none) per input candidate, duplicate references included. */
+  readonly byInput: readonly (MediaArtifact | undefined)[]
+}
+
+const collectMediaFromCandidates = (
+  candidates: readonly Option.Option<ToolFilePart>[],
+): Effect.Effect<CollectedMedia, never, FileSystem.FileSystem | Path.Path> =>
   Effect.gen(function* () {
     const items: MediaArtifact[] = []
-    const keys = new Set<string>()
+    const byInput: (MediaArtifact | undefined)[] = []
+    const known = new Map<string, MediaArtifact>()
     let totalBytes = 0
-    for (const part of parts) {
-      if (items.length >= MAX_TELEGRAM_MEDIA_COUNT || totalBytes >= MAX_TELEGRAM_MEDIA_TOTAL_BYTES) break
-      let candidate = Option.none<ToolFilePart>()
-      if (isToolFilePart(part)) candidate = decodeToolFilePart(part)
-      else {
-        const textPart = Option.getOrUndefined(
-          Schema.decodeUnknownOption(Schema.Struct({ type: Schema.Literal("text"), text: Schema.String }))(part),
-        )
-        if (textPart !== undefined) candidate = decodeToolFileJson(textPart.text)
+    for (const candidate of candidates) {
+      if (Option.isNone(candidate)) {
+        byInput.push(undefined)
+        continue
       }
-      if (Option.isNone(candidate)) continue
       const media = yield* mediaFromToolPartEffect(candidate.value, MAX_TELEGRAM_MEDIA_TOTAL_BYTES - totalBytes)
-      if (Option.isNone(media) || keys.has(media.value.key)) continue
-      keys.add(media.value.key)
+      if (Option.isNone(media)) {
+        byInput.push(undefined)
+        continue
+      }
+      const duplicate = known.get(media.value.key)
+      if (duplicate !== undefined) {
+        byInput.push(duplicate)
+        continue
+      }
+      if (items.length >= MAX_TELEGRAM_MEDIA_COUNT || totalBytes + media.value.bytes.length > MAX_TELEGRAM_MEDIA_TOTAL_BYTES) {
+        byInput.push(undefined)
+        continue
+      }
+      known.set(media.value.key, media.value)
       items.push(media.value)
+      byInput.push(media.value)
       totalBytes += media.value.bytes.length
     }
-    return items
+    return { items, byInput }
   })
+
+const collectMediaParts = (parts: readonly unknown[]): Effect.Effect<readonly MediaArtifact[], never, FileSystem.FileSystem | Path.Path> =>
+  collectMediaFromCandidates(parts.map(decodeToolPartCandidate)).pipe(Effect.map((collected) => collected.items))
 
 const mediaFromToolContentEffect = (content: ToolContentValue): Effect.Effect<readonly MediaArtifact[], never, FileSystem.FileSystem | Path.Path> =>
   Array.isArray(content) ? collectMediaParts(content) : Effect.succeed([])
 
-export const mediaFromResponseText = (text: string): Effect.Effect<{ readonly text: string; readonly media: readonly MediaArtifact[] }, never, FileSystem.FileSystem | Path.Path> => {
-  const contracts: ToolFilePart[] = []
-  const visibleText = text.replace(TELEGRAM_MEDIA_PATTERN, (_match, encoded: string) => {
-    Option.map(decodeToolFileJson(encoded), (part) => contracts.push(part))
-    return ""
-  }).trim()
-  return collectMediaParts(contracts).pipe(Effect.map((media) => ({ text: visibleText, media })))
-}
+export const mediaFromResponseText = (text: string): Effect.Effect<ParsedResponse, never, FileSystem.FileSystem | Path.Path> =>
+  Effect.gen(function* () {
+    const pattern = new RegExp(TELEGRAM_MEDIA_PATTERN.source, "g")
+    const matches: { readonly start: number; readonly end: number; readonly part: Option.Option<ToolFilePart> }[] = []
+    let match: RegExpExecArray | null
+    while ((match = pattern.exec(text)) !== null) {
+      matches.push({
+        start: match.index,
+        end: match.index + match[0].length,
+        part: decodeToolFileJson(match[1] ?? ""),
+      })
+    }
+    const collected = yield* collectMediaFromCandidates(matches.map((entry) => entry.part))
+    const placements: MediaPlacement[] = matches.map((entry, index) => ({
+      start: entry.start,
+      end: entry.end,
+      part: Option.getOrUndefined(entry.part),
+      media: collected.byInput[index],
+    }))
+    return {
+      text: text.replace(TELEGRAM_MEDIA_PATTERN, "").trim(),
+      media: collected.items,
+      rawText: text,
+      placements,
+    }
+  })
 
 const TELEGRAM_MEDIA_PATTERN = /<telegram-media>\s*([\s\S]*?)\s*<\/telegram-media>/g
 
 const visibleResponseText = (text: string): string => text.replace(TELEGRAM_MEDIA_PATTERN, "").trim()
+
+/** Replace each response marker with its uploaded Yomu object URL in place. */
+const yomuResponseBody = (input: {
+  readonly rawText: string
+  readonly placements: readonly MediaPlacement[]
+  readonly uploads: ReadonlyMap<string, string>
+  readonly uploadsEnabled: boolean
+}): string => {
+  const ordered = [...input.placements].sort((left, right) => left.start - right.start)
+  let cursor = 0
+  const parts: string[] = []
+  for (const placement of ordered) {
+    if (placement.start < cursor) continue
+    parts.push(input.rawText.slice(cursor, placement.start))
+    const media = placement.media
+    const url = media === undefined ? undefined : input.uploads.get(media.key)
+    if (media !== undefined && url !== undefined) {
+      parts.push(media.mime.startsWith("image/") ? `![${media.name}](${url})` : `[${media.name}](${url})`)
+    } else if (media !== undefined && input.uploadsEnabled) {
+      parts.push(`[media: ${media.name}]`)
+    }
+    // Without uploads the marker is dropped, matching the Telegram message.
+    cursor = placement.end
+  }
+  parts.push(input.rawText.slice(cursor))
+  return parts.join("").trim()
+}
+
+const yomuMediaAppendix = (media: readonly MediaArtifact[], uploads: ReadonlyMap<string, string>): string => {
+  const lines = media.flatMap((item) => {
+    const url = uploads.get(item.key)
+    if (url === undefined) return []
+    return [item.mime.startsWith("image/") ? `![${item.name}](${url})` : `[${item.name}](${url})`]
+  })
+  return lines.length === 0 ? "" : `\n\n---\n\n${lines.join("\n\n")}`
+}
+
+/**
+ * Build the full untruncated Yomu link for one run. Returns none when Yomu
+ * is not configured, the message is empty, or encoding fails. The message
+ * never reaches the logs.
+ */
+export const buildYomuLink = (input: {
+  readonly response: Pick<ParsedResponse, "rawText" | "placements">
+  readonly toolMedia: readonly MediaArtifact[]
+  readonly config: AppConfig
+}): Effect.Effect<Option.Option<string>, never, never> =>
+  Effect.gen(function* () {
+    const keyValue = input.config.yomuAesKey
+    if (keyValue === undefined) return Option.none()
+    const key = parseSharedKey(keyValue)
+    if (Option.isNone(key)) return Option.none()
+    const baseUrl = input.config.yomuBaseUrl ?? DEFAULT_YOMU_BASE_URL
+    const uploadToken = input.config.yomuUploadToken
+    const candidates = new Map<string, MediaArtifact>()
+    for (const placement of input.response.placements) {
+      if (placement.media !== undefined) candidates.set(placement.media.key, placement.media)
+    }
+    for (const media of input.toolMedia) candidates.set(media.key, media)
+    const uploads = new Map<string, string>()
+    if (uploadToken !== undefined) {
+      yield* Effect.forEach([...candidates.values()], (media) => {
+        if (!isYomuMediaMime(media.mime) || media.bytes.byteLength === 0) return Effect.void
+        return uploadYomuMedia({
+          baseUrl,
+          token: uploadToken,
+          bytes: media.bytes,
+          mime: media.mime,
+        }).pipe(
+          Effect.timeoutOption("8 seconds"),
+          Effect.catchCause((cause) =>
+            logBoundary("telegram/run", "yomu-upload", "Yomu media upload failed")(cause).pipe(
+              Effect.as(Option.none<string>()),
+            ),
+          ),
+          Effect.tap((url) => Option.match(url, {
+            onNone: () => Effect.void,
+            onSome: (value) => Effect.sync(() => {
+              uploads.set(media.key, value)
+            }),
+          })),
+        )
+      }, { concurrency: "unbounded" })
+    }
+    const referenced = new Set(input.response.placements.flatMap((placement) =>
+      placement.media === undefined ? [] : [placement.media.key]
+    ))
+    const markdown = yomuResponseBody({
+      rawText: input.response.rawText,
+      placements: input.response.placements,
+      uploads,
+      uploadsEnabled: uploadToken !== undefined,
+    }) + yomuMediaAppendix(input.toolMedia.filter((media) => !referenced.has(media.key)), uploads)
+    if (markdown.trim().length === 0) return Option.none()
+    const payload = yield* encodeYomuPayload({ markdown, key: key.value }).pipe(Effect.option)
+    if (Option.isNone(payload)) return Option.none()
+    return Option.some(buildYomuUrl({ payload: payload.value, baseUrl }))
+  }).pipe(
+    Effect.catchCause((cause) =>
+      logBoundary("telegram/run", "yomu-link", "Yomu link build failed")(cause).pipe(
+        Effect.andThen(Effect.succeed(Option.none<string>())),
+      ),
+    ),
+  )
 
 interface RecoverableMessage {
   readonly id: string
@@ -539,7 +714,7 @@ const toolMediaPartsForInput = (messages: readonly RecoverableMessage[], inputID
 export const recoveredResponseForInput = (
   messages: readonly RecoverableMessage[],
   inputID: string,
-): Effect.Effect<Option.Option<{ readonly text: string; readonly media: readonly MediaArtifact[] }>, never, FileSystem.FileSystem | Path.Path> => {
+): Effect.Effect<Option.Option<ParsedResponse>, never, FileSystem.FileSystem | Path.Path> => {
   const turn = assistantTurnForInput(messages, inputID)
   if (turn.length === 0) return Effect.succeed(Option.none())
   const text = assistantResponseForInput(messages, inputID) ?? ""
@@ -550,7 +725,12 @@ export const recoveredResponseForInput = (
     const media = limitMedia([...toolMedia, ...response.media])
     return response.text.length === 0 && media.length === 0
       ? Option.none()
-      : Option.some({ text: response.text, media })
+      : Option.some({
+          text: response.text,
+          media,
+          rawText: response.rawText,
+          placements: response.placements,
+        })
   }))
 }
 
@@ -558,7 +738,7 @@ export const recoveredResponseForInput = (
 export const recoveredResponseFromPages = <R>(
   inputID: string,
   listPage: (cursor?: string) => Effect.Effect<RecoverableMessagePage | undefined, never, R>,
-): Effect.Effect<Option.Option<{ readonly text: string; readonly media: readonly MediaArtifact[] }>, never, R | FileSystem.FileSystem | Path.Path> =>
+): Effect.Effect<Option.Option<ParsedResponse>, never, R | FileSystem.FileSystem | Path.Path> =>
   Effect.gen(function* () {
     const messages: RecoverableMessage[] = []
     const cursors = new Set<string>()
@@ -585,7 +765,7 @@ export const recoveredResponseFromHistory = (
     readonly enabled?: boolean
     readonly runID?: string
   } = {},
-): Effect.Effect<Option.Option<{ readonly text: string; readonly media: readonly MediaArtifact[] }>, never, OpenCode | FileSystem.FileSystem | Path.Path> =>
+): Effect.Effect<Option.Option<ParsedResponse>, never, OpenCode | FileSystem.FileSystem | Path.Path> =>
   Effect.gen(function* () {
     const opencode = yield* OpenCode
     const debug = (message: string, annotations: LogAnnotations = {}) => logDebugEvent(
@@ -1556,7 +1736,13 @@ export const runPrompt = (input: RunInput) =>
     })
     const rendered = yield* renderTelegramMermaid(renderFinal(response.text, outcome) + usageLine)
     const finalMedia = limitMedia([...rendered.media, ...finalState.media, ...response.media])
-    const finalization: RunFinalization = { text: truncate(rendered.text), media: finalMedia, outcome }
+    const yomuUrl = yield* buildYomuLink({ response, toolMedia: finalState.media, config })
+    const finalization: RunFinalization = {
+      text: truncate(rendered.text),
+      media: finalMedia,
+      outcome,
+    }
+    if (Option.isSome(yomuUrl)) Object.assign(finalization, { yomu: yomuUrl.value })
     yield* debug("Telegram final response prepared", {
       outcome,
       finalTextLength: finalization.text.length,

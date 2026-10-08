@@ -644,3 +644,98 @@ export const selectExactModel = (chatId: number, query: string, threadId?: numbe
     }))
     yield* sendText(chatId, text, threadId)
   })
+
+export const DEFAULT_MODEL_USAGE = "Usage: /default_model <provider/model> [variant] | clear"
+
+/** `/default_model [provider/model] [variant]` — show, set, or clear the project's default model. */
+export const handleDefaultModel = (chatId: number, query: string, threadId?: number) =>
+  Effect.gen(function* () {
+    const sessions = yield* Sessions
+    const opencode = yield* OpenCode
+    const store = yield* Store
+    const conversation = conversationId({ chatId, threadId })
+    const directory = yield* sessions.directoryFor(conversation)
+    const trimmed = query.trim()
+    if (trimmed.length === 0) {
+      const current = yield* store.getDirectoryModelFallback(directory)
+      const line = Option.match(current, {
+        onNone: () => `No default model is set for ${directory}.`,
+        onSome: (model) => `Default model for ${directory}: ${formatModelPreference(model)}.`,
+      })
+      yield* sendText(chatId, `${line}\n${DEFAULT_MODEL_USAGE}`, threadId)
+      return
+    }
+    if (trimmed === "clear") {
+      const cleared = yield* store.setDirectoryModelFallback(directory, Option.none()).pipe(
+        Effect.as(true),
+        Effect.catchCause((cause) =>
+          logBoundary("telegram/handlers", "default-model", "clear default model failed")(cause).pipe(
+            Effect.as(false),
+          ),
+        ),
+      )
+      yield* sendText(chatId, cleared
+        ? `Default model cleared for ${directory}. New sessions use the OpenCode default.`
+        : "The default model could not be cleared. Please try again.", threadId)
+      return
+    }
+    const reference = parseExactModelReference(trimmed)
+    if (Option.isNone(reference)) {
+      yield* sendText(chatId, DEFAULT_MODEL_USAGE, threadId)
+      return
+    }
+    const modelReference = reference.value.model
+    const variantReference = reference.value.variant
+    const models = yield* opencode.listModels(directory).pipe(
+      Effect.catchCause((cause) => logBoundary("telegram/handlers", "opencode-client", "list models failed")(cause).pipe(
+        Effect.andThen(Effect.succeed<readonly ModelInfo[]>([])),
+      )),
+    )
+    const matches = models.filter((model) => model.id === modelReference || `${model.providerID}/${model.id}` === modelReference)
+    if (matches.length !== 1) {
+      yield* sendText(
+        chatId,
+        matches.length === 0 ? `Model not found: ${modelReference}` : "Model name is ambiguous; use provider/model.",
+        threadId,
+      )
+      return
+    }
+    const selected = matches[0]
+    if (selected === undefined) {
+      yield* sendText(chatId, `Model not found: ${modelReference}`, threadId)
+      return
+    }
+    if (variantReference !== undefined) {
+      const available = selected.variants.map((variant) => variant.id)
+      if (!available.includes(variantReference)) {
+        yield* sendText(
+          chatId,
+          available.length === 0
+            ? `Model ${modelReference} has no variants.`
+            : `Unknown variant "${variantReference}" for ${modelReference}. Available: ${available.join(", ")}`,
+          threadId,
+        )
+        return
+      }
+    }
+    const model: StoredModel = variantReference === undefined
+      ? { id: selected.id, providerID: selected.providerID }
+      : { id: selected.id, providerID: selected.providerID, variant: variantReference }
+    const saved = yield* store.setDirectoryModelFallback(directory, Option.some(model)).pipe(
+      Effect.as(true),
+      Effect.catchCause((cause) =>
+        logBoundary("telegram/handlers", "default-model", "save default model failed")(cause).pipe(
+          Effect.as(false),
+        ),
+      ),
+    )
+    yield* sendText(chatId, saved
+      ? `Default model for ${directory} set to ${formatModelPreference(model)}. New sessions will start with it.`
+      : "The default model could not be saved. Please try again.", threadId)
+  }).pipe(
+    Effect.catchCause((cause) =>
+      logBoundary("telegram/handlers", "default-model", "default model command failed")(cause).pipe(
+        Effect.andThen(sendText(chatId, "The default model action failed. Please try again.", threadId)),
+      ),
+    ),
+  )

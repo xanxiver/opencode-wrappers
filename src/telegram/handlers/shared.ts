@@ -35,6 +35,7 @@ export const HELP_TEXT = [
   "/agents — choose an agent",
   "/models [query] — browse models and variants",
   "/model &lt;provider/model&gt; [variant] — switch model",
+  "/default_model &lt;provider/model&gt; [variant] | clear — model new sessions start with",
   "/agent_model [agent] [provider/model] [variant] — view or set a pairing",
   "/pwa &lt;agent&gt; &lt;prompt&gt; — run with a specific agent",
   "",

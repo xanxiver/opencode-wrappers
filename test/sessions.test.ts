@@ -1,9 +1,9 @@
 import { describe, expect, test } from "bun:test"
-import { Effect, Layer, Ref, Stream } from "effect"
+import { Effect, Layer, Option, Ref, Stream } from "effect"
 import { BunFileSystem } from "@effect/platform-bun"
-import { OpenCode } from "../src/core/opencode.js"
+import { OpenCode, OpenCodeError, type OpenCodeService } from "../src/core/opencode.js"
 import { Live as SessionsLive, Sessions } from "../src/core/sessions.js"
-import { Live as StoreLive } from "../src/core/store.js"
+import { Live as StoreLive, Store, type StoredModel } from "../src/core/store.js"
 import { AppConfig, AppConfigTag } from "../src/config.js"
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -38,7 +38,12 @@ const makeStoreLayer = () => {
   return { storeLayer, configLayer, cleanup: () => rmSync(dir, { recursive: true, force: true }) }
 }
 
-const makeOpenCodeLayer = (callCount: Ref.Ref<number>) =>
+interface OpenCodeLayerOptions {
+  readonly switches?: Ref.Ref<readonly StoredModel[]>
+  readonly failSwitch?: boolean
+}
+
+const makeOpenCodeLayer = (callCount: Ref.Ref<number>, options: OpenCodeLayerOptions = {}) =>
   Layer.succeed(OpenCode, {
     createSession: (directory: string) =>
       Ref.update(callCount, (n) => n + 1).pipe(
@@ -63,7 +68,13 @@ const makeOpenCodeLayer = (callCount: Ref.Ref<number>) =>
      listModels: () => Effect.never,
      listAgents: () => Effect.succeed([]),
      switchAgent: () => Effect.never,
-     switchModel: () => Effect.never,
+     switchModel: ({ model }) => {
+       if (options.failSwitch === true) {
+         return Effect.fail(new OpenCodeError({ operation: "switch model", cause: new Error("unavailable") }))
+       }
+       if (options.switches === undefined) return Effect.never
+       return Ref.update(options.switches, (values) => [...values, model])
+     },
     replyQuestion: () => Effect.never,
     events: () => Stream.never,
   })
@@ -76,6 +87,18 @@ const sessionsLayer = (
   Layer.provide(
     SessionsLive,
     Layer.merge(makeOpenCodeLayer(callCount), Layer.merge(storeLayer, configLayer)),
+  )
+
+/** Sessions, Store, OpenCode, and AppConfig together so tests can seed defaults. */
+const sessionsWithStoreLayer = (
+  callCount: Ref.Ref<number>,
+  storeLayer: ReturnType<typeof makeStoreLayer>["storeLayer"],
+  configLayer: ReturnType<typeof makeStoreLayer>["configLayer"],
+  options: OpenCodeLayerOptions = {},
+) =>
+  Layer.provideMerge(
+    SessionsLive,
+    Layer.merge(makeOpenCodeLayer(callCount, options), Layer.merge(storeLayer, configLayer)),
   )
 
 describe("Sessions", () => {
@@ -219,6 +242,67 @@ describe("Sessions", () => {
         }).pipe(Effect.provide(layer)),
       )
       expect(result.count).toBe(2)
+    } finally {
+      cleanup()
+    }
+  })
+
+  test("a new session applies the directory default model", async () => {
+    const { storeLayer, configLayer, cleanup } = makeStoreLayer()
+    const callCount = await Effect.runPromise(Ref.make(0))
+    const switches = await Effect.runPromise(Ref.make<readonly StoredModel[]>([]))
+    const layer = sessionsWithStoreLayer(callCount, storeLayer, configLayer, { switches })
+    try {
+      const result = await Effect.runPromise(Effect.gen(function* () {
+        const store = yield* Store
+        const sessions = yield* Sessions
+        yield* store.setDirectoryModelFallback(
+          "/default-dir",
+          Option.some({ id: "default-model", providerID: "provider", variant: "high" }),
+        )
+        const id = yield* sessions.getOrCreate("tg:1")
+        return { id, switches: yield* Ref.get(switches) }
+      }).pipe(Effect.provide(layer)))
+      expect(result.switches).toEqual([
+        { id: "default-model", providerID: "provider", variant: "high" },
+      ])
+    } finally {
+      cleanup()
+    }
+  })
+
+  test("a new session without a default applies no model", async () => {
+    const { storeLayer, configLayer, cleanup } = makeStoreLayer()
+    const callCount = await Effect.runPromise(Ref.make(0))
+    const switches = await Effect.runPromise(Ref.make<readonly StoredModel[]>([]))
+    const layer = sessionsWithStoreLayer(callCount, storeLayer, configLayer, { switches })
+    try {
+      const result = await Effect.runPromise(Effect.gen(function* () {
+        const sessions = yield* Sessions
+        const id = yield* sessions.getOrCreate("tg:1")
+        return { id, switches: yield* Ref.get(switches) }
+      }).pipe(Effect.provide(layer)))
+      expect(result.switches).toEqual([])
+    } finally {
+      cleanup()
+    }
+  })
+
+  test("a failed default model switch does not fail session creation", async () => {
+    const { storeLayer, configLayer, cleanup } = makeStoreLayer()
+    const callCount = await Effect.runPromise(Ref.make(0))
+    const layer = sessionsWithStoreLayer(callCount, storeLayer, configLayer, { failSwitch: true })
+    try {
+      const result = await Effect.runPromise(Effect.gen(function* () {
+        const store = yield* Store
+        const sessions = yield* Sessions
+        yield* store.setDirectoryModelFallback(
+          "/default-dir",
+          Option.some({ id: "default-model", providerID: "provider" }),
+        )
+        return yield* sessions.getOrCreate("tg:1")
+      }).pipe(Effect.provide(layer)))
+      expect(result).toBe("ses__default_dir")
     } finally {
       cleanup()
     }

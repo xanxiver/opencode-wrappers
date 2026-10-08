@@ -40,7 +40,7 @@ import {
   runPrompt,
   type RunFinalization,
 } from "./run.js"
-import { MessageSchema, TelegramApi, type ApiError, type Message, type TelegramDeliveryClient } from "./api.js"
+import { isDefinitiveSendRejection, MessageSchema, TelegramApi, type ApiError, type KeyboardMarkup, type Message, type TelegramDeliveryClient } from "./api.js"
 import { PermissionRegistry } from "./permissions.js"
 import { QuestionRegistry } from "./questions.js"
 import { reconcilePendingSession } from "./resurface.js"
@@ -129,6 +129,8 @@ const PersistedFinalization = Schema.Struct({
   // Older persisted results predate the outcome field; the notification word
   // then falls back to reading renderFinal's trailing marker.
   outcome: Schema.optional(Schema.String),
+  /** Encrypted Yomu link for the full message; predates older results. */
+  yomu: Schema.optional(Schema.String),
   media: Schema.Array(Schema.Struct({
     key: Schema.String,
     name: Schema.String,
@@ -142,6 +144,7 @@ type PersistedFinalization = Schema.Schema.Type<typeof PersistedFinalization>
 const encodeFinalization = (result: RunFinalization): string => JSON.stringify({
   text: result.text,
   outcome: result.outcome,
+  yomu: result.yomu,
   media: result.media.map((media) => ({
     key: media.key,
     name: media.name,
@@ -643,19 +646,40 @@ export const TelegramDurableExecutorLive: Layer.Layer<
         // A new reply (unlike an edit) makes Telegram notify the user that
         // this run finished, with the outcome as the whole message.
         const word = finishNotificationWord(result.outcome, result.text)
-        const notificationSent = yield* deliveryApi.sendMessage({
-          runID: lease.job.id,
-          chatId: payload.runDeliveryRoute.chatId,
-          text: word,
-          messageThreadId: payload.runDeliveryRoute.threadId,
-          replyToMessageId: progressMessageID,
-        }).pipe(
+        // The Yomu link rides on the best-effort finish notification, so a
+        // rejected button URL can never fail the durable final delivery.
+        const yomuMarkup: KeyboardMarkup | undefined = result.yomu === undefined
+          ? undefined
+          : { inline_keyboard: [[{ text: "Open in Yomu", url: result.yomu }]] }
+        const sendNotification = (replyMarkup?: KeyboardMarkup) => {
+          const input = {
+            runID: lease.job.id,
+            chatId: payload.runDeliveryRoute.chatId,
+            text: word,
+            messageThreadId: payload.runDeliveryRoute.threadId,
+            replyToMessageId: progressMessageID,
+          }
+          return replyMarkup === undefined
+            ? deliveryApi.sendMessage(input)
+            : deliveryApi.sendMessage({ ...input, replyMarkup })
+        }
+        const notificationSent = yield* sendNotification(yomuMarkup).pipe(
           Effect.as(true),
-          Effect.catchCause((cause) =>
-            logBoundary("telegram/executor", "telegram-notification", "finish notification failed")(cause).pipe(
-              Effect.as(false),
-            ),
-          ),
+          Effect.catchTag("ApiError", (error) => {
+            if (yomuMarkup !== undefined && isDefinitiveSendRejection(error)) {
+              return sendNotification().pipe(
+                Effect.as(true),
+                Effect.catchTag("ApiError", (retryError) =>
+                  logBoundary("telegram/executor", "telegram-notification", "finish notification failed")(
+                    Cause.fail(retryError),
+                  ).pipe(Effect.as(false)),
+                ),
+              )
+            }
+            return logBoundary("telegram/executor", "telegram-notification", "finish notification failed")(
+              Cause.fail(error),
+            ).pipe(Effect.as(false))
+          }),
         )
         yield* debugFinal("Telegram finish notification finished", {
           messageId: progressMessageID,
