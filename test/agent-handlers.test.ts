@@ -100,6 +100,7 @@ const store: StoreService = {
   setDirectory: () => Effect.void,
   switchConversationDirectory: () => Effect.void,
   getDirectoryModelFallback: () => Effect.succeed(Option.none()),
+  setDirectoryModelFallback: () => Effect.void,
   getSessionAgentModel: () => Effect.succeed(Option.none()),
   setSessionAgentModel: () => Effect.void,
   getLoosePrompts: () => Effect.succeed(false),
