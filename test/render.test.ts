@@ -721,6 +721,35 @@ describe("mediaFromResponseText", () => {
       expect(result.media[0]?.name).toBe("screen.png")
       expect(result.media[0]?.mime).toBe("image/png")
       expect(result.media[0]?.bytes.length).toBeGreaterThan(0)
+      expect(result.rawText).toContain("<telegram-media>")
+      expect(result.placements).toHaveLength(2)
+      expect(result.placements[0]?.media?.name).toBe("screen.png")
+      expect(result.placements[1]?.media?.key).toBe(result.placements[0]?.media?.key)
+    } finally {
+      await unlink(path).catch(() => undefined)
+    }
+  })
+
+  test("locates each media marker for in-place Yomu replacement", async () => {
+    const path = `/tmp/telegram-media-placement-${process.pid}.png`
+    await Bun.write(path, png)
+    try {
+      const marker = `<telegram-media>{"type":"file","path":"${path}","mime":"image/png","name":"screen.png"}</telegram-media>`
+      const text = `first ${marker} middle ${marker} last`
+      const result = await Effect.runPromise(mediaFromResponseText(text).pipe(
+        Effect.provide(BunFileSystem.layer),
+        Effect.provide(BunPath.layer),
+      ))
+      expect(result.rawText).toBe(text)
+      expect(result.placements).toHaveLength(2)
+      const first = result.placements[0]
+      const second = result.placements[1]
+      expect(first?.start).toBe("first ".length)
+      expect(first?.end).toBe("first ".length + marker.length)
+      expect(second?.start).toBe(`first ${marker} middle `.length)
+      expect(second?.end).toBe((second?.start ?? 0) + marker.length)
+      expect(first?.media?.key).toBe(second?.media?.key)
+      expect(result.media).toHaveLength(1)
     } finally {
       await unlink(path).catch(() => undefined)
     }

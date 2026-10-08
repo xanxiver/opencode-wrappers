@@ -149,10 +149,9 @@ const retryTransient = <A, R>(
 ): Effect.Effect<A, ApiError, R> =>
   retryErrors(attempt, run, (error) => error.transient, onRetry)
 
-export interface KeyboardButton {
-  readonly text: string
-  readonly callback_data: string
-}
+export type KeyboardButton =
+  | { readonly text: string; readonly callback_data: string }
+  | { readonly text: string; readonly url: string }
 
 export interface KeyboardMarkup {
   readonly inline_keyboard: ReadonlyArray<ReadonlyArray<KeyboardButton>>

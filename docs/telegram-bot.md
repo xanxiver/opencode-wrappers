@@ -22,6 +22,11 @@ The bot lives in `src/` and `test/` at the repository root. The core
   reasoning. Existing conversations default to `normal`.
 - Finished runs reply `done`, `fail`, `interrupted`, or `timeout` under the
   run message so the chat notifies on completion.
+- The finish notification carries an **Open in Yomu** button. The link renders
+  the full untruncated message at `https://yomu.reveshu.com` (mermaid diagrams
+  render natively; run media is uploaded when `YOMU_UPLOAD_TOKEN` is set). The
+  payload is encrypted with `YOMU_AES_KEY`, and the message is never stored or
+  logged by this wrapper.
 - Token usage and cost in the final message.
 - Working-tree changes summary in the final message (branch, changed files, and
   tracked diff line totals) when the project directory is inside a Git
