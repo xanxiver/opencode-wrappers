@@ -18,7 +18,6 @@ import {
 } from "./api.js"
 import { AppConfigTag, parseRunTimeout, type AppConfig } from "../config.js"
 import {
-  DEFAULT_SHARE_BASE_URL,
   buildShareUrl,
   encodeSharePayload,
   isShareMediaMime,
@@ -145,7 +144,7 @@ export interface ParsedResponse {
 export interface RunFinalization {
   readonly text: string
   readonly media: readonly MediaArtifact[]
-  /** Full untruncated share link for the message, when Share is configured. */
+  /** Full untruncated share link for the message, when the service is configured. */
   readonly shareUrl?: string
   /** How the run ended; drives the finish notification reply. */
   readonly outcome: RunOutcome
@@ -564,7 +563,7 @@ const TELEGRAM_MEDIA_PATTERN = /<telegram-media>\s*([\s\S]*?)\s*<\/telegram-medi
 
 const visibleResponseText = (text: string): string => text.replace(TELEGRAM_MEDIA_PATTERN, "").trim()
 
-/** Replace each response marker with its uploaded Share object URL in place. */
+/** Replace each response marker with its uploaded share-service object URL in place. */
 const shareResponseBody = (input: {
   readonly rawText: string
   readonly placements: readonly MediaPlacement[]
@@ -601,9 +600,9 @@ const shareMediaAppendix = (media: readonly MediaArtifact[], uploads: ReadonlyMa
 }
 
 /**
- * Build the full untruncated share link for one run. Returns none when Share
- * is not configured, the message is empty, or encoding fails. The message
- * never reaches the logs.
+ * Build the full untruncated share link for one run. Returns none when the
+ * share service is not configured, the message is empty, or encoding fails.
+ * The message never reaches the logs.
  */
 export const buildShareLink = (input: {
   readonly response: Pick<ParsedResponse, "rawText" | "placements">
@@ -615,7 +614,8 @@ export const buildShareLink = (input: {
     if (keyValue === undefined) return Option.none()
     const key = parseSharedKey(keyValue)
     if (Option.isNone(key)) return Option.none()
-    const baseUrl = input.config.shareBaseUrl ?? DEFAULT_SHARE_BASE_URL
+    const baseUrl = input.config.shareBaseUrl
+    if (baseUrl === undefined) return Option.none()
     const uploadToken = input.config.shareUploadToken
     const candidates = new Map<string, MediaArtifact>()
     for (const placement of input.response.placements) {
@@ -1742,7 +1742,7 @@ export const runPrompt = (input: RunInput) =>
       media: finalMedia,
       outcome,
     }
-    if (Option.isSome(shareUrl)) Object.assign(finalization, { share: shareUrl.value })
+    if (Option.isSome(shareUrl)) Object.assign(finalization, { shareUrl: shareUrl.value })
     yield* debug("Telegram final response prepared", {
       outcome,
       finalTextLength: finalization.text.length,

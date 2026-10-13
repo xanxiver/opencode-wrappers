@@ -730,7 +730,7 @@ describe("mediaFromResponseText", () => {
     }
   })
 
-  test("locates each media marker for in-place Share replacement", async () => {
+  test("locates each media marker for in-place share-link replacement", async () => {
     const path = `/tmp/telegram-media-placement-${process.pid}.png`
     await Bun.write(path, png)
     try {

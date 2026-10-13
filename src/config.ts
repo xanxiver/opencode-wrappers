@@ -1,7 +1,7 @@
 import { Config, ConfigProvider, Context, Data, Duration, Effect, Layer, Option, Schema } from "effect"
 import { homedir } from "node:os"
 import { resolve } from "node:path"
-import { DEFAULT_SHARE_BASE_URL, parseSharedKey } from "./core/share-links.js"
+import { parseSharedKey } from "./core/share-links.js"
 
 export class ConfigError extends Data.TaggedError("ConfigError")<{
   readonly message: string
@@ -107,11 +107,11 @@ export class AppConfig extends Schema.Class<AppConfig>("AppConfig")({
   webTrustedOrigins: Schema.optional(Schema.String),
   /** Comma-separated filesystem roots whose direct child directories are workspace options. */
   webWorkspaceRoots: Schema.optional(Schema.String),
-  /** shared key for share links (64 hex or 43 base64url chars). */
+  /** Shared key for encrypted share links (64 hex or 43 base64url chars). */
   shareAesKey: Schema.optional(Schema.String),
   /** Bearer token for share-service media uploads. */
   shareUploadToken: Schema.optional(Schema.String),
-  /** Base URL for share links and uploads. */
+  /** Base URL of the share service used for links and uploads. */
   shareBaseUrl: Schema.optional(Schema.NonEmptyString),
 }) {}
 
@@ -158,7 +158,7 @@ const raw = Config.all({
   webWorkspaceRoots: Config.option(Config.string("WEB_WORKSPACE_ROOTS")),
   shareAesKey: Config.option(Config.string("SHARE_AES_KEY")),
   shareUploadToken: Config.option(Config.string("SHARE_UPLOAD_TOKEN")),
-  shareBaseUrl: Config.string("SHARE_BASE_URL").pipe(Config.withDefault(DEFAULT_SHARE_BASE_URL)),
+  shareBaseUrl: Config.option(Config.string("SHARE_BASE_URL")),
 })
 
 export const Live: Layer.Layer<AppConfig, ConfigError> = Layer.effect(
@@ -185,7 +185,7 @@ export const Live: Layer.Layer<AppConfig, ConfigError> = Layer.effect(
         webWorkspaceRoots: emptyToUndefined(Option.getOrUndefined(env.webWorkspaceRoots)),
         shareAesKey: emptyToUndefined(Option.getOrUndefined(env.shareAesKey)),
         shareUploadToken: emptyToUndefined(Option.getOrUndefined(env.shareUploadToken)),
-       shareBaseUrl: env.shareBaseUrl,
+       shareBaseUrl: emptyToUndefined(Option.getOrUndefined(env.shareBaseUrl)),
        webUiPort: Option.getOrUndefined(env.webUiPort),
     })),
     Effect.flatMap((env) => Effect.gen(function* () {

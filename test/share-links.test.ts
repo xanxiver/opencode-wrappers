@@ -2,7 +2,6 @@ import { describe, expect, test } from "bun:test"
 import { Effect, Option } from "effect"
 import { AppConfig } from "../src/config.js"
 import {
-  DEFAULT_SHARE_BASE_URL,
   buildShareUrl,
   decodeSharePayload,
   encodeSharePayload,
@@ -43,7 +42,7 @@ const stubFetch = (handler: (input: RequestInfo | URL, init?: RequestInit) => Pr
   return handler as typeof fetch
 }
 
-describe("share shared keys", () => {
+describe("share-link shared keys", () => {
   test("parses 64 hex chars and 43 base64url chars", () => {
     const hex = parseSharedKey(hexKey(0x2a))
     const base64 = parseSharedKey(base64UrlKey(0x2a))
@@ -60,7 +59,7 @@ describe("share shared keys", () => {
   })
 })
 
-describe("share payload codec", () => {
+describe("share-link payload codec", () => {
   const sample = [
     "# Sample report",
     "",
@@ -110,10 +109,10 @@ describe("share payload codec", () => {
   })
 })
 
-describe("share url", () => {
-  test("defaults to the calm variant and the public base URL", () => {
-    const url = new URL(buildShareUrl({ payload: "abc" }))
-    expect(url.origin + url.pathname).toBe(`${DEFAULT_SHARE_BASE_URL}/`)
+describe("share-link url", () => {
+  test("defaults to the calm variant", () => {
+    const url = new URL(buildShareUrl({ payload: "abc", baseUrl: "https://share.example" }))
+    expect(url.origin + url.pathname).toBe("https://share.example/")
     expect(url.searchParams.get("variant")).toBe("calm")
     expect(url.searchParams.get("m")).toBe("abc")
   })
@@ -125,7 +124,7 @@ describe("share url", () => {
   })
 })
 
-describe("share media upload", () => {
+describe("share-service media upload", () => {
   test("presigns and uploads with the bearer token", async () => {
     const calls: Array<{ readonly url: string; readonly method: string; readonly authorization?: string; readonly contentType?: string }> = []
     const stub = stubFetch(async (input, init) => {
@@ -183,7 +182,16 @@ describe("buildShareLink", () => {
     const result = await run(buildShareLink({
       response: { rawText: "# Hello", placements: [] },
       toolMedia: [],
-      config: config(),
+      config: config({ shareBaseUrl: "https://share.example" }),
+    }))
+    expect(Option.isNone(result)).toBe(true)
+  })
+
+  test("returns none without a configured base URL", async () => {
+    const result = await run(buildShareLink({
+      response: { rawText: "# Hello", placements: [] },
+      toolMedia: [],
+      config: config({ shareAesKey: hexKey(7) }),
     }))
     expect(Option.isNone(result)).toBe(true)
   })
@@ -248,7 +256,7 @@ describe("buildShareLink", () => {
         }],
       },
       toolMedia: [],
-      config: config({ shareAesKey: hexKey(11) }),
+      config: config({ shareAesKey: hexKey(11), shareBaseUrl: "https://share.example" }),
     }))
     const key = Option.getOrThrow(parseSharedKey(hexKey(11)))
     const markdown = await run(decodeSharePayload({ payload: new URL(Option.getOrThrow(url)).searchParams.get("m") ?? "", key }))
@@ -271,7 +279,7 @@ describe("buildShareLink", () => {
       run(buildShareLink({
         response: { rawText: "body", placements: [] },
         toolMedia: [{ key: "extra", name: "extra.png", mime: "image/png", bytes: pngBytes }],
-        config: config({ shareAesKey: hexKey(13), shareUploadToken: "token" }),
+        config: config({ shareAesKey: hexKey(13), shareUploadToken: "token", shareBaseUrl: "https://share.example" }),
       })))
     const key = Option.getOrThrow(parseSharedKey(hexKey(13)))
     const markdown = await run(decodeSharePayload({ payload: new URL(Option.getOrThrow(url)).searchParams.get("m") ?? "", key }))

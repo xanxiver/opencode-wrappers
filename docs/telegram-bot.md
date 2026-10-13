@@ -23,10 +23,10 @@ The bot lives in `src/` and `test/` at the repository root. The core
 - Finished runs reply `done`, `fail`, `interrupted`, or `timeout` under the
   run message so the chat notifies on completion.
 - The finish notification carries an **Open full output** button. The link renders
-  the full untruncated message at `https://share.example.com` (mermaid diagrams
-  render natively; run media is uploaded when `SHARE_UPLOAD_TOKEN` is set). The
-  payload is encrypted with `SHARE_AES_KEY`, and the message is never stored or
-  logged by this wrapper.
+  the full untruncated message on the share service you configure with
+  `SHARE_BASE_URL` (mermaid diagrams render natively; run media is uploaded when
+  `SHARE_UPLOAD_TOKEN` is set). The payload is encrypted with `SHARE_AES_KEY`, and
+  the message is never stored or logged by this wrapper.
 - Token usage and cost in the final message.
 - Working-tree changes summary in the final message (branch, changed files, and
   tracked diff line totals) when the project directory is inside a Git

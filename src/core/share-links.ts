@@ -2,7 +2,7 @@ import { Buffer } from "node:buffer"
 import { Data, Effect, Option, Schema } from "effect"
 
 /**
- * share links: https://share.example.com/?m=<payload>
+ * Encrypted share links: <base-url>/?m=<payload>
  *
  * The payload is a deflate-raw compressed markdown message, encrypted with
  * AES-256-GCM, prefixed with the random 12 byte IV, and encoded as unpadded
@@ -13,9 +13,8 @@ import { Data, Effect, Option, Schema } from "effect"
 export const SHARE_VARIANTS = ["calm", "desk", "term", "memo", "card"] as const
 export type ShareVariant = (typeof SHARE_VARIANTS)[number]
 export const SHARE_DEFAULT_VARIANT: ShareVariant = "calm"
-export const DEFAULT_SHARE_BASE_URL = "https://share.example.com"
 
-/** Server-side limits mirrored from the share service. */
+/** Server-side limits mirrored by the share service. */
 export const SHARE_MAX_MARKDOWN_BYTES = 256 * 1024
 export const SHARE_MAX_PAYLOAD_CHARS = 64 * 1024
 
@@ -144,9 +143,9 @@ export const decodeSharePayload = (input: {
 export const buildShareUrl = (input: {
   readonly payload: string
   readonly variant?: ShareVariant
-  readonly baseUrl?: string
+  readonly baseUrl: string
 }): string => {
-  const url = new URL(input.baseUrl ?? DEFAULT_SHARE_BASE_URL)
+  const url = new URL(input.baseUrl)
   url.searchParams.set("variant", input.variant ?? SHARE_DEFAULT_VARIANT)
   url.searchParams.set("m", input.payload)
   return url.toString()
